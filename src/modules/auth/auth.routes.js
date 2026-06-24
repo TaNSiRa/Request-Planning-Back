@@ -38,12 +38,9 @@ router.post("/logout", requireAuth, asyncHandler(async (req, res) => {
 }));
 
 router.get("/me", requireAuth, asyncHandler(async (req, res) => {
-  const result = await query(
-    `SELECT u.id, u.employee_no, u.email, u.display_name, u.branch, u.department, u.section, u.phone, r.code AS role_code
-     FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = @id`,
-    { id: req.user.id }
-  );
-  const user = sanitizeUser(result.recordset[0]);
+  const userRow = await findActiveUserById(req.user.id);
+  if (!userRow) return res.status(401).json({ message: "Unauthorized" });
+  const user = sanitizeUser(userRow);
   user.sections = await getUserSections(user);
   res.json({ user });
 }));
@@ -53,13 +50,11 @@ router.get("/sections", requireAuth, asyncHandler(async (req, res) => {
 }));
 
 router.get("/session", requireAuth, asyncHandler(async (req, res) => {
-  const user = sanitizeUser({
-    ...req.user,
-    display_name: req.user.displayName,
-    role_code: req.user.roleCode
-  });
+  const userRow = await findActiveUserById(req.user.id);
+  if (!userRow) return res.status(401).json({ message: "Unauthorized" });
+  const user = sanitizeUser(userRow);
   user.sections = await getUserSections(user);
-  res.json({ token: signToken(req.user), user, csrfToken: req.session?.csrfToken || null });
+  res.json({ token: signToken(userRow), user, csrfToken: req.session?.csrfToken || null });
 }));
 
 router.get("/csrf-token", requireAuth, asyncHandler(async (req, res) => {
@@ -109,6 +104,39 @@ router.post("/microsoft/login", asyncHandler(async (req, res) => {
   res.json(await completeLogin(req, user));
 }));
 
+router.post("/pdpa-consent", requireAuth, asyncHandler(async (req, res) => {
+  await query(
+    `UPDATE users
+     SET pdpa_consent_accepted = 1,
+         pdpa_consent_at = SYSUTCDATETIME(),
+         pdpa_consent_ip = @ip,
+         pdpa_consent_user_agent = @userAgent,
+         pdpa_policy_version = @policyVersion,
+         updated_at = SYSUTCDATETIME()
+     WHERE id = @id`,
+    {
+      id: req.user.id,
+      ip: req.ip,
+      userAgent: `${req.headers["user-agent"] || ""}`.slice(0, 512),
+      policyVersion: "privacy-policy-2026"
+    }
+  );
+  const userRow = await findActiveUserById(req.user.id);
+  const csrfToken = setLoggedInSession(req, userRow);
+  await writeAudit({
+    actorId: req.user.id,
+    action: "PDPA_ACCEPT",
+    entityType: "USER",
+    entityId: req.user.id,
+    afterValue: { pdpaConsentAccepted: true, policyVersion: "privacy-policy-2026" },
+    ip: req.ip,
+    userAgent: req.headers["user-agent"]
+  });
+  const user = sanitizeUser(userRow);
+  user.sections = await getUserSections(user);
+  res.json({ token: signToken(userRow), csrfToken, user });
+}));
+
 async function findActiveUserByEmail(email) {
   const result = await query(
     `SELECT TOP 1 u.*, r.code AS role_code
@@ -116,6 +144,17 @@ async function findActiveUserByEmail(email) {
      JOIN roles r ON r.id = u.role_id
      WHERE LOWER(u.email) = LOWER(@email) AND u.is_active = 1`,
     { email: `${email || ""}`.trim() }
+  );
+  return result.recordset[0] || null;
+}
+
+async function findActiveUserById(id) {
+  const result = await query(
+    `SELECT TOP 1 u.*, r.code AS role_code
+     FROM users u
+     JOIN roles r ON r.id = u.role_id
+     WHERE u.id = @id AND u.is_active = 1`,
+    { id }
   );
   return result.recordset[0] || null;
 }
@@ -143,6 +182,9 @@ async function completeLogin(req, user) {
 }
 
 function sanitizeUser(user) {
+  const pdpaConsentAccepted = user?.pdpa_consent_accepted === true ||
+    user?.pdpa_consent_accepted === 1 ||
+    user?.pdpaConsentAccepted === true;
   return {
     id: user.id,
     employeeNo: user.employee_no,
@@ -152,7 +194,10 @@ function sanitizeUser(user) {
     department: user.department,
     section: user.section,
     phone: user.phone,
-    roleCode: user.role_code
+    roleCode: user.role_code,
+    pdpaConsentAccepted,
+    pdpaConsentAt: user.pdpa_consent_at,
+    pdpaPolicyVersion: user.pdpa_policy_version
   };
 }
 

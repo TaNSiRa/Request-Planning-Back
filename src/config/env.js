@@ -1,4 +1,4 @@
-require("dotenv").config();
+﻿require("dotenv").config();
 
 function boolEnv(name, defaultValue = false) {
   const value = process.env[name];
@@ -54,7 +54,7 @@ const env = {
   sql: {
     server: process.env.SQL_SERVER || "127.0.0.1",
     port: Number(process.env.SQL_PORT || 1433),
-    database: process.env.SQL_DATABASE || "AutomationRequest",
+    database: process.env.SQL_DATABASE || "RAP",
     user: process.env.SQL_USER || "",
     password: process.env.SQL_PASSWORD || "",
     options: {
