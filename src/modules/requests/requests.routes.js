@@ -1,0 +1,810 @@
+const express = require("express");
+const { z } = require("zod");
+const { query } = require("../../db/pool");
+const { asyncHandler } = require("../../middleware/asyncHandler");
+const { requireAuth } = require("../../middleware/auth");
+const { audit } = require("../../middleware/audit");
+const { sendMail } = require("../../services/mailService");
+const { notify } = require("../../services/notificationService");
+const { emitSystem } = require("../../services/realtimeService");
+const { storeDataUrlAttachment, readAttachmentAsDataUrl, deleteStoredAttachment } = require("../../services/attachmentStorage");
+const { isAdmin, resolveSection } = require("../../services/sectionService");
+
+const router = express.Router();
+router.use(requireAuth);
+router.use(resolveSection);
+
+router.get("/", asyncHandler(async (req, res) => {
+  const { status, q, type, from, to } = req.query;
+  const canViewAll = req.sectionAccess.canViewAll ? 1 : 0;
+  const result = await query(
+    `SELECT r.*, u.display_name AS requester_name, au.display_name AS incharge_name, su.display_name AS support_name,
+            u.branch AS requester_branch, u.department AS requester_department, u.section AS requester_section,
+            au.branch AS incharge_branch, au.department AS incharge_department, au.section AS incharge_section,
+            su.branch AS support_branch, su.department AS support_department, su.section AS support_section,
+            todo.todo_total, todo.todo_done, todo.todo_progress_percent
+     FROM requests r
+     JOIN users u ON u.id = r.requester_user_id
+     LEFT JOIN users au ON au.id = r.incharge_user_id
+     LEFT JOIN users su ON su.id = r.support_user_id
+     OUTER APPLY (
+       SELECT COUNT(1) AS todo_total,
+              COALESCE(SUM(CASE WHEN t.is_done = 1 THEN 1 ELSE 0 END), 0) AS todo_done,
+              CASE
+                WHEN COUNT(1) = 0 THEN 0
+                ELSE CAST(ROUND(COALESCE(SUM(CASE WHEN t.is_done = 1 THEN 1 ELSE 0 END), 0) * 100.0 / COUNT(1), 0) AS INT)
+              END AS todo_progress_percent
+       FROM request_todos t
+       WHERE t.request_id = r.id
+     ) todo
+     WHERE (@status IS NULL OR r.status = @status)
+       AND r.section_id = @sectionId
+       AND (@type IS NULL OR r.request_type = @type)
+       AND (@canViewAll = 1 OR r.requester_user_id = @userId OR r.incharge_user_id = @userId OR r.support_user_id = @userId)
+       AND (@q IS NULL OR r.title LIKE '%' + @q + '%' OR r.request_no LIKE '%' + @q + '%')
+       AND (@from IS NULL OR r.created_at >= @from)
+       AND (@to IS NULL OR r.created_at <= @to)
+     ORDER BY r.created_at DESC`,
+    {
+      status: status || null,
+      type: type || null,
+      q: q || null,
+      from: from || null,
+      to: to || null,
+      userId: req.user.id,
+      sectionId: req.section.id,
+      canViewAll
+    }
+  );
+  res.json({ data: result.recordset });
+}));
+
+router.get("/attachments/:kind/:attachmentId/data-url", asyncHandler(async (req, res) => {
+  const attachment = await getAttachmentForDownload(
+    req.params.kind,
+    Number(req.params.attachmentId),
+    req.user,
+    req.section.id,
+    req.sectionAccess
+  );
+  if (!attachment) return res.status(404).json({ message: "Attachment not found" });
+  const dataUrl = attachment.storage_path
+    ? await readAttachmentAsDataUrl(attachment.storage_path, attachment.content_type)
+    : attachment.data_url;
+  if (!dataUrl) return res.status(404).json({ message: "Attachment content not found" });
+  res.json({ dataUrl });
+}));
+
+router.get("/:id", asyncHandler(async (req, res) => {
+  const id = Number(req.params.id);
+  const request = (await query(
+    `SELECT r.*, requester.display_name AS requester_name, inc.display_name AS incharge_name, sup.display_name AS support_name,
+            requester.branch AS requester_branch, requester.department AS requester_department, requester.section AS requester_section,
+            inc.branch AS incharge_branch, inc.department AS incharge_department, inc.section AS incharge_section,
+            sup.branch AS support_branch, sup.department AS support_department, sup.section AS support_section
+     FROM requests r
+     JOIN users requester ON requester.id = r.requester_user_id
+     LEFT JOIN users inc ON inc.id = r.incharge_user_id
+     LEFT JOIN users sup ON sup.id = r.support_user_id
+     WHERE r.id=@id AND r.section_id=@sectionId`,
+    { id, sectionId: req.section.id }
+  )).recordset[0];
+  if (!request) return res.status(404).json({ message: "Request not found" });
+  if (!canAccessRequest(request, req.user, req.sectionAccess)) return res.status(403).json({ message: "Forbidden" });
+  const todos = (await query("SELECT * FROM request_todos WHERE request_id=@id ORDER BY sort_order, id", { id })).recordset;
+  const todoAttachments = await getTodoAttachments(id);
+  for (const todo of todos) {
+    todo.attachments = todoAttachments.get(todo.id) || [];
+  }
+  const attachments = await getAttachments(id);
+  const extensionHistory = await getExtensionHistory(id);
+  const approvals = (await query(
+    `SELECT a.*, u.display_name AS approver_name,
+            u.branch AS approver_branch, u.department AS approver_department, u.section AS approver_section
+     FROM approval_steps a LEFT JOIN users u ON u.id = a.approver_user_id
+     WHERE a.request_id=@id ORDER BY sequence_no`,
+    { id }
+  )).recordset;
+  res.json({ data: { ...request, todos, approvals, attachments, extensionHistory } });
+}));
+
+router.get("/:id/export.txt", asyncHandler(async (req, res) => {
+  const id = Number(req.params.id);
+  const detail = (await query(
+    `SELECT r.*, requester.display_name AS requester_name, inc.display_name AS incharge_name, sup.display_name AS support_name,
+            requester.branch AS requester_branch, requester.department AS requester_department, requester.section AS requester_section,
+            inc.branch AS incharge_branch, inc.department AS incharge_department, inc.section AS incharge_section,
+            sup.branch AS support_branch, sup.department AS support_department, sup.section AS support_section
+     FROM requests r
+     JOIN users requester ON requester.id = r.requester_user_id
+     LEFT JOIN users inc ON inc.id = r.incharge_user_id
+     LEFT JOIN users sup ON sup.id = r.support_user_id
+     WHERE r.id=@id AND r.section_id=@sectionId`,
+    { id, sectionId: req.section.id }
+  )).recordset[0];
+  if (!detail) return res.status(404).send("Request not found");
+  if (!canAccessRequest(detail, req.user, req.sectionAccess)) return res.status(403).send("Forbidden");
+  const todos = (await query("SELECT * FROM request_todos WHERE request_id=@id ORDER BY sort_order, id", { id })).recordset;
+  const todoAttachments = await getTodoAttachments(id);
+  const attachments = await getAttachments(id);
+  const lines = [
+    `${req.section.name.toUpperCase()} FORM`,
+    "=======================",
+    `Request No: ${detail.request_no}`,
+    `Title: ${detail.title}`,
+    `Type: ${detail.request_type}`,
+    `System Area: ${detail.system_area || "-"}`,
+    `Priority: ${detail.priority}`,
+    `Status: ${detail.status}`,
+    `Requester: ${detail.requester_name}`,
+    `Requester Branch/Department/Section: ${detail.requester_branch || "-"} / ${detail.requester_department || "-"} / ${detail.requester_section || "-"}`,
+    `Incharge: ${detail.incharge_name || "-"}`,
+    `Incharge Branch/Department/Section: ${detail.incharge_branch || "-"} / ${detail.incharge_department || "-"} / ${detail.incharge_section || "-"}`,
+    `Support: ${detail.support_name || "-"}`,
+    `Support Branch/Department/Section: ${detail.support_branch || "-"} / ${detail.support_department || "-"} / ${detail.support_section || "-"}`,
+    `Due Date: ${formatDate(detail.due_date)}`,
+    `Project Period: ${formatDate(detail.planned_start)} - ${formatDate(detail.planned_end)}`,
+    "",
+    "Description",
+    detail.description || "-",
+    "",
+    "Business Impact",
+    detail.business_impact || "-",
+    "",
+    `Attachments: ${attachments.length}`,
+    "",
+    "Todo List",
+    ...todos.map((todo, index) => {
+      const files = todoAttachments.get(todo.id) || [];
+      const fileNames = files.length ? ` | Files: ${files.map(file => file.fileName).join(", ")}` : "";
+      return `${index + 1}. [${todo.is_done ? "x" : " "}] ${todo.title} (${formatDate(todo.planned_start)} - ${formatDate(todo.planned_end)})${fileNames}`;
+    })
+  ];
+  res.header("Content-Type", "text/plain; charset=utf-8").send(lines.join("\n"));
+}));
+
+router.post("/", audit("CREATE", "REQUEST", req => req.body.title), asyncHandler(async (req, res) => {
+  const schema = z.object({
+    title: z.string().min(3),
+    requestType: z.string().min(2),
+    systemArea: z.string().min(1),
+    priority: z.string().min(1).default("NORMAL"),
+    dueDate: z.string(),
+    description: z.string().min(5),
+    businessImpact: z.string().min(1),
+    attachments: attachmentSchema()
+  });
+  const input = schema.parse(req.body);
+  const { attachments, ...requestInput } = input;
+  const values = {
+    ...requestInput,
+    systemArea: input.systemArea ?? null,
+    businessImpact: input.businessImpact ?? null
+  };
+  const number = await generateRequestNumber(req.section.id, req.section.requestPrefix || "AR");
+  const insert = await query(
+    `INSERT INTO requests (section_id, request_no, requester_user_id, title, request_type, system_area, priority, due_date, description, business_impact, status)
+     OUTPUT INSERTED.id
+     VALUES (@sectionId, @number, @userId, @title, @requestType, @systemArea, @priority, @dueDate, @description, @businessImpact, 'PENDING_APPROVAL')`,
+    { ...values, sectionId: req.section.id, number, userId: req.user.id }
+  );
+  const requestId = insert.recordset[0].id;
+  await saveAttachments(requestId, attachments);
+  await createApprovalSteps(requestId, req.section.id, input.requestType);
+  await notifyRequestParticipants(requestId, "CREATE", "Request submitted", number);
+  await notifyFirstApprover(requestId, number);
+  emitSystem("request.created", { id: requestId, requestNo: number, status: "PENDING_APPROVAL" });
+  res.status(201).json({ id: requestId, requestNo: number });
+}));
+
+router.patch("/:id/cancel", audit("CANCEL", "REQUEST"), asyncHandler(async (req, res) => {
+  const id = Number(req.params.id);
+  const row = (await query("SELECT * FROM requests WHERE id=@id AND section_id=@sectionId", {
+    id,
+    sectionId: req.section.id
+  })).recordset[0];
+  if (!row) return res.status(404).json({ message: "Request not found" });
+  if (row.requester_user_id !== req.user.id && !isAdmin(req.user)) {
+    return res.status(403).json({ message: "Only requester can cancel this request" });
+  }
+  await query("UPDATE requests SET status='CANCELLED', cancel_reason=@reason, cancelled_at=SYSUTCDATETIME(), updated_at=SYSUTCDATETIME() WHERE id=@id", {
+    id,
+    reason: req.body.reason || null
+  });
+  await notifyRequestParticipants(id, "CANCEL", "Request cancelled", row.request_no);
+  emitSystem("request.updated", { id, status: "CANCELLED" });
+  res.json({ ok: true });
+}));
+
+router.post("/:id/todos", audit("CREATE", "TODO"), asyncHandler(async (req, res) => {
+  const schema = z.object({
+    title: z.string().min(2),
+    description: z.string().optional().nullable(),
+    plannedStart: z.string(),
+    plannedEnd: z.string(),
+    sortOrder: z.number().int().optional().default(0),
+    attachments: attachmentSchema()
+  });
+  const input = schema.parse(req.body);
+  const { attachments, ...todoInput } = input;
+  const values = {
+    ...todoInput,
+    description: input.description ?? null
+  };
+  await assertCanManageRequestWork(Number(req.params.id), req.user, req.sectionAccess, req.section.id);
+  await assertTodoWindow(Number(req.params.id), req.section.id, input.plannedStart, input.plannedEnd);
+  const result = await query(
+    `INSERT INTO request_todos (request_id, title, description, planned_start, planned_end, sort_order, created_by)
+     OUTPUT INSERTED.id VALUES (@id, @title, @description, @plannedStart, @plannedEnd, @sortOrder, @userId)`,
+    { ...values, id: Number(req.params.id), userId: req.user.id }
+  );
+  const todoId = result.recordset[0].id;
+  await saveTodoAttachments(Number(req.params.id), todoId, attachments);
+  res.status(201).json({ id: todoId });
+}));
+
+router.patch("/:id/todos/:todoId", audit("EDIT", "TODO", req => req.params.todoId), asyncHandler(async (req, res) => {
+  const schema = z.object({
+    title: z.string().min(2),
+    description: z.string().optional().nullable(),
+    plannedStart: z.string(),
+    plannedEnd: z.string(),
+    isDone: z.boolean().optional().default(false),
+    attachments: attachmentSchema({ defaultEmpty: false })
+  });
+  const input = schema.parse(req.body);
+  const { attachments, ...todoInput } = input;
+  const values = {
+    ...todoInput,
+    description: input.description ?? null
+  };
+  await assertCanManageRequestWork(Number(req.params.id), req.user, req.sectionAccess, req.section.id);
+  await assertTodoWindow(Number(req.params.id), req.section.id, input.plannedStart, input.plannedEnd);
+  await query(
+    `UPDATE request_todos SET title=@title, description=@description, planned_start=@plannedStart, planned_end=@plannedEnd,
+      is_done=@isDone, completed_at=CASE WHEN @isDone=1 THEN SYSUTCDATETIME() ELSE NULL END, updated_at=SYSUTCDATETIME()
+     WHERE id=@todoId AND request_id=@id`,
+    { ...values, todoId: Number(req.params.todoId), id: Number(req.params.id) }
+  );
+  if (Object.prototype.hasOwnProperty.call(req.body, "attachments")) {
+    await replaceTodoAttachments(Number(req.params.id), Number(req.params.todoId), attachments);
+  }
+  res.json({ ok: true });
+}));
+
+router.delete("/:id/todos/:todoId", audit("DELETE", "TODO", req => req.params.todoId), asyncHandler(async (req, res) => {
+  await assertCanManageRequestWork(Number(req.params.id), req.user, req.sectionAccess, req.section.id);
+  await deleteTodoAttachmentFiles(Number(req.params.id), Number(req.params.todoId));
+  await query("DELETE FROM request_todos WHERE id=@todoId AND request_id=@id", {
+    todoId: Number(req.params.todoId),
+    id: Number(req.params.id)
+  });
+  res.json({ ok: true });
+}));
+
+router.post("/:id/complete-work", audit("COMPLETE_WORK", "REQUEST"), asyncHandler(async (req, res) => {
+  const id = Number(req.params.id);
+  await assertCanManageRequestWork(id, req.user, req.sectionAccess, req.section.id);
+  const request = (await query("SELECT request_no, status FROM requests WHERE id=@id AND section_id=@sectionId", {
+    id,
+    sectionId: req.section.id
+  })).recordset[0];
+  if (!request) return res.status(404).json({ message: "Request not found" });
+  if (request.status !== "IN_PROGRESS") {
+    return res.status(400).json({ message: "Only in-progress requests can be submitted for close approval" });
+  }
+  const pending = (await query("SELECT COUNT(*) AS count FROM request_todos WHERE request_id=@id AND is_done=0", { id })).recordset[0].count;
+  if (pending > 0) return res.status(400).json({ message: "All todo items must be completed first" });
+  await query("UPDATE requests SET status='WAITING_CLOSE', work_completed_at=SYSUTCDATETIME(), updated_at=SYSUTCDATETIME() WHERE id=@id", { id });
+  await createCloseApprovalSteps(id, req.section.id);
+  await notifyFirstCloseApprover(id);
+  await notifyRequestParticipants(id, "WAITING_CLOSE", "Work submitted for close", "Waiting for approver to close this request");
+  emitSystem("request.updated", { id, status: "WAITING_CLOSE" });
+  res.json({ ok: true });
+}));
+
+router.post("/:id/extension-requests", audit("CREATE", "EXTENSION_REQUEST"), asyncHandler(async (req, res) => {
+  const schema = z.object({ requestedStart: z.string(), requestedEnd: z.string(), reason: z.string().min(5) });
+  const input = schema.parse(req.body);
+  const requestId = Number(req.params.id);
+  await assertCanManageRequestWork(requestId, req.user, req.sectionAccess, req.section.id);
+  const request = (await query("SELECT planned_start, planned_end, request_type FROM requests WHERE id=@id AND section_id=@sectionId", {
+    id: requestId,
+    sectionId: req.section.id
+  })).recordset[0];
+  if (!request) return res.status(404).json({ message: "Request not found" });
+  if (!request.planned_start || !request.planned_end) {
+    return res.status(400).json({ message: "Project period has not been assigned yet" });
+  }
+  const result = await query(
+    `INSERT INTO schedule_extension_requests (request_id, requested_by, previous_start, previous_end, requested_start, requested_end, reason, status)
+     OUTPUT INSERTED.id VALUES (@id, @userId, @previousStart, @previousEnd, @requestedStart, @requestedEnd, @reason, 'PENDING_APPROVAL')`,
+    {
+      ...input,
+      id: requestId,
+      userId: req.user.id,
+      previousStart: request.planned_start,
+      previousEnd: request.planned_end
+    }
+  );
+  await createExtensionApprovalSteps(result.recordset[0].id, req.section.id, request.request_type);
+  await notifyFirstExtensionApprover(requestId, result.recordset[0].id);
+  res.status(201).json({ id: result.recordset[0].id });
+}));
+
+async function createApprovalSteps(requestId, sectionId, requestType) {
+  const route = await findApprovalRoute(sectionId, requestType);
+  if (!route) {
+    const err = new Error("No active approval route is configured for this section");
+    err.status = 400;
+    throw err;
+  }
+  await query(
+    `INSERT INTO approval_steps (request_id, route_id, sequence_no, approver_user_id, step_name, status)
+     SELECT @requestId, ar.id, ars.sequence_no, ars.default_approver_user_id, ars.step_name,
+            CASE WHEN ars.sequence_no = 1 THEN 'PENDING' ELSE 'WAITING' END
+     FROM approval_routes ar
+     JOIN approval_route_steps ars ON ars.route_id = ar.id
+     WHERE ar.id = @routeId
+     ORDER BY ars.sequence_no`,
+    { requestId, routeId: route.id }
+  );
+}
+
+async function createCloseApprovalSteps(requestId, sectionId) {
+  await query("DELETE FROM approval_steps WHERE request_id=@requestId AND sequence_no >= 100 AND status IN ('WAITING','PENDING')", { requestId });
+  const request = (await query("SELECT request_type FROM requests WHERE id=@requestId AND section_id=@sectionId", {
+    requestId,
+    sectionId
+  })).recordset[0];
+  const route = await findApprovalRoute(sectionId, request?.request_type);
+  if (!route) {
+    const err = new Error("No active approval route is configured for this section");
+    err.status = 400;
+    throw err;
+  }
+  await query(
+    `INSERT INTO approval_steps (request_id, route_id, sequence_no, approver_user_id, step_name, status)
+     SELECT @requestId, ar.id, ars.sequence_no + 100, ars.default_approver_user_id, CONCAT('Close - ', ars.step_name),
+            CASE WHEN ars.sequence_no = 1 THEN 'PENDING' ELSE 'WAITING' END
+     FROM approval_routes ar
+     JOIN approval_route_steps ars ON ars.route_id = ar.id
+     WHERE ar.id = @routeId
+     ORDER BY ars.sequence_no`,
+    { requestId, routeId: route.id }
+  );
+}
+
+async function findApprovalRoute(sectionId, requestType) {
+  const result = await query(
+    `SELECT TOP 1 id
+     FROM approval_routes
+     WHERE section_id=@sectionId
+       AND is_active=1
+       AND (request_type=@requestType OR request_type IS NULL)
+     ORDER BY
+       CASE WHEN request_type=@requestType THEN 0 WHEN is_default=1 THEN 1 ELSE 2 END,
+       is_default DESC,
+       id`,
+    { sectionId, requestType: requestType || null }
+  );
+  return result.recordset[0] || null;
+}
+
+async function createExtensionApprovalSteps(extensionId, sectionId, requestType) {
+  const route = await findApprovalRoute(sectionId, requestType);
+  if (!route) {
+    const err = new Error("No active approval route is configured for this section");
+    err.status = 400;
+    throw err;
+  }
+  await query(
+    `INSERT INTO schedule_extension_approval_steps (extension_id, route_id, sequence_no, approver_user_id, step_name, status)
+     SELECT @extensionId, ar.id, ars.sequence_no, ars.default_approver_user_id, CONCAT('Extension - ', ars.step_name),
+            CASE WHEN ars.sequence_no = 1 THEN 'PENDING' ELSE 'WAITING' END
+     FROM approval_routes ar
+     JOIN approval_route_steps ars ON ars.route_id = ar.id
+     WHERE ar.id=@routeId
+     ORDER BY ars.sequence_no`,
+    { extensionId, routeId: route.id }
+  );
+}
+
+async function notifyFirstApprover(requestId, requestNo) {
+  const approver = (await query(
+    `SELECT TOP 1 u.id, u.email, u.display_name FROM approval_steps a
+     JOIN users u ON u.id = a.approver_user_id WHERE a.request_id=@requestId AND a.sequence_no=1`,
+    { requestId }
+  )).recordset[0];
+  if (!approver) return;
+  await notify({ userId: approver.id, requestId, type: "APPROVAL", title: "New request needs approval", body: requestNo });
+  await sendMail({
+    to: approver.email,
+    subject: `[Automation Request] Approval required: ${requestNo}`,
+    html: `<p>Please review automation request <strong>${requestNo}</strong>.</p>`,
+    requestId,
+    type: "APPROVAL"
+  });
+}
+
+async function notifyFirstExtensionApprover(requestId, extensionId) {
+  const row = (await query(
+    `SELECT TOP 1 u.id, u.email, r.request_no
+     FROM schedule_extension_approval_steps a
+     JOIN schedule_extension_requests e ON e.id = a.extension_id
+     JOIN requests r ON r.id = e.request_id
+     JOIN users u ON u.id = a.approver_user_id
+     WHERE e.id=@extensionId AND e.request_id=@requestId AND a.status='PENDING'
+     ORDER BY a.sequence_no`,
+    { requestId, extensionId }
+  )).recordset[0];
+  if (!row) return;
+  await notify({
+    userId: row.id,
+    requestId,
+    type: "EXTENSION",
+    title: "Schedule extension needs approval",
+    body: `${row.request_no} extension #${extensionId}`
+  });
+  await sendMail({
+    to: row.email,
+    subject: `[Automation Request] Extension approval required: ${row.request_no}`,
+    html: `<p>Please review schedule extension request for <strong>${row.request_no}</strong>.</p>`,
+    requestId,
+    type: "EXTENSION"
+  });
+}
+
+async function getAttachments(requestId) {
+  try {
+    const result = await query(
+      `SELECT id, 'request' AS kind, file_name AS fileName, content_type AS contentType, file_size AS fileSize, created_at
+       FROM request_attachments
+       WHERE request_id=@requestId
+       ORDER BY id`,
+      { requestId }
+    );
+    return result.recordset;
+  } catch (err) {
+    if (`${err.message}`.includes("Invalid object name")) return [];
+    throw err;
+  }
+}
+
+async function getTodoAttachments(requestId) {
+  try {
+    const result = await query(
+      `SELECT id, 'todo' AS kind, todo_id AS todoId, file_name AS fileName, content_type AS contentType, file_size AS fileSize, created_at
+       FROM todo_attachments
+       WHERE request_id=@requestId
+       ORDER BY todo_id, id`,
+      { requestId }
+    );
+    const grouped = new Map();
+    for (const attachment of result.recordset) {
+      if (!grouped.has(attachment.todoId)) grouped.set(attachment.todoId, []);
+      grouped.get(attachment.todoId).push(attachment);
+    }
+    return grouped;
+  } catch (err) {
+    if (`${err.message}`.includes("Invalid object name")) return new Map();
+    throw err;
+  }
+}
+
+async function saveAttachments(requestId, attachments = []) {
+  const context = await getAttachmentStorageContext(requestId, { bucket: "Request Files" });
+  for (const attachment of attachments.slice(0, 5)) {
+    if (!isNewAttachment(attachment)) continue;
+    const stored = await storeDataUrlAttachment(attachment, context);
+    await query(
+      `INSERT INTO request_attachments (request_id, file_name, content_type, data_url, storage_path, file_size)
+       VALUES (@requestId, @fileName, @contentType, NULL, @storagePath, @fileSize)`,
+      {
+        requestId,
+        fileName: attachment.fileName,
+        contentType: stored.contentType,
+        storagePath: stored.storagePath,
+        fileSize: stored.fileSize
+      }
+    );
+  }
+}
+
+async function saveTodoAttachments(requestId, todoId, attachments = []) {
+  const bucket = await getTodoAttachmentBucket(requestId, todoId);
+  const context = await getAttachmentStorageContext(requestId, { bucket });
+  for (const attachment of attachments.slice(0, 5)) {
+    if (!isNewAttachment(attachment)) continue;
+    const stored = await storeDataUrlAttachment(attachment, context);
+    await query(
+      `INSERT INTO todo_attachments (request_id, todo_id, file_name, content_type, data_url, storage_path, file_size)
+       VALUES (@requestId, @todoId, @fileName, @contentType, NULL, @storagePath, @fileSize)`,
+      {
+        requestId,
+        todoId,
+        fileName: attachment.fileName,
+        contentType: stored.contentType,
+        storagePath: stored.storagePath,
+        fileSize: stored.fileSize
+      }
+    );
+  }
+}
+
+async function getTodoAttachmentBucket(requestId, todoId) {
+  const result = await query(
+    `SELECT todo_index
+     FROM (
+       SELECT id, ROW_NUMBER() OVER (ORDER BY sort_order, id) AS todo_index
+       FROM request_todos
+       WHERE request_id=@requestId
+     ) ranked
+     WHERE id=@todoId`,
+    { requestId, todoId }
+  );
+  const index = Number(result.recordset[0]?.todo_index) || 1;
+  return `${String(index).padStart(3, "0")}_todo`;
+}
+
+async function replaceTodoAttachments(requestId, todoId, attachments = []) {
+  const existing = (await query(
+    `SELECT id, storage_path
+     FROM todo_attachments
+     WHERE request_id=@requestId AND todo_id=@todoId`,
+    { requestId, todoId }
+  )).recordset;
+  const existingIds = new Set(existing.map(row => Number(row.id)));
+  const keepIds = new Set(
+    attachments
+      .map(attachment => Number(attachment.id))
+      .filter(id => Number.isInteger(id) && existingIds.has(id))
+  );
+  const removed = existing.filter(row => !keepIds.has(Number(row.id)));
+  for (const attachment of removed) {
+    await deleteStoredAttachment(attachment.storage_path);
+  }
+  if (removed.length) {
+    const params = { requestId, todoId };
+    const ids = removed.map((row, index) => {
+      params[`id${index}`] = row.id;
+      return `@id${index}`;
+    });
+    await query(
+      `DELETE FROM todo_attachments
+       WHERE request_id=@requestId AND todo_id=@todoId AND id IN (${ids.join(",")})`,
+      params
+    );
+  }
+  await saveTodoAttachments(requestId, todoId, attachments);
+}
+
+async function deleteTodoAttachmentFiles(requestId, todoId) {
+  const existing = (await query(
+    `SELECT storage_path
+     FROM todo_attachments
+     WHERE request_id=@requestId AND todo_id=@todoId`,
+    { requestId, todoId }
+  )).recordset;
+  for (const attachment of existing) {
+    await deleteStoredAttachment(attachment.storage_path);
+  }
+}
+
+function isNewAttachment(attachment) {
+  return typeof attachment?.dataUrl === "string" && attachment.dataUrl.startsWith("data:");
+}
+
+async function getAttachmentStorageContext(requestId, { bucket } = {}) {
+  const result = await query(
+    `SELECT r.request_no, r.created_at, requester.branch, requester.department, s.name AS request_section
+     FROM requests r
+     JOIN users requester ON requester.id = r.requester_user_id
+     LEFT JOIN request_sections s ON s.id = r.section_id
+     WHERE r.id=@requestId`,
+    { requestId }
+  );
+  const row = result.recordset[0] || {};
+  return {
+    branch: row.branch,
+    department: row.department,
+    section: row.request_section,
+    createdAt: row.created_at,
+    requestNo: row.request_no,
+    bucket
+  };
+}
+
+async function getAttachmentForDownload(kind, attachmentId, user, sectionId, sectionAccess) {
+  const isTodo = kind === "todo";
+  const table = isTodo ? "todo_attachments" : "request_attachments";
+  const result = await query(
+    `SELECT a.id, a.request_id, a.file_name, a.content_type, a.data_url, a.storage_path,
+            r.section_id, r.requester_user_id, r.incharge_user_id, r.support_user_id
+     FROM ${table} a
+     JOIN requests r ON r.id = a.request_id
+     WHERE a.id=@attachmentId AND r.section_id=@sectionId`,
+    { attachmentId, sectionId }
+  );
+  const row = result.recordset[0];
+  if (!row) return null;
+  return canAccessRequest(row, user, sectionAccess) ? row : null;
+}
+
+async function getExtensionHistory(requestId) {
+  const result = await query(
+    `SELECT e.*, requested_by.display_name AS requested_by_name,
+            requested_by.branch AS requested_by_branch, requested_by.department AS requested_by_department, requested_by.section AS requested_by_section,
+            first_user.display_name AS first_approved_by_name,
+            first_user.branch AS first_approved_by_branch, first_user.department AS first_approved_by_department, first_user.section AS first_approved_by_section,
+            second_user.display_name AS second_approved_by_name,
+            second_user.branch AS second_approved_by_branch, second_user.department AS second_approved_by_department, second_user.section AS second_approved_by_section,
+            rejected_user.display_name AS rejected_by_name,
+            rejected_user.branch AS rejected_by_branch, rejected_user.department AS rejected_by_department, rejected_user.section AS rejected_by_section
+     FROM schedule_extension_requests e
+     JOIN users requested_by ON requested_by.id = e.requested_by
+     LEFT JOIN users first_user ON first_user.id = e.first_approved_by
+     LEFT JOIN users second_user ON second_user.id = e.second_approved_by
+     LEFT JOIN users rejected_user ON rejected_user.id = e.rejected_by
+     WHERE e.request_id=@requestId
+     ORDER BY e.created_at DESC`,
+    { requestId }
+  );
+  for (const extension of result.recordset) {
+    extension.approvalSteps = (await query(
+      `SELECT a.*, u.display_name AS approver_name
+       FROM schedule_extension_approval_steps a
+       LEFT JOIN users u ON u.id = a.approver_user_id
+       WHERE a.extension_id=@extensionId
+       ORDER BY a.sequence_no`,
+      { extensionId: extension.id }
+    )).recordset;
+  }
+  return result.recordset;
+}
+
+function attachmentSchema({ defaultEmpty = true } = {}) {
+  const schema = z.array(z.object({
+    id: z.number().int().positive().optional().nullable(),
+    kind: z.string().max(30).optional().nullable(),
+    fileName: z.string().min(1).max(255),
+    contentType: z.string().max(100).optional().nullable(),
+    dataUrl: z.string().optional().nullable()
+  }).refine(
+    attachment => Boolean(attachment.id) || isNewAttachment(attachment),
+    { message: "Attachment must include an existing id or a data URL" }
+  )).max(5);
+  return defaultEmpty ? schema.optional().default([]) : schema.optional();
+}
+
+async function generateRequestNumber(sectionId, requestPrefix = "AR") {
+  const now = new Date();
+  const yy = `${now.getUTCFullYear()}`.slice(-2);
+  const mm = `${now.getUTCMonth() + 1}`.padStart(2, "0");
+  const dd = `${now.getUTCDate()}`.padStart(2, "0");
+  const safePrefix = `${requestPrefix || "AR"}`.trim().toUpperCase().replace(/[^A-Z0-9]/g, "") || "AR";
+  const prefix = `${safePrefix}-${yy}${mm}${dd}-`;
+  const result = await query(
+    `SELECT TOP 1 request_no
+     FROM requests
+     WHERE section_id=@sectionId AND request_no LIKE @prefix + '%'
+     ORDER BY request_no DESC`,
+    { prefix, sectionId }
+  );
+  const latest = result.recordset[0]?.request_no || "";
+  const latestNo = Number.parseInt(latest.slice(prefix.length), 10);
+  const nextNo = Number.isFinite(latestNo) ? latestNo + 1 : 1;
+  return `${prefix}${String(nextNo).padStart(4, "0")}`;
+}
+
+async function notifyFirstCloseApprover(requestId) {
+  const row = (await query(
+    `SELECT TOP 1 u.id, u.email, r.request_no
+     FROM approval_steps a
+     JOIN users u ON u.id = a.approver_user_id
+     JOIN requests r ON r.id = a.request_id
+     WHERE a.request_id=@requestId AND a.sequence_no >= 100 AND a.status='PENDING'
+     ORDER BY a.sequence_no`,
+    { requestId }
+  )).recordset[0];
+  if (!row) return;
+  await notify({
+    userId: row.id,
+    requestId,
+    type: "CLOSE",
+    title: "Work complete needs close approval",
+    body: row.request_no
+  });
+  await sendMail({
+    to: row.email,
+    subject: `[Automation Request] Close approval required: ${row.request_no}`,
+    html: `<p>Automation work is submitted complete. Please close <strong>${row.request_no}</strong>.</p>`,
+    requestId,
+    type: "CLOSE"
+  });
+}
+
+async function notifyRequestParticipants(requestId, type, title, body) {
+  const row = (await query(
+    `SELECT r.request_no, r.requester_user_id, r.incharge_user_id, r.support_user_id
+     FROM requests r
+     WHERE r.id=@requestId`,
+    { requestId }
+  )).recordset[0];
+  if (!row) return;
+  const ids = [...new Set([row.requester_user_id, row.incharge_user_id, row.support_user_id].filter(Boolean))];
+  for (const userId of ids) {
+    const user = (await query("SELECT email FROM users WHERE id=@userId", { userId })).recordset[0];
+    await notify({
+      userId,
+      requestId,
+      type,
+      title,
+      body: body || row.request_no
+    });
+    if (user?.email) {
+      await sendMail({
+        to: user.email,
+        subject: `[Automation Request] ${title}: ${row.request_no}`,
+        html: `<p>${body || row.request_no}</p>`,
+        requestId,
+        type
+      });
+    }
+  }
+}
+
+async function assertTodoWindow(requestId, sectionId, plannedStart, plannedEnd) {
+  const row = (await query(
+    "SELECT planned_start, planned_end FROM requests WHERE id=@requestId AND section_id=@sectionId",
+    { requestId, sectionId }
+  )).recordset[0];
+  if (!row?.planned_start || !row?.planned_end) return;
+  const start = new Date(plannedStart);
+  const end = new Date(plannedEnd);
+  if (start < row.planned_start || end > row.planned_end || start > end) {
+    const err = new Error("Todo period must be inside assigned project period");
+    err.status = 400;
+    throw err;
+  }
+}
+
+function canAccessRequest(row, user, sectionAccess) {
+  return Boolean(
+    sectionAccess?.canViewAll ||
+    row.requester_user_id === user.id ||
+    row.incharge_user_id === user.id ||
+    row.support_user_id === user.id
+  );
+}
+
+async function assertCanManageRequestWork(requestId, user, sectionAccess, sectionId) {
+  const request = (await query(
+    `SELECT requester_user_id, incharge_user_id, support_user_id
+     FROM requests
+     WHERE id=@requestId AND section_id=@sectionId`,
+    { requestId, sectionId }
+  )).recordset[0];
+  if (!request) {
+    const err = new Error("Request not found");
+    err.status = 404;
+    throw err;
+  }
+  const canManage =
+    sectionAccess?.isAdmin ||
+    request.incharge_user_id === user.id ||
+    request.support_user_id === user.id;
+  if (!canManage) {
+    const err = new Error("Only assigned incharge/support can update work items");
+    err.status = 403;
+    throw err;
+  }
+  return request;
+}
+
+function formatDate(value) {
+  if (!value) return "-";
+  return new Date(value).toISOString().slice(0, 10);
+}
+
+module.exports = router;
