@@ -38,7 +38,10 @@ function buildSessionUser(user) {
     branch: user.branch,
     department: user.department,
     section: user.section,
-    roleCode: user.role_code || user.roleCode
+    roleCode: user.role_code || user.roleCode,
+    pdpaConsentAccepted: user.pdpa_consent_accepted === true ||
+      user.pdpa_consent_accepted === 1 ||
+      user.pdpaConsentAccepted === true
   };
 }
 
