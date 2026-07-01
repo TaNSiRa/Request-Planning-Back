@@ -1,0 +1,17 @@
+
+# FVM Version Cache
+.fvm/
+
+# Environment/config
+.env
+.env.example
+web/auth_config.js
+
+# Flutter generated files
+.dart_tool/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# Local logs
+*.log
