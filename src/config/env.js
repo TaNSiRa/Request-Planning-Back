@@ -1,4 +1,8 @@
-﻿require("dotenv").config();
+﻿const path = require("path");
+
+require("dotenv").config({
+  path: path.resolve(__dirname, "../../.env"),
+});
 
 function boolEnv(name, defaultValue = false) {
   const value = process.env[name];
