@@ -5,10 +5,29 @@ const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
 const { audit } = require("../../middleware/audit");
 const { requireAdmin, resolveSection } = require("../../services/sectionService");
+const { verifyMail, isMailConfigured, sendMail } = require("../../services/mailService");
 
 const router = express.Router();
 router.use(requireAuth);
 router.use(resolveSection);
+
+// Check the SMTP connection/credentials without sending anything.
+router.get("/mail/verify", requireAdmin, asyncHandler(async (req, res) => {
+  res.json({ configured: isMailConfigured(), ...(await verifyMail()) });
+}));
+
+// Send a real test email to prove end-to-end delivery works.
+router.post("/mail/test", requireAdmin, audit("TEST", "MAIL"), asyncHandler(async (req, res) => {
+  const schema = z.object({ to: z.string().email() });
+  const input = schema.parse(req.body);
+  const result = await sendMail({
+    to: input.to,
+    subject: "Test email — Request & Planning",
+    html: "<p>This is a test email from the Request &amp; Planning system. If you received it, SMTP delivery is working.</p>",
+    type: "TEST"
+  });
+  res.json(result);
+}));
 
 router.get("/", requireAdmin, asyncHandler(async (req, res) => {
   const result = await query(
