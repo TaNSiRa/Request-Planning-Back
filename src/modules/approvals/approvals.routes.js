@@ -7,7 +7,7 @@ const { audit } = require("../../middleware/audit");
 const { notify } = require("../../services/notificationService");
 const { sendMail } = require("../../services/mailService");
 const { emitSystem } = require("../../services/realtimeService");
-const { isAdmin, resolveSection } = require("../../services/sectionService");
+const { isAdmin, resolveSection, getSectionName } = require("../../services/sectionService");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -15,8 +15,10 @@ router.use(resolveSection);
 
 router.get("/pending", asyncHandler(async (req, res) => {
   const result = await query(
-    `SELECT a.*, ars.can_assign_work, r.request_no, r.title, r.priority, r.due_date, r.request_type, r.system_area,
+    `SELECT a.*, r.request_no, r.title, r.priority, r.due_date, r.request_type, r.system_area,
             r.description, r.business_impact, r.is_kpi, r.incharge_user_id, r.support_user_id, r.planned_start, r.planned_end,
+            r.section_id AS target_section_id, r.requester_section_id,
+            ts.name AS target_section_name, rs.name AS origin_section_name,
             u.display_name AS requester_name, inc.display_name AS incharge_name, sup.display_name AS support_name,
             u.branch AS requester_branch, u.department AS requester_department, u.section AS requester_section,
             inc.branch AS incharge_branch, inc.department AS incharge_department, inc.section AS incharge_section,
@@ -25,11 +27,11 @@ router.get("/pending", asyncHandler(async (req, res) => {
      FROM approval_steps a
      JOIN requests r ON r.id = a.request_id
      JOIN users u ON u.id = r.requester_user_id
+     JOIN request_sections ts ON ts.id = r.section_id
+     LEFT JOIN request_sections rs ON rs.id = r.requester_section_id
      LEFT JOIN users inc ON inc.id = r.incharge_user_id
      LEFT JOIN users sup ON sup.id = r.support_user_id
-     LEFT JOIN approval_route_steps ars ON ars.route_id = a.route_id AND ars.sequence_no =
-       CASE WHEN a.sequence_no >= 100 THEN a.sequence_no - 100 ELSE a.sequence_no END
-     WHERE r.section_id=@sectionId
+     WHERE (r.section_id=@sectionId OR r.requester_section_id=@sectionId)
        AND (@isAdmin = 1 OR a.approver_user_id=@userId)
        AND a.status='PENDING'
      ORDER BY r.created_at`,
@@ -37,7 +39,11 @@ router.get("/pending", asyncHandler(async (req, res) => {
   );
   const rows = [];
   for (const row of result.recordset) {
-    rows.push({ ...row, attachments: await getAttachments(row.request_id) });
+    const supTypes = (await query(
+      "SELECT sup_type FROM request_support_types WHERE request_id=@id ORDER BY sup_type",
+      { id: row.request_id }
+    )).recordset.map(r => r.sup_type);
+    rows.push({ ...row, attachments: await getAttachments(row.request_id), supTypes });
   }
   res.json({ data: rows });
 }));
@@ -70,7 +76,8 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
     supportUserId: z.number().int().optional().nullable(),
     plannedStart: z.string().optional().nullable(),
     plannedEnd: z.string().optional().nullable(),
-    isKpi: z.boolean().optional().nullable()
+    isKpi: z.boolean().optional().nullable(),
+    supTypes: z.array(z.string().trim().min(1)).optional().nullable()
   });
   const input = schema.parse(req.body);
   const values = {
@@ -107,9 +114,18 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
        status='PENDING_APPROVAL', updated_at=SYSUTCDATETIME() WHERE id=@requestId`,
       { ...values, requestId: step.request_id }
     );
+    // Replace the request's support-type tags with the approver's selection.
+    const supTypes = [...new Set((input.supTypes ?? []).map(s => s.trim()).filter(Boolean))];
+    await query("DELETE FROM request_support_types WHERE request_id=@requestId", { requestId: step.request_id });
+    for (const supType of supTypes) {
+      await query(
+        "INSERT INTO request_support_types (request_id, sup_type) VALUES (@requestId, @supType)",
+        { requestId: step.request_id, supType }
+      );
+    }
     if (step.sequence_no === 1 ||
-        step.incharge_user_id !== values.inchargeUserId ||
-        step.support_user_id !== values.supportUserId) {
+      step.incharge_user_id !== values.inchargeUserId ||
+      step.support_user_id !== values.supportUserId) {
       await notifyAssignedUsers(step.request_id, step.request_no, values.inchargeUserId, values.supportUserId);
     }
   }
@@ -127,7 +143,7 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
     await query("UPDATE approval_steps SET status='PENDING', updated_at=SYSUTCDATETIME() WHERE id=@id", { id: next.id });
     const title = isCloseApproval ? "Close request needs approval" : "Request needs approval";
     await notify({ userId: next.approver_user_id, requestId: step.request_id, type: "APPROVAL", title, body: step.request_no });
-    await sendMail({ to: next.email, subject: `[Automation Request] Approval required: ${step.request_no}`, html: `<p>Please approve ${step.request_no}</p>`, requestId: step.request_id, type: "APPROVAL" });
+    await sendMail({ to: next.email, subject: `[${req.section.name}] Approval required: ${step.request_no}`, html: `<p>Please approve ${step.request_no}</p>`, requestId: step.request_id, type: "APPROVAL" });
   } else {
     if (isCloseApproval) {
       await query("UPDATE requests SET status='COMPLETED', closed_by=@userId, closed_at=SYSUTCDATETIME(), updated_at=SYSUTCDATETIME() WHERE id=@id", {
@@ -211,7 +227,7 @@ router.post("/extension/:extensionId/approve", audit("APPROVE", "EXTENSION_REQUE
     });
     await sendMail({
       to: next.email,
-      subject: `[Automation Request] Extension approval required: ${step.request_no}`,
+      subject: `[${req.section.name}] Extension approval required: ${step.request_no}`,
       html: `<p>Please review schedule extension request for <strong>${step.request_no}</strong>.</p>`,
       requestId: step.request_id,
       type: "EXTENSION"
@@ -265,15 +281,13 @@ router.post("/extension/:extensionId/reject", audit("REJECT", "EXTENSION_REQUEST
 
 async function getStep(stepId, user, sectionId) {
   return (await query(
-    `SELECT a.*, ars.can_assign_work,
+    `SELECT a.*,
             r.request_no, r.status AS request_status, r.incharge_user_id, r.support_user_id,
             r.planned_start, r.planned_end, r.is_kpi
      FROM approval_steps a
      JOIN requests r ON r.id=a.request_id
-     LEFT JOIN approval_route_steps ars ON ars.route_id = a.route_id AND ars.sequence_no =
-       CASE WHEN a.sequence_no >= 100 THEN a.sequence_no - 100 ELSE a.sequence_no END
      WHERE a.id=@stepId
-       AND r.section_id=@sectionId
+       AND (r.section_id=@sectionId OR r.requester_section_id=@sectionId)
        AND (@isAdmin=1 OR a.approver_user_id=@userId)
        AND a.status='PENDING'`,
     {
@@ -286,8 +300,10 @@ async function getStep(stepId, user, sectionId) {
 }
 
 async function getExtensionStep(extensionId, user, sectionId) {
+  // a.* already includes extension_id (the FK), so don't alias e.id to it again
+  // — a duplicate column name makes the mssql driver return an array.
   return (await query(
-    `SELECT a.*, e.id AS extension_id, e.request_id, e.requested_by, e.requested_start, e.requested_end,
+    `SELECT a.*, e.request_id, e.requested_by, e.requested_start, e.requested_end,
             r.request_no
      FROM schedule_extension_approval_steps a
      JOIN schedule_extension_requests e ON e.id = a.extension_id
@@ -309,6 +325,7 @@ async function getExtensionStep(extensionId, user, sectionId) {
 async function notifyAssignedUsers(requestId, requestNo, inchargeUserId, supportUserId) {
   const ids = [inchargeUserId, supportUserId].filter(Boolean);
   if (!ids.length) return;
+  const sectionName = await getSectionName(requestId);
   const result = await query(
     `SELECT id, email, display_name FROM users WHERE id IN (${ids.map((_, index) => `@id${index}`).join(",")})`,
     Object.fromEntries(ids.map((id, index) => [`id${index}`, id]))
@@ -318,13 +335,13 @@ async function notifyAssignedUsers(requestId, requestNo, inchargeUserId, support
       userId: user.id,
       requestId,
       type: "ASSIGN",
-      title: "Automation work assigned",
+      title: `${sectionName} assigned`,
       body: requestNo
     });
     await sendMail({
       to: user.email,
-      subject: `[Automation Request] Assigned: ${requestNo}`,
-      html: `<p>You have been assigned to automation request <strong>${requestNo}</strong>.</p>`,
+      subject: `[${sectionName}] Assigned: ${requestNo}`,
+      html: `<p>You have been assigned to ${sectionName.toLowerCase()} <strong>${requestNo}</strong>.</p>`,
       requestId,
       type: "ASSIGN"
     });
@@ -355,6 +372,7 @@ async function notifyRequestParticipants(requestId, type, title, body) {
     { requestId }
   )).recordset[0];
   if (!row) return;
+  const sectionName = await getSectionName(requestId);
   const ids = [...new Set([row.requester_user_id, row.incharge_user_id, row.support_user_id].filter(Boolean))];
   for (const userId of ids) {
     const user = (await query("SELECT email FROM users WHERE id=@userId", { userId })).recordset[0];
@@ -368,7 +386,7 @@ async function notifyRequestParticipants(requestId, type, title, body) {
     if (user?.email) {
       await sendMail({
         to: user.email,
-        subject: `[Automation Request] ${title}: ${row.request_no}`,
+        subject: `[${sectionName}] ${title}: ${row.request_no}`,
         html: `<p>${body || row.request_no}</p>`,
         requestId,
         type

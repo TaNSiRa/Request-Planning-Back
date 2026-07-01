@@ -17,7 +17,11 @@ router.get("/", requireAdmin, asyncHandler(async (req, res) => {
   const result = await query(
     `SELECT u.id, u.employee_no, u.email, u.display_name, u.branch, u.department, u.section, u.phone, u.is_active, u.role_id,
             r.code AS role_code, r.name AS role_name,
-            m.can_request, m.can_work, m.is_active AS membership_active
+            m.can_request, m.can_work, m.is_active AS membership_active,
+            (SELECT ms.section_id, ms.can_request, ms.can_work
+               FROM user_section_memberships ms
+               WHERE ms.user_id = u.id AND ms.is_active = 1
+               FOR JSON PATH) AS memberships_json
      FROM users u
      JOIN roles r ON r.id = u.role_id
      LEFT JOIN user_section_memberships m ON m.user_id = u.id AND m.section_id = @sectionId
@@ -25,7 +29,11 @@ router.get("/", requireAdmin, asyncHandler(async (req, res) => {
      ORDER BY u.display_name`,
     { sectionId: req.section.id }
   );
-  res.json({ data: result.recordset });
+  const rows = result.recordset.map(row => {
+    const { memberships_json, ...rest } = row;
+    return { ...rest, memberships: memberships_json ? JSON.parse(memberships_json) : [] };
+  });
+  res.json({ data: rows });
 }));
 
 router.get("/assignees", asyncHandler(async (req, res) => {
@@ -54,11 +62,15 @@ router.post("/", requireAdmin, audit("CREATE", "USER", req => req.body.email), a
     section: z.string().min(1),
     phone: z.string().optional().nullable(),
     canRequest: z.boolean().optional().default(true),
-    canWork: z.boolean().optional().default(true)
+    canWork: z.boolean().optional().default(true),
+    memberships: membershipsSchema
   });
   const input = schema.parse(req.body);
+  // Exclude non-column fields (arrays/flags) from the INSERT params — passing an
+  // array to mssql throws "Invalid string".
+  const { memberships, canRequest, canWork, ...userInput } = input;
   const values = {
-    ...input,
+    ...userInput,
     employeeNo: input.employeeNo ?? null,
     branch: input.branch ?? null,
     department: input.department ?? null,
@@ -73,7 +85,11 @@ router.post("/", requireAdmin, audit("CREATE", "USER", req => req.body.email), a
     { ...values, email: input.email.toLowerCase(), passwordHash }
   );
   const userId = result.recordset[0].id;
-  await upsertMembership(userId, req.section.id, input.canRequest, input.canWork);
+  if (input.memberships && input.memberships.length) {
+    await setMemberships(userId, input.memberships);
+  } else {
+    await upsertMembership(userId, req.section.id, input.canRequest, input.canWork);
+  }
   res.status(201).json({ id: userId });
 }));
 
@@ -89,7 +105,8 @@ router.patch("/:id(\\d+)", requireAdmin, audit("EDIT", "USER", req => req.params
     phone: z.string().optional().nullable(),
     isActive: z.boolean(),
     canRequest: z.boolean().optional().default(true),
-    canWork: z.boolean().optional().default(true)
+    canWork: z.boolean().optional().default(true),
+    memberships: membershipsSchema
   });
   const input = schema.parse(req.body);
   await query(
@@ -110,7 +127,11 @@ router.patch("/:id(\\d+)", requireAdmin, audit("EDIT", "USER", req => req.params
       isActive: input.isActive
     }
   );
-  await upsertMembership(Number(req.params.id), req.section.id, input.canRequest, input.canWork);
+  if (input.memberships) {
+    await setMemberships(Number(req.params.id), input.memberships);
+  } else {
+    await upsertMembership(Number(req.params.id), req.section.id, input.canRequest, input.canWork);
+  }
   res.json({ ok: true });
 }));
 
@@ -177,6 +198,23 @@ async function upsertMembership(userId, sectionId, canRequest = true, canWork = 
        VALUES (@userId, @sectionId, @canRequest, @canWork, 1);`,
     { userId, sectionId, canRequest, canWork }
   );
+}
+
+// Per-section access chosen in the user form: which sections the user can
+// request/work in. Deactivates any section not in the list.
+const membershipsSchema = z
+  .array(z.object({
+    sectionId: z.number().int().positive(),
+    canRequest: z.boolean().optional().default(true),
+    canWork: z.boolean().optional().default(true)
+  }))
+  .optional();
+
+async function setMemberships(userId, memberships) {
+  await query("UPDATE user_section_memberships SET is_active=0 WHERE user_id=@userId", { userId });
+  for (const m of memberships) {
+    await upsertMembership(userId, m.sectionId, m.canRequest !== false, m.canWork !== false);
+  }
 }
 
 module.exports = router;

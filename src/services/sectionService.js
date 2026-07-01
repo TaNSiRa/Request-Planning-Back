@@ -15,6 +15,8 @@ async function getUserSections(user) {
             CAST(CASE WHEN @isAdmin = 1 THEN 1 ELSE COALESCE(m.can_request, 0) END AS BIT) AS can_request,
             CAST(CASE WHEN @isAdmin = 1 THEN 1 ELSE COALESCE(m.can_work, 0) END AS BIT) AS can_work,
             CAST(CASE WHEN @isAdmin = 1 THEN 1 ELSE 0 END AS BIT) AS is_admin,
+            (SELECT COUNT(1) FROM notifications n
+               WHERE n.user_id = @userId AND n.section_id = s.id AND n.read_at IS NULL) AS unread_count,
             CAST(CASE WHEN EXISTS (
               SELECT 1
               FROM approval_routes ar
@@ -40,7 +42,8 @@ async function getUserSections(user) {
     canRequest: section.can_request === true || section.can_request === 1,
     canWork: section.can_work === true || section.can_work === 1,
     isAdmin: section.is_admin === true || section.is_admin === 1,
-    isApprover: section.is_approver === true || section.is_approver === 1
+    isApprover: section.is_approver === true || section.is_approver === 1,
+    unreadCount: section.unread_count || 0
   }));
 }
 
@@ -93,12 +96,25 @@ async function resolveSection(req, res, next) {
   }
 }
 
+async function getSectionName(requestId) {
+  if (!requestId) return "Request";
+  const result = await query(
+    `SELECT s.name
+     FROM requests r
+     JOIN request_sections s ON s.id = r.section_id
+     WHERE r.id = @requestId`,
+    { requestId }
+  );
+  return result.recordset[0]?.name || "Request";
+}
+
 function requireAdmin(req, res, next) {
   if (isAdmin(req.user)) return next();
   return res.status(403).json({ message: "Forbidden" });
 }
 
 module.exports = {
+  getSectionName,
   getUserSections,
   isAdmin,
   normalizeSectionCode,

@@ -47,7 +47,14 @@ app.use(helmet({
 app.use(cors(corsOptions));
 app.use(compression());
 app.use(express.json({ limit: "50mb" }));
-app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 500 }));
+app.use(rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 3000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  // Return JSON (not plain text) so the frontend can parse the error body.
+  message: { message: "Too many requests, please slow down and try again shortly." }
+}));
 app.use(sessionMiddleware());
 app.use(csrfProtection);
 
@@ -64,5 +71,5 @@ app.use(notFound);
 app.use(errorHandler);
 
 server.listen(env.apiPort, env.apiHost, () => {
-  console.log(`Automation Request API running at http://${env.apiHost}:${env.apiPort}`);
+  console.log(`Request & Planning API running at http://${env.apiHost}:${env.apiPort}`);
 });

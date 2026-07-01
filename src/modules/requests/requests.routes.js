@@ -8,7 +8,7 @@ const { sendMail } = require("../../services/mailService");
 const { notify } = require("../../services/notificationService");
 const { emitSystem } = require("../../services/realtimeService");
 const { storeDataUrlAttachment, readAttachmentAsDataUrl, deleteStoredAttachment } = require("../../services/attachmentStorage");
-const { isAdmin, resolveSection } = require("../../services/sectionService");
+const { isAdmin, resolveSection, getSectionName } = require("../../services/sectionService");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -22,7 +22,12 @@ router.get("/", asyncHandler(async (req, res) => {
             u.branch AS requester_branch, u.department AS requester_department, u.section AS requester_section,
             au.branch AS incharge_branch, au.department AS incharge_department, au.section AS incharge_section,
             su.branch AS support_branch, su.department AS support_department, su.section AS support_section,
-            todo.todo_total, todo.todo_done, todo.todo_progress_percent
+            todo.todo_total, todo.todo_done, todo.todo_progress_percent,
+            (SELECT t2.id, t2.title, t2.planned_start, t2.planned_end, t2.is_done
+               FROM request_todos t2
+               WHERE t2.request_id = r.id
+               ORDER BY t2.sort_order, t2.id
+               FOR JSON PATH) AS todos_json
      FROM requests r
      JOIN users u ON u.id = r.requester_user_id
      LEFT JOIN users au ON au.id = r.incharge_user_id
@@ -38,9 +43,8 @@ router.get("/", asyncHandler(async (req, res) => {
        WHERE t.request_id = r.id
      ) todo
      WHERE (@status IS NULL OR r.status = @status)
-       AND r.section_id = @sectionId
+       AND (r.section_id = @sectionId OR r.requester_section_id = @sectionId)
        AND (@type IS NULL OR r.request_type = @type)
-       AND (@canViewAll = 1 OR r.requester_user_id = @userId OR r.incharge_user_id = @userId OR r.support_user_id = @userId)
        AND (@q IS NULL OR r.title LIKE '%' + @q + '%' OR r.request_no LIKE '%' + @q + '%')
        AND (@from IS NULL OR r.created_at >= @from)
        AND (@to IS NULL OR r.created_at <= @to)
@@ -56,7 +60,11 @@ router.get("/", asyncHandler(async (req, res) => {
       canViewAll
     }
   );
-  res.json({ data: result.recordset });
+  const rows = result.recordset.map(row => {
+    const { todos_json, ...rest } = row;
+    return { ...rest, todos: todos_json ? JSON.parse(todos_json) : [] };
+  });
+  res.json({ data: rows });
 }));
 
 router.get("/attachments/:kind/:attachmentId/data-url", asyncHandler(async (req, res) => {
@@ -81,16 +89,21 @@ router.get("/:id", asyncHandler(async (req, res) => {
     `SELECT r.*, requester.display_name AS requester_name, inc.display_name AS incharge_name, sup.display_name AS support_name,
             requester.branch AS requester_branch, requester.department AS requester_department, requester.section AS requester_section,
             inc.branch AS incharge_branch, inc.department AS incharge_department, inc.section AS incharge_section,
-            sup.branch AS support_branch, sup.department AS support_department, sup.section AS support_section
+            sup.branch AS support_branch, sup.department AS support_department, sup.section AS support_section,
+            ts.name AS target_section_name, os.name AS origin_section_name
      FROM requests r
      JOIN users requester ON requester.id = r.requester_user_id
+     JOIN request_sections ts ON ts.id = r.section_id
+     LEFT JOIN request_sections os ON os.id = r.requester_section_id
      LEFT JOIN users inc ON inc.id = r.incharge_user_id
      LEFT JOIN users sup ON sup.id = r.support_user_id
-     WHERE r.id=@id AND r.section_id=@sectionId`,
+     WHERE r.id=@id AND (r.section_id=@sectionId OR r.requester_section_id=@sectionId)`,
     { id, sectionId: req.section.id }
   )).recordset[0];
   if (!request) return res.status(404).json({ message: "Request not found" });
-  if (!canAccessRequest(request, req.user, req.sectionAccess)) return res.status(403).json({ message: "Forbidden" });
+  // Any member of the section may view a request in that section (the query is
+  // already scoped by section_id). Mutations stay gated by their own checks
+  // (e.g. assertCanManageRequestWork, requester/admin).
   const todos = (await query("SELECT * FROM request_todos WHERE request_id=@id ORDER BY sort_order, id", { id })).recordset;
   const todoAttachments = await getTodoAttachments(id);
   for (const todo of todos) {
@@ -105,7 +118,10 @@ router.get("/:id", asyncHandler(async (req, res) => {
      WHERE a.request_id=@id ORDER BY sequence_no`,
     { id }
   )).recordset;
-  res.json({ data: { ...request, todos, approvals, attachments, extensionHistory } });
+  const supTypes = (await query(
+    "SELECT sup_type FROM request_support_types WHERE request_id=@id ORDER BY sup_type", { id }
+  )).recordset.map(r => r.sup_type);
+  res.json({ data: { ...request, todos, approvals, attachments, extensionHistory, supTypes } });
 }));
 
 router.get("/:id/export.txt", asyncHandler(async (req, res) => {
@@ -119,11 +135,11 @@ router.get("/:id/export.txt", asyncHandler(async (req, res) => {
      JOIN users requester ON requester.id = r.requester_user_id
      LEFT JOIN users inc ON inc.id = r.incharge_user_id
      LEFT JOIN users sup ON sup.id = r.support_user_id
-     WHERE r.id=@id AND r.section_id=@sectionId`,
+     WHERE r.id=@id AND (r.section_id=@sectionId OR r.requester_section_id=@sectionId)`,
     { id, sectionId: req.section.id }
   )).recordset[0];
   if (!detail) return res.status(404).send("Request not found");
-  if (!canAccessRequest(detail, req.user, req.sectionAccess)) return res.status(403).send("Forbidden");
+  // View-only export: allowed for any member of the request's section.
   const todos = (await query("SELECT * FROM request_todos WHERE request_id=@id ORDER BY sort_order, id", { id })).recordset;
   const todoAttachments = await getTodoAttachments(id);
   const attachments = await getAttachments(id);
@@ -165,12 +181,12 @@ router.get("/:id/export.txt", asyncHandler(async (req, res) => {
 
 router.post("/", audit("CREATE", "REQUEST", req => req.body.title), asyncHandler(async (req, res) => {
   const schema = z.object({
-    title: z.string().min(3),
-    requestType: z.string().min(2),
+    title: z.string().min(1),
+    requestType: z.string().min(1),
     systemArea: z.string().min(1),
     priority: z.string().min(1).default("NORMAL"),
     dueDate: z.string(),
-    description: z.string().min(5),
+    description: z.string().min(1),
     businessImpact: z.string().min(1),
     attachments: attachmentSchema()
   });
@@ -181,16 +197,21 @@ router.post("/", audit("CREATE", "REQUEST", req => req.body.title), asyncHandler
     systemArea: input.systemArea ?? null,
     businessImpact: input.businessImpact ?? null
   };
+  // The request lives in the section it's created in (the executing/handling
+  // section). The requester's home section (from their profile) is the origin;
+  // if it differs, a stage-1 origin approval is inserted ahead of this section's
+  // route. See resolveRequesterSection.
+  const requesterSectionId = await resolveRequesterSection(req.user.section, req.section.id);
   const number = await generateRequestNumber(req.section.id, req.section.requestPrefix || "AR");
   const insert = await query(
-    `INSERT INTO requests (section_id, request_no, requester_user_id, title, request_type, system_area, priority, due_date, description, business_impact, status)
+    `INSERT INTO requests (section_id, requester_section_id, request_no, requester_user_id, title, request_type, system_area, priority, due_date, description, business_impact, status)
      OUTPUT INSERTED.id
-     VALUES (@sectionId, @number, @userId, @title, @requestType, @systemArea, @priority, @dueDate, @description, @businessImpact, 'PENDING_APPROVAL')`,
-    { ...values, sectionId: req.section.id, number, userId: req.user.id }
+     VALUES (@sectionId, @requesterSectionId, @number, @userId, @title, @requestType, @systemArea, @priority, @dueDate, @description, @businessImpact, 'PENDING_APPROVAL')`,
+    { ...values, sectionId: req.section.id, requesterSectionId, number, userId: req.user.id }
   );
   const requestId = insert.recordset[0].id;
   await saveAttachments(requestId, attachments);
-  await createApprovalSteps(requestId, req.section.id, input.requestType);
+  await createApprovalSteps(requestId, req.section.id, requesterSectionId, input.requestType);
   await notifyRequestParticipants(requestId, "CREATE", "Request submitted", number);
   await notifyFirstApprover(requestId, number);
   emitSystem("request.created", { id: requestId, requestNo: number, status: "PENDING_APPROVAL" });
@@ -199,7 +220,8 @@ router.post("/", audit("CREATE", "REQUEST", req => req.body.title), asyncHandler
 
 router.patch("/:id/cancel", audit("CANCEL", "REQUEST"), asyncHandler(async (req, res) => {
   const id = Number(req.params.id);
-  const row = (await query("SELECT * FROM requests WHERE id=@id AND section_id=@sectionId", {
+  const row = (await query(
+    "SELECT * FROM requests WHERE id=@id AND (section_id=@sectionId OR requester_section_id=@sectionId)", {
     id,
     sectionId: req.section.id
   })).recordset[0];
@@ -218,7 +240,7 @@ router.patch("/:id/cancel", audit("CANCEL", "REQUEST"), asyncHandler(async (req,
 
 router.post("/:id/todos", audit("CREATE", "TODO"), asyncHandler(async (req, res) => {
   const schema = z.object({
-    title: z.string().min(2),
+    title: z.string().trim().min(1),
     description: z.string().optional().nullable(),
     plannedStart: z.string(),
     plannedEnd: z.string(),
@@ -231,7 +253,9 @@ router.post("/:id/todos", audit("CREATE", "TODO"), asyncHandler(async (req, res)
     ...todoInput,
     description: input.description ?? null
   };
-  await assertCanManageRequestWork(Number(req.params.id), req.user, req.sectionAccess, req.section.id);
+  await assertCanManageRequestWork(Number(req.params.id), req.user, req.sectionAccess, req.section.id, {
+    allowSectionMember: req.query.meeting === "1"
+  });
   await assertTodoWindow(Number(req.params.id), req.section.id, input.plannedStart, input.plannedEnd);
   const result = await query(
     `INSERT INTO request_todos (request_id, title, description, planned_start, planned_end, sort_order, created_by)
@@ -245,7 +269,7 @@ router.post("/:id/todos", audit("CREATE", "TODO"), asyncHandler(async (req, res)
 
 router.patch("/:id/todos/:todoId", audit("EDIT", "TODO", req => req.params.todoId), asyncHandler(async (req, res) => {
   const schema = z.object({
-    title: z.string().min(2),
+    title: z.string().trim().min(1),
     description: z.string().optional().nullable(),
     plannedStart: z.string(),
     plannedEnd: z.string(),
@@ -258,7 +282,9 @@ router.patch("/:id/todos/:todoId", audit("EDIT", "TODO", req => req.params.todoI
     ...todoInput,
     description: input.description ?? null
   };
-  await assertCanManageRequestWork(Number(req.params.id), req.user, req.sectionAccess, req.section.id);
+  await assertCanManageRequestWork(Number(req.params.id), req.user, req.sectionAccess, req.section.id, {
+    allowSectionMember: req.query.meeting === "1"
+  });
   await assertTodoWindow(Number(req.params.id), req.section.id, input.plannedStart, input.plannedEnd);
   await query(
     `UPDATE request_todos SET title=@title, description=@description, planned_start=@plannedStart, planned_end=@plannedEnd,
@@ -273,7 +299,9 @@ router.patch("/:id/todos/:todoId", audit("EDIT", "TODO", req => req.params.todoI
 }));
 
 router.delete("/:id/todos/:todoId", audit("DELETE", "TODO", req => req.params.todoId), asyncHandler(async (req, res) => {
-  await assertCanManageRequestWork(Number(req.params.id), req.user, req.sectionAccess, req.section.id);
+  await assertCanManageRequestWork(Number(req.params.id), req.user, req.sectionAccess, req.section.id, {
+    allowSectionMember: req.query.meeting === "1"
+  });
   await deleteTodoAttachmentFiles(Number(req.params.id), Number(req.params.todoId));
   await query("DELETE FROM request_todos WHERE id=@todoId AND request_id=@id", {
     todoId: Number(req.params.todoId),
@@ -284,7 +312,9 @@ router.delete("/:id/todos/:todoId", audit("DELETE", "TODO", req => req.params.to
 
 router.post("/:id/complete-work", audit("COMPLETE_WORK", "REQUEST"), asyncHandler(async (req, res) => {
   const id = Number(req.params.id);
-  await assertCanManageRequestWork(id, req.user, req.sectionAccess, req.section.id);
+  await assertCanManageRequestWork(id, req.user, req.sectionAccess, req.section.id, {
+    allowSectionMember: req.query.meeting === "1"
+  });
   const request = (await query("SELECT request_no, status FROM requests WHERE id=@id AND section_id=@sectionId", {
     id,
     sectionId: req.section.id
@@ -303,11 +333,42 @@ router.post("/:id/complete-work", audit("COMPLETE_WORK", "REQUEST"), asyncHandle
   res.json({ ok: true });
 }));
 
+// Toggle a request between IN_PROGRESS and ON_HOLD. The assigned incharge or an
+// admin may pause/resume work; in Meeting mode (?meeting=1) any section member may.
+router.post("/:id/hold", audit("HOLD", "REQUEST"), asyncHandler(async (req, res) => {
+  const id = Number(req.params.id);
+  const request = (await query(
+    "SELECT request_no, status, incharge_user_id FROM requests WHERE id=@id AND section_id=@sectionId",
+    { id, sectionId: req.section.id }
+  )).recordset[0];
+  if (!request) return res.status(404).json({ message: "Request not found" });
+  const isIncharge = request.incharge_user_id === req.user.id;
+  const fromMeeting = req.query.meeting === "1";
+  if (!isIncharge && !req.sectionAccess?.isAdmin && !fromMeeting) {
+    return res.status(403).json({ message: "Only the assigned incharge can hold this request" });
+  }
+  if (request.status !== "IN_PROGRESS" && request.status !== "ON_HOLD") {
+    return res.status(400).json({ message: "Only in-progress requests can be put on hold" });
+  }
+  const next = request.status === "ON_HOLD" ? "IN_PROGRESS" : "ON_HOLD";
+  await query("UPDATE requests SET status=@next, updated_at=SYSUTCDATETIME() WHERE id=@id", { id, next });
+  await notifyRequestParticipants(
+    id,
+    next,
+    next === "ON_HOLD" ? "Request put on hold" : "Request resumed",
+    next === "ON_HOLD" ? "This request has been put on hold" : "This request is back in progress"
+  );
+  emitSystem("request.updated", { id, status: next });
+  res.json({ ok: true, status: next });
+}));
+
 router.post("/:id/extension-requests", audit("CREATE", "EXTENSION_REQUEST"), asyncHandler(async (req, res) => {
-  const schema = z.object({ requestedStart: z.string(), requestedEnd: z.string(), reason: z.string().min(5) });
+  const schema = z.object({ requestedStart: z.string(), requestedEnd: z.string(), reason: z.string().min(1) });
   const input = schema.parse(req.body);
   const requestId = Number(req.params.id);
-  await assertCanManageRequestWork(requestId, req.user, req.sectionAccess, req.section.id);
+  await assertCanManageRequestWork(requestId, req.user, req.sectionAccess, req.section.id, {
+    allowSectionMember: req.query.meeting === "1"
+  });
   const request = (await query("SELECT planned_start, planned_end, request_type FROM requests WHERE id=@id AND section_id=@sectionId", {
     id: requestId,
     sectionId: req.section.id
@@ -332,23 +393,83 @@ router.post("/:id/extension-requests", audit("CREATE", "EXTENSION_REQUEST"), asy
   res.status(201).json({ id: result.recordset[0].id });
 }));
 
-async function createApprovalSteps(requestId, sectionId, requestType) {
-  const route = await findApprovalRoute(sectionId, requestType);
+// Maps the requester's profile section text (e.g. "Maintenance") to a
+// request_sections id. Returns null when it can't be resolved or resolves to the
+// handling section itself (internal request — no stage-1 origin approval).
+async function resolveRequesterSection(userSectionText, handlingSectionId) {
+  const text = `${userSectionText || ""}`.trim();
+  if (!text) return null;
+  const row = (await query(
+    `SELECT TOP 1 id FROM request_sections
+     WHERE is_active=1 AND (code=@code OR name=@text OR name LIKE @prefix)
+     ORDER BY CASE WHEN code=@code THEN 0 WHEN name=@text THEN 1 ELSE 2 END, id`,
+    { code: text.toUpperCase(), text, prefix: text + "%" }
+  )).recordset[0];
+  if (!row || row.id === handlingSectionId) return null;
+  return row.id;
+}
+
+async function getRouteSteps(routeId) {
+  return (await query(
+    `SELECT sequence_no, step_name, default_approver_user_id, can_assign_work
+     FROM approval_route_steps WHERE route_id=@routeId ORDER BY sequence_no`,
+    { routeId }
+  )).recordset;
+}
+
+// Stage-1 cross-section route: requests from requesterSectionId executed by targetSectionId.
+async function findCrossRoute(targetSectionId, requesterSectionId, requestType) {
+  const result = await query(
+    `SELECT TOP 1 id
+     FROM approval_routes
+     WHERE section_id=@targetSectionId
+       AND requester_section_id=@requesterSectionId
+       AND is_active=1
+       AND (request_type=@requestType OR request_type IS NULL)
+     ORDER BY
+       CASE WHEN request_type=@requestType THEN 0 WHEN is_default=1 THEN 1 ELSE 2 END,
+       is_default DESC, id`,
+    { targetSectionId, requesterSectionId, requestType: requestType || null }
+  );
+  return result.recordset[0] || null;
+}
+
+// Builds the forward approval chain. When the request is cross-section, the
+// requester section's origin-approval route runs first (stage 1), then the
+// target section's internal route (stage 2). Steps are renumbered 1..n.
+async function createApprovalSteps(requestId, targetSectionId, requesterSectionId, requestType) {
+  const combined = [];
+  if (requesterSectionId && requesterSectionId !== targetSectionId) {
+    const crossRoute = await findCrossRoute(targetSectionId, requesterSectionId, requestType);
+    if (crossRoute) {
+      for (const step of await getRouteSteps(crossRoute.id)) combined.push({ routeId: crossRoute.id, step });
+    }
+  }
+  const route = await findApprovalRoute(targetSectionId, requestType);
   if (!route) {
     const err = new Error("No active approval route is configured for this section");
     err.status = 400;
     throw err;
   }
-  await query(
-    `INSERT INTO approval_steps (request_id, route_id, sequence_no, approver_user_id, step_name, status)
-     SELECT @requestId, ar.id, ars.sequence_no, ars.default_approver_user_id, ars.step_name,
-            CASE WHEN ars.sequence_no = 1 THEN 'PENDING' ELSE 'WAITING' END
-     FROM approval_routes ar
-     JOIN approval_route_steps ars ON ars.route_id = ar.id
-     WHERE ar.id = @routeId
-     ORDER BY ars.sequence_no`,
-    { requestId, routeId: route.id }
-  );
+  for (const step of await getRouteSteps(route.id)) combined.push({ routeId: route.id, step });
+
+  let seq = 1;
+  for (const { routeId, step } of combined) {
+    await query(
+      `INSERT INTO approval_steps (request_id, route_id, sequence_no, approver_user_id, step_name, can_assign_work, status)
+       VALUES (@requestId, @routeId, @seq, @approver, @stepName, @canAssign, @status)`,
+      {
+        requestId,
+        routeId,
+        seq,
+        approver: step.default_approver_user_id,
+        stepName: step.step_name,
+        canAssign: step.can_assign_work ? 1 : 0,
+        status: seq === 1 ? "PENDING" : "WAITING"
+      }
+    );
+    seq++;
+  }
 }
 
 async function createCloseApprovalSteps(requestId, sectionId) {
@@ -364,8 +485,9 @@ async function createCloseApprovalSteps(requestId, sectionId) {
     throw err;
   }
   await query(
-    `INSERT INTO approval_steps (request_id, route_id, sequence_no, approver_user_id, step_name, status)
+    `INSERT INTO approval_steps (request_id, route_id, sequence_no, approver_user_id, step_name, can_assign_work, status)
      SELECT @requestId, ar.id, ars.sequence_no + 100, ars.default_approver_user_id, CONCAT('Close - ', ars.step_name),
+            ars.can_assign_work,
             CASE WHEN ars.sequence_no = 1 THEN 'PENDING' ELSE 'WAITING' END
      FROM approval_routes ar
      JOIN approval_route_steps ars ON ars.route_id = ar.id
@@ -375,11 +497,13 @@ async function createCloseApprovalSteps(requestId, sectionId) {
   );
 }
 
+// Internal/target routes only (cross-section stage-1 routes are excluded here).
 async function findApprovalRoute(sectionId, requestType) {
   const result = await query(
     `SELECT TOP 1 id
      FROM approval_routes
      WHERE section_id=@sectionId
+       AND requester_section_id IS NULL
        AND is_active=1
        AND (request_type=@requestType OR request_type IS NULL)
      ORDER BY
@@ -417,11 +541,12 @@ async function notifyFirstApprover(requestId, requestNo) {
     { requestId }
   )).recordset[0];
   if (!approver) return;
+  const sectionName = await getSectionName(requestId);
   await notify({ userId: approver.id, requestId, type: "APPROVAL", title: "New request needs approval", body: requestNo });
   await sendMail({
     to: approver.email,
-    subject: `[Automation Request] Approval required: ${requestNo}`,
-    html: `<p>Please review automation request <strong>${requestNo}</strong>.</p>`,
+    subject: `[${sectionName}] Approval required: ${requestNo}`,
+    html: `<p>Please review ${sectionName.toLowerCase()} <strong>${requestNo}</strong>.</p>`,
     requestId,
     type: "APPROVAL"
   });
@@ -439,6 +564,7 @@ async function notifyFirstExtensionApprover(requestId, extensionId) {
     { requestId, extensionId }
   )).recordset[0];
   if (!row) return;
+  const sectionName = await getSectionName(requestId);
   await notify({
     userId: row.id,
     requestId,
@@ -448,7 +574,7 @@ async function notifyFirstExtensionApprover(requestId, extensionId) {
   });
   await sendMail({
     to: row.email,
-    subject: `[Automation Request] Extension approval required: ${row.request_no}`,
+    subject: `[${sectionName}] Extension approval required: ${row.request_no}`,
     html: `<p>Please review schedule extension request for <strong>${row.request_no}</strong>.</p>`,
     requestId,
     type: "EXTENSION"
@@ -628,7 +754,8 @@ async function getAttachmentForDownload(kind, attachmentId, user, sectionId, sec
   );
   const row = result.recordset[0];
   if (!row) return null;
-  return canAccessRequest(row, user, sectionAccess) ? row : null;
+  // View-only download: any member of the request's section may read attachments.
+  return row;
 }
 
 async function getExtensionHistory(requestId) {
@@ -708,6 +835,7 @@ async function notifyFirstCloseApprover(requestId) {
     { requestId }
   )).recordset[0];
   if (!row) return;
+  const sectionName = await getSectionName(requestId);
   await notify({
     userId: row.id,
     requestId,
@@ -717,8 +845,8 @@ async function notifyFirstCloseApprover(requestId) {
   });
   await sendMail({
     to: row.email,
-    subject: `[Automation Request] Close approval required: ${row.request_no}`,
-    html: `<p>Automation work is submitted complete. Please close <strong>${row.request_no}</strong>.</p>`,
+    subject: `[${sectionName}] Close approval required: ${row.request_no}`,
+    html: `<p>Work is submitted complete. Please close <strong>${row.request_no}</strong>.</p>`,
     requestId,
     type: "CLOSE"
   });
@@ -732,6 +860,7 @@ async function notifyRequestParticipants(requestId, type, title, body) {
     { requestId }
   )).recordset[0];
   if (!row) return;
+  const sectionName = await getSectionName(requestId);
   const ids = [...new Set([row.requester_user_id, row.incharge_user_id, row.support_user_id].filter(Boolean))];
   for (const userId of ids) {
     const user = (await query("SELECT email FROM users WHERE id=@userId", { userId })).recordset[0];
@@ -745,7 +874,7 @@ async function notifyRequestParticipants(requestId, type, title, body) {
     if (user?.email) {
       await sendMail({
         to: user.email,
-        subject: `[Automation Request] ${title}: ${row.request_no}`,
+        subject: `[${sectionName}] ${title}: ${row.request_no}`,
         html: `<p>${body || row.request_no}</p>`,
         requestId,
         type
@@ -769,16 +898,7 @@ async function assertTodoWindow(requestId, sectionId, plannedStart, plannedEnd) 
   }
 }
 
-function canAccessRequest(row, user, sectionAccess) {
-  return Boolean(
-    sectionAccess?.canViewAll ||
-    row.requester_user_id === user.id ||
-    row.incharge_user_id === user.id ||
-    row.support_user_id === user.id
-  );
-}
-
-async function assertCanManageRequestWork(requestId, user, sectionAccess, sectionId) {
+async function assertCanManageRequestWork(requestId, user, sectionAccess, sectionId, options = {}) {
   const request = (await query(
     `SELECT requester_user_id, incharge_user_id, support_user_id
      FROM requests
@@ -793,7 +913,10 @@ async function assertCanManageRequestWork(requestId, user, sectionAccess, sectio
   const canManage =
     sectionAccess?.isAdmin ||
     request.incharge_user_id === user.id ||
-    request.support_user_id === user.id;
+    request.support_user_id === user.id ||
+    // Meeting mode lets any section member collaborate on todos. The request is
+    // already scoped to the caller's section by the query above.
+    options.allowSectionMember === true;
   if (!canManage) {
     const err = new Error("Only assigned incharge/support can update work items");
     err.status = 403;
