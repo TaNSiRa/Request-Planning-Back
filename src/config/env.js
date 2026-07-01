@@ -36,7 +36,7 @@ const env = {
   apiHost: process.env.API_HOST,
   apiPort: Number(firstEnv("API_PORT", "PORT")),
   frontendOrigin: frontendOrigins[0],
-  frontendOrigins: frontendOrigins.length ? frontendOrigins : ["http://127.0.0.1:5320"],
+  frontendOrigins: frontendOrigins,
   jwtSecret: process.env.JWT_SECRET,
   jwtExpiresIn: process.env.JWT_EXPIRES_IN,
   bcryptRounds: Number(process.env.BCRYPT_ROUNDS),

@@ -41,6 +41,23 @@ router.get("/request-options", asyncHandler(async (req, res) => {
   });
 }));
 
+// Global org lookup lists (Branch/Department/Section) used to populate the
+// dropdowns in Manage Users and Profile — same idea as request-options but
+// these are org-wide, not per-request-section.
+router.get("/org-options", asyncHandler(async (req, res) => {
+  const result = await query(
+    `SELECT setting_key, setting_value FROM app_settings
+     WHERE setting_key IN ('org.branches', 'org.departments', 'org.sections') AND section_id IS NULL`
+  );
+  const map = {};
+  for (const row of result.recordset) map[row.setting_key] = row.setting_value;
+  res.json({
+    branches: splitCsv(map["org.branches"], []),
+    departments: splitCsv(map["org.departments"], []),
+    sections: splitCsv(map["org.sections"], [])
+  });
+}));
+
 router.put("/:key", requireAdmin, audit("EDIT", "SETTING", req => req.params.key), asyncHandler(async (req, res) => {
   const schema = z.object({ value: z.string(), valueType: z.string().optional().default("string"), isPublic: z.boolean().optional().default(false) });
   const input = schema.parse(req.body);
@@ -153,7 +170,7 @@ const routeSchema = z.object({
 });
 
 function isGlobalSetting(key) {
-  return key.startsWith("frontend.") || key.startsWith("mail.") || key.startsWith("microsoft365.");
+  return key.startsWith("frontend.") || key.startsWith("mail.") || key.startsWith("microsoft365.") || key.startsWith("org.");
 }
 
 function nestRoutes(rows) {
