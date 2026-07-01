@@ -1,7 +1,7 @@
 {
-  "name": "automation-request-api",
+  "name": "request-and-planning-api",
   "version": "1.0.0",
-  "description": "Automation Request backend API",
+  "description": "Request & Planning backend API",
   "main": "src/server.js",
   "scripts": {
     "dev": "nodemon src/server.js",

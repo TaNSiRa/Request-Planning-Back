@@ -25,7 +25,7 @@ router.get("/request-options", asyncHandler(async (req, res) => {
   const result = await query(
     `SELECT setting_key, setting_value
      FROM app_settings
-     WHERE setting_key IN ('request.types', 'request.priorities')
+     WHERE setting_key IN ('request.types', 'request.priorities', 'request.supTypes')
        AND (section_id=@sectionId OR section_id IS NULL)
      ORDER BY CASE WHEN section_id=@sectionId THEN 0 ELSE 1 END`
     , { sectionId: req.section.id }
@@ -36,7 +36,8 @@ router.get("/request-options", asyncHandler(async (req, res) => {
   }
   res.json({
     types: splitCsv(map["request.types"], ["PLC", "SCADA", "Touch Screen", "Flutter App", "Express.js", "Node-RED", "Report", "Other"]),
-    priorities: splitCsv(map["request.priorities"], ["LOW", "NORMAL", "HIGH", "URGENT"])
+    priorities: splitCsv(map["request.priorities"], ["LOW", "NORMAL", "HIGH", "URGENT"]),
+    supTypes: splitCsv(map["request.supTypes"], [])
   });
 }));
 
@@ -59,12 +60,14 @@ router.put("/:key", requireAdmin, audit("EDIT", "SETTING", req => req.params.key
 router.get("/approval-routes", requireAdmin, asyncHandler(async (req, res) => {
   const result = await query(
     `SELECT ar.id AS route_id, ar.name, ar.request_type, ar.is_default, ar.is_active,
+            ar.requester_section_id, rs.name AS requester_section_name,
             ars.id AS step_id, ars.sequence_no, ars.step_name, ars.can_assign_work,
             ars.default_approver_user_id, u.display_name AS approver_name,
             u.branch AS approver_branch, u.department AS approver_department, u.section AS approver_section
      FROM approval_routes ar
      JOIN approval_route_steps ars ON ars.route_id=ar.id
      LEFT JOIN users u ON u.id=ars.default_approver_user_id
+     LEFT JOIN request_sections rs ON rs.id=ar.requester_section_id
      WHERE ar.section_id=@sectionId
      ORDER BY ar.is_default DESC, ar.name, ars.sequence_no`,
     { sectionId: req.section.id }
@@ -75,11 +78,12 @@ router.get("/approval-routes", requireAdmin, asyncHandler(async (req, res) => {
 router.post("/approval-routes", requireAdmin, audit("CREATE", "APPROVAL_ROUTE", req => req.body.name), asyncHandler(async (req, res) => {
   const input = routeSchema.parse(req.body);
   const result = await query(
-    `INSERT INTO approval_routes (section_id, name, request_type, is_default, is_active)
+    `INSERT INTO approval_routes (section_id, requester_section_id, name, request_type, is_default, is_active)
      OUTPUT INSERTED.id
-     VALUES (@sectionId, @name, @requestType, @isDefault, @isActive)`,
+     VALUES (@sectionId, @requesterSectionId, @name, @requestType, @isDefault, @isActive)`,
     {
       sectionId: req.section.id,
+      requesterSectionId: input.requesterSectionId || null,
       name: input.name,
       requestType: input.requestType || null,
       isDefault: input.isDefault,
@@ -101,13 +105,15 @@ router.put("/approval-routes/:routeId", requireAdmin, audit("EDIT", "APPROVAL_RO
   if (!existing) return res.status(404).json({ message: "Approval route not found" });
   await query(
     `UPDATE approval_routes
-     SET name=@name, request_type=@requestType, is_default=@isDefault, is_active=@isActive
+     SET name=@name, request_type=@requestType, requester_section_id=@requesterSectionId,
+         is_default=@isDefault, is_active=@isActive
      WHERE id=@routeId AND section_id=@sectionId`,
     {
       routeId,
       sectionId: req.section.id,
       name: input.name,
       requestType: input.requestType || null,
+      requesterSectionId: input.requesterSectionId || null,
       isDefault: input.isDefault,
       isActive: input.isActive
     }
@@ -133,6 +139,8 @@ function splitCsv(value, fallback) {
 const routeSchema = z.object({
   name: z.string().min(2),
   requestType: z.string().optional().nullable(),
+  // Origin section for a cross-section stage-1 route; null = normal internal route.
+  requesterSectionId: z.number().int().positive().optional().nullable(),
   isDefault: z.boolean().optional().default(true),
   isActive: z.boolean().optional().default(true),
   steps: z.array(z.object({
@@ -156,6 +164,8 @@ function nestRoutes(rows) {
         id: row.route_id,
         name: row.name,
         requestType: row.request_type,
+        requesterSectionId: row.requester_section_id,
+        requesterSectionName: row.requester_section_name,
         isDefault: row.is_default === true || row.is_default === 1,
         isActive: row.is_active === true || row.is_active === 1,
         steps: []
