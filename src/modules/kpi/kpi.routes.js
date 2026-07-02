@@ -19,7 +19,7 @@ router.get("/summary", asyncHandler(async (req, res) => {
     `SELECT status, COUNT(*) AS total FROM requests
      WHERE (@kpiOnly = 0 OR is_kpi = 1)
        AND section_id=@sectionId
-       AND (@mine=0 OR requester_user_id=@userId OR incharge_user_id=@userId OR support_user_id=@userId)
+       AND (@mine=0 OR incharge_user_id=@userId)
        AND (@from IS NULL OR created_at >= @from)
        AND (@to IS NULL OR created_at <= @to)
      GROUP BY status ORDER BY status`,
@@ -30,7 +30,7 @@ router.get("/summary", asyncHandler(async (req, res) => {
      WHERE (@kpiOnly = 0 OR is_kpi = 1)
        AND status = 'COMPLETED'
        AND section_id=@sectionId
-       AND (@mine=0 OR requester_user_id=@userId OR incharge_user_id=@userId OR support_user_id=@userId)
+       AND (@mine=0 OR incharge_user_id=@userId)
        AND (@from IS NULL OR created_at >= @from)
        AND (@to IS NULL OR created_at <= @to)
      GROUP BY request_type ORDER BY total DESC`,
@@ -46,7 +46,7 @@ router.get("/summary", asyncHandler(async (req, res) => {
        AND planned_start IS NOT NULL
        AND work_completed_at IS NOT NULL
        AND section_id=@sectionId
-       AND (@mine=0 OR requester_user_id=@userId OR incharge_user_id=@userId OR support_user_id=@userId)
+       AND (@mine=0 OR incharge_user_id=@userId)
        AND (@from IS NULL OR created_at >= @from)
        AND (@to IS NULL OR created_at <= @to)`,
     { mine, kpiOnly, userId: req.user.id, sectionId: req.section.id, from: from || null, to: to || null }
@@ -63,7 +63,7 @@ router.get("/summary", asyncHandler(async (req, res) => {
      WHERE (@kpiOnly = 0 OR is_kpi = 1) AND status NOT IN ('ON_HOLD','REJECTED','CANCELLED') AND planned_end IS NOT NULL
        AND YEAR(planned_end) = @chartYear
        AND section_id=@sectionId
-       AND (@mine=0 OR requester_user_id=@userId OR incharge_user_id=@userId OR support_user_id=@userId)
+       AND (@mine=0 OR incharge_user_id=@userId)
      GROUP BY MONTH(planned_end) ORDER BY month`,
     { mine, kpiOnly, chartYear, userId: req.user.id, sectionId: req.section.id }
   );
@@ -73,7 +73,7 @@ router.get("/summary", asyncHandler(async (req, res) => {
      WHERE (@kpiOnly = 0 OR is_kpi = 1) AND status = 'COMPLETED' AND work_completed_at IS NOT NULL
        AND YEAR(work_completed_at) = @chartYear
        AND section_id=@sectionId
-       AND (@mine=0 OR requester_user_id=@userId OR incharge_user_id=@userId OR support_user_id=@userId)
+       AND (@mine=0 OR incharge_user_id=@userId)
      GROUP BY MONTH(work_completed_at) ORDER BY month`,
     { mine, kpiOnly, chartYear, userId: req.user.id, sectionId: req.section.id }
   );
@@ -85,7 +85,7 @@ router.get("/summary", asyncHandler(async (req, res) => {
        AND work_completed_at < DATEFROMPARTS(YEAR(planned_end), MONTH(planned_end), 1)
        AND YEAR(planned_end) = @chartYear
        AND section_id=@sectionId
-       AND (@mine=0 OR requester_user_id=@userId OR incharge_user_id=@userId OR support_user_id=@userId)
+       AND (@mine=0 OR incharge_user_id=@userId)
      GROUP BY MONTH(planned_end) ORDER BY month`,
     { mine, kpiOnly, chartYear, userId: req.user.id, sectionId: req.section.id }
   );
@@ -94,11 +94,11 @@ router.get("/summary", asyncHandler(async (req, res) => {
     `SELECT DISTINCT yr FROM (
        SELECT YEAR(planned_end) AS yr FROM requests
          WHERE (@kpiOnly = 0 OR is_kpi = 1) AND status NOT IN ('ON_HOLD','REJECTED','CANCELLED') AND planned_end IS NOT NULL AND section_id=@sectionId
-           AND (@mine=0 OR requester_user_id=@userId OR incharge_user_id=@userId OR support_user_id=@userId)
+           AND (@mine=0 OR incharge_user_id=@userId)
        UNION
        SELECT YEAR(work_completed_at) FROM requests
          WHERE (@kpiOnly = 0 OR is_kpi = 1) AND status='COMPLETED' AND work_completed_at IS NOT NULL AND section_id=@sectionId
-           AND (@mine=0 OR requester_user_id=@userId OR incharge_user_id=@userId OR support_user_id=@userId)
+           AND (@mine=0 OR incharge_user_id=@userId)
      ) t WHERE yr IS NOT NULL ORDER BY yr DESC`,
     { mine, kpiOnly, userId: req.user.id, sectionId: req.section.id }
   );
@@ -111,7 +111,7 @@ router.get("/summary", asyncHandler(async (req, res) => {
        AND planned_end IS NOT NULL
        AND CAST(work_completed_at AS DATE) > CAST(planned_end AS DATE)
        AND section_id=@sectionId
-       AND (@mine=0 OR requester_user_id=@userId OR incharge_user_id=@userId OR support_user_id=@userId)
+       AND (@mine=0 OR incharge_user_id=@userId)
        AND (@from IS NULL OR created_at >= @from)
        AND (@to IS NULL OR created_at <= @to)`,
     { mine, kpiOnly, userId: req.user.id, sectionId: req.section.id, from: from || null, to: to || null }
@@ -147,7 +147,7 @@ router.get("/sup-type-summary", asyncHandler(async (req, res) => {
      FROM request_support_types st
      JOIN requests r ON r.id = st.request_id
      WHERE r.section_id=@sectionId
-       AND (@mine=0 OR r.requester_user_id=@userId OR r.incharge_user_id=@userId OR r.support_user_id=@userId)
+       AND (@mine=0 OR r.incharge_user_id=@userId)
      GROUP BY st.sup_type
      ORDER BY total DESC, st.sup_type`,
     { mine, userId: req.user.id, sectionId: req.section.id }
