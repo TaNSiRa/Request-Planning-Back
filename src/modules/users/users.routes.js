@@ -43,7 +43,9 @@ router.get("/assignees", asyncHandler(async (req, res) => {
      JOIN roles r ON r.id = u.role_id
      LEFT JOIN user_section_memberships m ON m.user_id = u.id AND m.section_id = @sectionId AND m.is_active = 1
      WHERE u.is_active = 1
-       AND (r.code = 'ADMIN' OR m.can_work = 1)
+       -- Strict: only users with can_work = 1 in this section can be assigned,
+       -- with no admin exception.
+       AND m.can_work = 1
      ORDER BY u.branch, u.department, u.section, u.display_name`
     , { sectionId: req.section.id }
   );
