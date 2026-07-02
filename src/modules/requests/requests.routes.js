@@ -204,9 +204,11 @@ router.post("/", audit("CREATE", "REQUEST", req => req.body.title), asyncHandler
   const requesterSectionId = await resolveRequesterSection(req.user.section, req.section.id);
   const number = await generateRequestNumber(req.section.id, req.section.requestPrefix || "AR");
   const insert = await query(
-    `INSERT INTO requests (section_id, requester_section_id, request_no, requester_user_id, title, request_type, system_area, priority, due_date, description, business_impact, status)
+    // is_kpi starts false — the approver decides whether it counts as KPI when
+    // they assign the work, not the requester at creation time.
+    `INSERT INTO requests (section_id, requester_section_id, request_no, requester_user_id, title, request_type, system_area, priority, due_date, description, business_impact, status, is_kpi)
      OUTPUT INSERTED.id
-     VALUES (@sectionId, @requesterSectionId, @number, @userId, @title, @requestType, @systemArea, @priority, @dueDate, @description, @businessImpact, 'PENDING_APPROVAL')`,
+     VALUES (@sectionId, @requesterSectionId, @number, @userId, @title, @requestType, @systemArea, @priority, @dueDate, @description, @businessImpact, 'PENDING_APPROVAL', 0)`,
     { ...values, sectionId: req.section.id, requesterSectionId, number, userId: req.user.id }
   );
   const requestId = insert.recordset[0].id;
