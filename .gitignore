@@ -15,3 +15,6 @@ build/
 
 # Local logs
 *.log
+
+# Backend
+node_modules/
