@@ -8,6 +8,7 @@ const { writeAudit } = require("../../middleware/audit");
 const { clearSession, setLoggedInSession } = require("../../services/securityService");
 const { getUserSections } = require("../../services/sectionService");
 const { verifyMicrosoftIdToken } = require("../../services/microsoftTokenService");
+const { getGlobalBool } = require("../../services/settingsService");
 const { env } = require("../../config/env");
 
 const router = express.Router();
@@ -63,19 +64,30 @@ router.get("/csrf-token", requireAuth, asyncHandler(async (req, res) => {
   res.json({ csrfToken: req.session.csrfToken });
 }));
 
-router.get("/microsoft/config", (req, res) => {
+router.get("/microsoft/config", asyncHandler(async (req, res) => {
+  // Available only when BOTH the admin toggle (microsoft365.enabled) is on AND
+  // the OAuth app credentials exist in .env — you can't run OAuth without them.
+  const toggledOn = await getGlobalBool("microsoft365.enabled", false);
+  const configured = Boolean(env.microsoft.clientId && env.microsoft.tenantId);
   res.json({
-    enabled: Boolean(env.microsoft.clientId && env.microsoft.tenantId),
+    enabled: toggledOn && configured,
+    configured,
     clientId: env.microsoft.clientId,
     tenantId: env.microsoft.tenantId,
     scopes: env.microsoft.scopes,
-    message: env.microsoft.clientId && env.microsoft.tenantId
-      ? "Microsoft 365 login is configured."
-      : "Fill MS365_CLIENT_ID and MS365_TENANT_ID or MICROSOFT_CLIENT_ID and MICROSOFT_TENANT_ID in .env."
+    message: !toggledOn
+      ? "Microsoft 365 login is turned off in Settings (microsoft365.enabled)."
+      : configured
+        ? "Microsoft 365 login is configured."
+        : "Fill MS365_CLIENT_ID and MS365_TENANT_ID or MICROSOFT_CLIENT_ID and MICROSOFT_TENANT_ID in .env."
   });
-});
+}));
 
 router.post("/microsoft/login", asyncHandler(async (req, res) => {
+  const toggledOn = await getGlobalBool("microsoft365.enabled", false);
+  if (!toggledOn || !env.microsoft.clientId || !env.microsoft.tenantId) {
+    return res.status(403).json({ message: "Microsoft 365 login is disabled" });
+  }
   const input = microsoftLoginSchema.parse(req.body);
   const claims = await verifyMicrosoftIdToken(input.idToken);
   const email = claims.preferred_username || claims.email || claims.upn || "";
