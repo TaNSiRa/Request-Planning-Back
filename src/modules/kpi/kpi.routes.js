@@ -20,8 +20,8 @@ router.get("/summary", asyncHandler(async (req, res) => {
      WHERE (@kpiOnly = 0 OR is_kpi = 1)
        AND section_id=@sectionId
        AND (@mine=0 OR incharge_user_id=@userId)
-       AND (@from IS NULL OR created_at >= @from)
-       AND (@to IS NULL OR created_at <= @to)
+       AND (@from IS NULL OR planned_end >= @from)
+       AND (@to IS NULL OR planned_start <= @to)
      GROUP BY status ORDER BY status`,
     { mine, kpiOnly, userId: req.user.id, sectionId: req.section.id, from: from || null, to: to || null }
   );
@@ -31,8 +31,8 @@ router.get("/summary", asyncHandler(async (req, res) => {
        AND status = 'COMPLETED'
        AND section_id=@sectionId
        AND (@mine=0 OR incharge_user_id=@userId)
-       AND (@from IS NULL OR created_at >= @from)
-       AND (@to IS NULL OR created_at <= @to)
+       AND (@from IS NULL OR planned_end >= @from)
+       AND (@to IS NULL OR planned_start <= @to)
      GROUP BY request_type ORDER BY total DESC`,
     { mine, kpiOnly, userId: req.user.id, sectionId: req.section.id, from: from || null, to: to || null }
   );
@@ -47,8 +47,8 @@ router.get("/summary", asyncHandler(async (req, res) => {
        AND work_completed_at IS NOT NULL
        AND section_id=@sectionId
        AND (@mine=0 OR incharge_user_id=@userId)
-       AND (@from IS NULL OR created_at >= @from)
-       AND (@to IS NULL OR created_at <= @to)`,
+       AND (@from IS NULL OR planned_end >= @from)
+       AND (@to IS NULL OR planned_start <= @to)`,
     { mine, kpiOnly, userId: req.user.id, sectionId: req.section.id, from: from || null, to: to || null }
   );
   // Monthly chart compares, per month, the Target (completed requests whose
@@ -112,8 +112,8 @@ router.get("/summary", asyncHandler(async (req, res) => {
        AND CAST(work_completed_at AS DATE) > CAST(planned_end AS DATE)
        AND section_id=@sectionId
        AND (@mine=0 OR incharge_user_id=@userId)
-       AND (@from IS NULL OR created_at >= @from)
-       AND (@to IS NULL OR created_at <= @to)`,
+       AND (@from IS NULL OR planned_end >= @from)
+       AND (@to IS NULL OR planned_start <= @to)`,
     { mine, kpiOnly, userId: req.user.id, sectionId: req.section.id, from: from || null, to: to || null }
   );
   res.json({
