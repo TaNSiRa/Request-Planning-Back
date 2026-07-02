@@ -1,6 +1,7 @@
 const nodemailer = require("nodemailer");
 const { env } = require("../config/env");
 const { query } = require("../db/pool");
+const { getGlobalBool } = require("./settingsService");
 
 function isMailConfigured() {
   return Boolean(env.smtp.host && env.smtp.from);
@@ -44,8 +45,15 @@ async function resolveSectionId(requestId, sectionId) {
   return result.recordset[0]?.section_id || null;
 }
 
-async function sendMail({ to, subject, html, text, requestId, type, sectionId }) {
+async function sendMail({ to, subject, html, text, requestId, type, sectionId, ignoreEnabledFlag = false }) {
   const resolvedSectionId = await resolveSectionId(requestId, sectionId);
+  // The mail.enabled setting is the master on/off switch. When off, we still
+  // record the message in the outbox (audit trail) but never deliver it. The
+  // "test email" path passes ignoreEnabledFlag so admins can verify SMTP before
+  // flipping the switch on.
+  const mailEnabled = ignoreEnabledFlag || (await getGlobalBool("mail.enabled", false));
+  const configured = isMailConfigured();
+  const status = !mailEnabled ? "disabled" : configured ? "queued" : "pending_config";
   // Always record the message in the outbox first (audit trail), then try to
   // deliver it and update the row with the outcome.
   const insert = await query(
@@ -59,10 +67,12 @@ async function sendMail({ to, subject, html, text, requestId, type, sectionId })
       to,
       subject,
       html,
-      status: isMailConfigured() ? "queued" : "pending_config"
+      status
     }
   );
   const outboxId = insert.recordset[0].id;
+
+  if (!mailEnabled) return { sent: false, reason: "Mail is disabled in settings (mail.enabled=false)" };
 
   const tx = getTransporter();
   if (!tx) return { sent: false, reason: "SMTP config is blank" };

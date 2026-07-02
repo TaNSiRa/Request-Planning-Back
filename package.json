@@ -19,6 +19,7 @@
     "helmet": "^8.0.0",
     "jsonwebtoken": "^9.0.2",
     "mssql": "^11.0.1",
+    "nodemailer": "^9.0.3",
     "socket.io": "^4.8.1",
     "zod": "^3.24.1"
   },

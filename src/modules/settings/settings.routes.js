@@ -24,7 +24,9 @@ router.post("/mail/test", requireAdmin, audit("TEST", "MAIL"), asyncHandler(asyn
     to: input.to,
     subject: "Test email — Request & Planning",
     html: "<p>This is a test email from the Request &amp; Planning system. If you received it, SMTP delivery is working.</p>",
-    type: "TEST"
+    type: "TEST",
+    // A test send verifies SMTP regardless of the mail.enabled master switch.
+    ignoreEnabledFlag: true
   });
   res.json(result);
 }));
