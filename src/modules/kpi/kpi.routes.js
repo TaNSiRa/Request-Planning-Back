@@ -8,14 +8,21 @@ const router = express.Router();
 router.use(requireAuth);
 router.use(resolveSection);
 
+function analyticsScope(req) {
+  const belongsToSection = req.sectionAccess.canWork || req.sectionAccess.canViewAll;
+  return {
+    dept: belongsToSection ? null : (req.user.department || "__NO_DEPARTMENT__"),
+    sectionMember: belongsToSection ? 1 : 0
+  };
+}
+
 router.get("/summary", asyncHandler(async (req, res) => {
   const { scope = "all", from, to } = req.query;
   const mine = scope === "mine" ? 1 : 0;
   // Members of this section (workers / approvers / admin) see the whole section
   // in the "all" scope; an outside cross-section requester sees only requests
   // raised by their own department. "mine" scope stays incharge-only.
-  const belongsToSection = req.sectionAccess.canWork || req.sectionAccess.canViewAll;
-  const dept = belongsToSection ? null : (req.user.department || null);
+  const { dept } = analyticsScope(req);
   // "kpi" = only requests flagged is_kpi; "all" (default) = every request,
   // including KPI-flagged ones.
   const kpiOnly = req.query.kpiFilter === "kpi" ? 1 : 0;
@@ -139,8 +146,7 @@ router.get("/summary", asyncHandler(async (req, res) => {
 router.get("/sup-type-summary", asyncHandler(async (req, res) => {
   const { scope = "all" } = req.query;
   const mine = scope === "mine" ? 1 : 0;
-  const belongsToSection = req.sectionAccess.canWork || req.sectionAccess.canViewAll;
-  const dept = belongsToSection ? null : (req.user.department || null);
+  const { dept } = analyticsScope(req);
   const rows = await query(
     `SELECT st.sup_type,
             COUNT(*) AS total,
@@ -163,10 +169,16 @@ router.get("/sup-type-summary", asyncHandler(async (req, res) => {
 }));
 
 router.get("/export.csv", asyncHandler(async (req, res) => {
+  const { dept, sectionMember } = analyticsScope(req);
   const rows = (await query(
-    `SELECT request_no, title, request_type, priority, status, due_date, planned_start, planned_end, created_at, closed_at
-     FROM requests WHERE is_kpi = 1 AND section_id=@sectionId ORDER BY created_at DESC`,
-    { sectionId: req.section.id }
+    `SELECT r.request_no, r.title, r.request_type, r.priority, r.status, r.due_date, r.planned_start, r.planned_end, r.created_at, r.closed_at
+     FROM requests r
+     JOIN users requester ON requester.id = r.requester_user_id
+     WHERE r.is_kpi = 1
+       AND r.section_id=@sectionId
+       AND (@sectionMember=1 OR requester.department=@dept)
+     ORDER BY r.created_at DESC`,
+    { sectionId: req.section.id, dept, sectionMember }
   )).recordset;
   const header = Object.keys(rows[0] || { request_no: "", title: "", status: "" });
   const csv = [header.join(","), ...rows.map(row => header.map(key => JSON.stringify(row[key] ?? "")).join(","))].join("\n");
