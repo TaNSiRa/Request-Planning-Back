@@ -62,6 +62,19 @@ router.get("/request-options", asyncHandler(async (req, res) => {
   });
 }));
 
+// Public per-section feature flags read by every authenticated user (e.g. to
+// decide whether the Skill Matrix page shows in the sidebar). Defaults to on
+// when the section has no explicit setting.
+router.get("/features", asyncHandler(async (req, res) => {
+  const result = await query(
+    "SELECT setting_value FROM app_settings WHERE setting_key='skillMatrix.enabled' AND section_id=@sectionId",
+    { sectionId: req.section.id }
+  );
+  const raw = result.recordset[0]?.setting_value;
+  const skillMatrixEnabled = raw == null ? true : `${raw}`.trim().toLowerCase() === "true";
+  res.json({ skillMatrixEnabled });
+}));
+
 // Global org lookup lists (Branch/Department/Section) used to populate the
 // dropdowns in Manage Users and Profile — same idea as request-options but
 // these are org-wide, not per-request-section.

@@ -11,6 +11,11 @@ router.use(resolveSection);
 router.get("/summary", asyncHandler(async (req, res) => {
   const { scope = "all", from, to } = req.query;
   const mine = scope === "mine" ? 1 : 0;
+  // Members of this section (workers / approvers / admin) see the whole section
+  // in the "all" scope; an outside cross-section requester sees only requests
+  // raised by their own department. "mine" scope stays incharge-only.
+  const belongsToSection = req.sectionAccess.canWork || req.sectionAccess.canViewAll;
+  const dept = belongsToSection ? null : (req.user.department || null);
   // "kpi" = only requests flagged is_kpi; "all" (default) = every request,
   // including KPI-flagged ones.
   const kpiOnly = req.query.kpiFilter === "kpi" ? 1 : 0;
@@ -19,22 +24,22 @@ router.get("/summary", asyncHandler(async (req, res) => {
     `SELECT status, COUNT(*) AS total FROM requests
      WHERE (@kpiOnly = 0 OR is_kpi = 1)
        AND section_id=@sectionId
-       AND (@mine=0 OR incharge_user_id=@userId)
+       AND ((@mine=1 AND incharge_user_id=@userId) OR (@mine=0 AND (@dept IS NULL OR requester_user_id IN (SELECT id FROM users WHERE department=@dept))))
        AND (@from IS NULL OR planned_end >= @from)
        AND (@to IS NULL OR planned_start <= @to)
      GROUP BY status ORDER BY status`,
-    { mine, kpiOnly, userId: req.user.id, sectionId: req.section.id, from: from || null, to: to || null }
+    { mine, kpiOnly, userId: req.user.id, dept, sectionId: req.section.id, from: from || null, to: to || null }
   );
   const byType = await query(
     `SELECT request_type, COUNT(*) AS total FROM requests
      WHERE (@kpiOnly = 0 OR is_kpi = 1)
        AND status = 'COMPLETED'
        AND section_id=@sectionId
-       AND (@mine=0 OR incharge_user_id=@userId)
+       AND ((@mine=1 AND incharge_user_id=@userId) OR (@mine=0 AND (@dept IS NULL OR requester_user_id IN (SELECT id FROM users WHERE department=@dept))))
        AND (@from IS NULL OR planned_end >= @from)
        AND (@to IS NULL OR planned_start <= @to)
      GROUP BY request_type ORDER BY total DESC`,
-    { mine, kpiOnly, userId: req.user.id, sectionId: req.section.id, from: from || null, to: to || null }
+    { mine, kpiOnly, userId: req.user.id, dept, sectionId: req.section.id, from: from || null, to: to || null }
   );
   // Lead time = from the approver-set start date to when the incharge submitted
   // work complete (work_completed_at), counted only for completed requests.
@@ -46,10 +51,10 @@ router.get("/summary", asyncHandler(async (req, res) => {
        AND planned_start IS NOT NULL
        AND work_completed_at IS NOT NULL
        AND section_id=@sectionId
-       AND (@mine=0 OR incharge_user_id=@userId)
+       AND ((@mine=1 AND incharge_user_id=@userId) OR (@mine=0 AND (@dept IS NULL OR requester_user_id IN (SELECT id FROM users WHERE department=@dept))))
        AND (@from IS NULL OR planned_end >= @from)
        AND (@to IS NULL OR planned_start <= @to)`,
-    { mine, kpiOnly, userId: req.user.id, sectionId: req.section.id, from: from || null, to: to || null }
+    { mine, kpiOnly, userId: req.user.id, dept, sectionId: req.section.id, from: from || null, to: to || null }
   );
   // Monthly chart compares, per month, the Target (completed requests whose
   // approver-set period end falls in that month) against the Actual (requests
@@ -63,9 +68,9 @@ router.get("/summary", asyncHandler(async (req, res) => {
      WHERE (@kpiOnly = 0 OR is_kpi = 1) AND status NOT IN ('ON_HOLD','REJECTED','CANCELLED') AND planned_end IS NOT NULL
        AND YEAR(planned_end) = @chartYear
        AND section_id=@sectionId
-       AND (@mine=0 OR incharge_user_id=@userId)
+       AND ((@mine=1 AND incharge_user_id=@userId) OR (@mine=0 AND (@dept IS NULL OR requester_user_id IN (SELECT id FROM users WHERE department=@dept))))
      GROUP BY MONTH(planned_end) ORDER BY month`,
-    { mine, kpiOnly, chartYear, userId: req.user.id, sectionId: req.section.id }
+    { mine, kpiOnly, chartYear, userId: req.user.id, dept, sectionId: req.section.id }
   );
   const monthlyActual = await query(
     `SELECT MONTH(work_completed_at) AS month, COUNT(*) AS total
@@ -73,9 +78,9 @@ router.get("/summary", asyncHandler(async (req, res) => {
      WHERE (@kpiOnly = 0 OR is_kpi = 1) AND status = 'COMPLETED' AND work_completed_at IS NOT NULL
        AND YEAR(work_completed_at) = @chartYear
        AND section_id=@sectionId
-       AND (@mine=0 OR incharge_user_id=@userId)
+       AND ((@mine=1 AND incharge_user_id=@userId) OR (@mine=0 AND (@dept IS NULL OR requester_user_id IN (SELECT id FROM users WHERE department=@dept))))
      GROUP BY MONTH(work_completed_at) ORDER BY month`,
-    { mine, kpiOnly, chartYear, userId: req.user.id, sectionId: req.section.id }
+    { mine, kpiOnly, chartYear, userId: req.user.id, dept, sectionId: req.section.id }
   );
   // Completed earlier than the target month — shown faded at the target month.
   const monthlyEarly = await query(
@@ -85,22 +90,22 @@ router.get("/summary", asyncHandler(async (req, res) => {
        AND work_completed_at < DATEFROMPARTS(YEAR(planned_end), MONTH(planned_end), 1)
        AND YEAR(planned_end) = @chartYear
        AND section_id=@sectionId
-       AND (@mine=0 OR incharge_user_id=@userId)
+       AND ((@mine=1 AND incharge_user_id=@userId) OR (@mine=0 AND (@dept IS NULL OR requester_user_id IN (SELECT id FROM users WHERE department=@dept))))
      GROUP BY MONTH(planned_end) ORDER BY month`,
-    { mine, kpiOnly, chartYear, userId: req.user.id, sectionId: req.section.id }
+    { mine, kpiOnly, chartYear, userId: req.user.id, dept, sectionId: req.section.id }
   );
   // Distinct years that have completed KPI data, for the chart's year selector.
   const years = await query(
     `SELECT DISTINCT yr FROM (
        SELECT YEAR(planned_end) AS yr FROM requests
          WHERE (@kpiOnly = 0 OR is_kpi = 1) AND status NOT IN ('ON_HOLD','REJECTED','CANCELLED') AND planned_end IS NOT NULL AND section_id=@sectionId
-           AND (@mine=0 OR incharge_user_id=@userId)
+           AND ((@mine=1 AND incharge_user_id=@userId) OR (@mine=0 AND (@dept IS NULL OR requester_user_id IN (SELECT id FROM users WHERE department=@dept))))
        UNION
        SELECT YEAR(work_completed_at) FROM requests
          WHERE (@kpiOnly = 0 OR is_kpi = 1) AND status='COMPLETED' AND work_completed_at IS NOT NULL AND section_id=@sectionId
-           AND (@mine=0 OR incharge_user_id=@userId)
+           AND ((@mine=1 AND incharge_user_id=@userId) OR (@mine=0 AND (@dept IS NULL OR requester_user_id IN (SELECT id FROM users WHERE department=@dept))))
      ) t WHERE yr IS NOT NULL ORDER BY yr DESC`,
-    { mine, kpiOnly, userId: req.user.id, sectionId: req.section.id }
+    { mine, kpiOnly, userId: req.user.id, dept, sectionId: req.section.id }
   );
   // Overdue = work submitted late: the incharge pressed "submit work complete"
   // (work_completed_at) after the approver-set period end.
@@ -111,10 +116,10 @@ router.get("/summary", asyncHandler(async (req, res) => {
        AND planned_end IS NOT NULL
        AND CAST(work_completed_at AS DATE) > CAST(planned_end AS DATE)
        AND section_id=@sectionId
-       AND (@mine=0 OR incharge_user_id=@userId)
+       AND ((@mine=1 AND incharge_user_id=@userId) OR (@mine=0 AND (@dept IS NULL OR requester_user_id IN (SELECT id FROM users WHERE department=@dept))))
        AND (@from IS NULL OR planned_end >= @from)
        AND (@to IS NULL OR planned_start <= @to)`,
-    { mine, kpiOnly, userId: req.user.id, sectionId: req.section.id, from: from || null, to: to || null }
+    { mine, kpiOnly, userId: req.user.id, dept, sectionId: req.section.id, from: from || null, to: to || null }
   );
   res.json({
     byStatus: byStatus.recordset,
@@ -134,6 +139,8 @@ router.get("/summary", asyncHandler(async (req, res) => {
 router.get("/sup-type-summary", asyncHandler(async (req, res) => {
   const { scope = "all" } = req.query;
   const mine = scope === "mine" ? 1 : 0;
+  const belongsToSection = req.sectionAccess.canWork || req.sectionAccess.canViewAll;
+  const dept = belongsToSection ? null : (req.user.department || null);
   const rows = await query(
     `SELECT st.sup_type,
             COUNT(*) AS total,
@@ -147,10 +154,10 @@ router.get("/sup-type-summary", asyncHandler(async (req, res) => {
      FROM request_support_types st
      JOIN requests r ON r.id = st.request_id
      WHERE r.section_id=@sectionId
-       AND (@mine=0 OR r.incharge_user_id=@userId)
+       AND ((@mine=1 AND r.incharge_user_id=@userId) OR (@mine=0 AND (@dept IS NULL OR r.requester_user_id IN (SELECT id FROM users WHERE department=@dept))))
      GROUP BY st.sup_type
      ORDER BY total DESC, st.sup_type`,
-    { mine, userId: req.user.id, sectionId: req.section.id }
+    { mine, userId: req.user.id, dept, sectionId: req.section.id }
   );
   res.json({ supTypes: rows.recordset });
 }));
