@@ -6,10 +6,16 @@ const { requireAuth } = require("../../middleware/auth");
 const { audit } = require("../../middleware/audit");
 const { requireAdmin, resolveSection } = require("../../services/sectionService");
 const { verifyMail, isMailConfigured, sendMail } = require("../../services/mailService");
+const { verifyHoliday } = require("../../db/holidayPool");
 
 const router = express.Router();
 router.use(requireAuth);
 router.use(resolveSection);
+
+// Test the external holiday DB connection (SAR / Master_Holiday).
+router.get("/holiday/verify", requireAdmin, asyncHandler(async (req, res) => {
+  res.json(await verifyHoliday());
+}));
 
 // Check the SMTP connection/credentials without sending anything.
 router.get("/mail/verify", requireAdmin, asyncHandler(async (req, res) => {
@@ -204,7 +210,8 @@ const routeSchema = z.object({
 });
 
 function isGlobalSetting(key) {
-  return key.startsWith("frontend.") || key.startsWith("mail.") || key.startsWith("microsoft365.") || key.startsWith("org.");
+  return key.startsWith("frontend.") || key.startsWith("mail.") || key.startsWith("microsoft365.")
+    || key.startsWith("org.") || key.startsWith("holiday.");
 }
 
 function nestRoutes(rows) {
