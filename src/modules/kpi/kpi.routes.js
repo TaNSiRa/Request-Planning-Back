@@ -9,12 +9,10 @@ router.use(requireAuth);
 router.use(resolveSection);
 
 function analyticsScope(req) {
-  // A viewer belongs to the section only if they're an admin or their org
-  // section matches the request section's name; cross-section approvers/workers
-  // are scoped to their own org section (mirrors the frontend).
-  const org = `${req.user.section || ""}`.trim().toLowerCase();
-  const sectionName = `${req.section.name || ""}`.trim().toLowerCase();
-  const belongsToSection = isAdmin(req.user) || (org !== "" && org === sectionName);
+  // A real member works in this section (can_work); a cross-section approver
+  // (can_work=0) is scoped to their own org section. Mirrors the frontend
+  // belongsToSection so KPI / sup-type views match what pages show.
+  const belongsToSection = isAdmin(req.user) || req.sectionAccess.canWork === true;
   return {
     requesterOrgSection: belongsToSection ? null : (req.user.section || "__NO_ORG_SECTION__"),
     sectionMember: belongsToSection ? 1 : 0
