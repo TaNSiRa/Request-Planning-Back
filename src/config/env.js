@@ -66,6 +66,22 @@ const env = {
       trustServerCertificate: String(process.env.SQL_TRUST_SERVER_CERTIFICATE) === "true"
     }
   },
+  // Read-only external DB holding company holidays (e.g. the SAR system's
+  // Master_Holiday table). May live on a different host/database. Credentials +
+  // port come from env; host/database/table can be overridden in Settings.
+  holiday: {
+    server: firstEnv("HOLIDAY_SQL_SERVER", "HOLIDAY_SQL_HOST"),
+    port: Number(process.env.HOLIDAY_SQL_PORT || 1433),
+    database: process.env.HOLIDAY_SQL_DATABASE || "",
+    user: process.env.HOLIDAY_SQL_USER || "",
+    password: process.env.HOLIDAY_SQL_PASSWORD || "",
+    table: process.env.HOLIDAY_SQL_TABLE || "Master_Holiday",
+    dateColumn: process.env.HOLIDAY_SQL_DATE_COLUMN || "HolidayDate",
+    options: {
+      encrypt: String(process.env.HOLIDAY_SQL_ENCRYPT) === "true",
+      trustServerCertificate: String(process.env.HOLIDAY_SQL_TRUST_SERVER_CERTIFICATE) === "true"
+    }
+  },
   smtp: {
     host: process.env.SMTP_HOST,
     port: Number(process.env.SMTP_PORT),
