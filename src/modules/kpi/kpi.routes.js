@@ -2,14 +2,19 @@ const express = require("express");
 const { query } = require("../../db/pool");
 const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
-const { resolveSection } = require("../../services/sectionService");
+const { resolveSection, isAdmin } = require("../../services/sectionService");
 
 const router = express.Router();
 router.use(requireAuth);
 router.use(resolveSection);
 
 function analyticsScope(req) {
-  const belongsToSection = req.sectionAccess.canWork || req.sectionAccess.canViewAll;
+  // A viewer belongs to the section only if they're an admin or their org
+  // section matches the request section's name; cross-section approvers/workers
+  // are scoped to their own org section (mirrors the frontend).
+  const org = `${req.user.section || ""}`.trim().toLowerCase();
+  const sectionName = `${req.section.name || ""}`.trim().toLowerCase();
+  const belongsToSection = isAdmin(req.user) || (org !== "" && org === sectionName);
   return {
     requesterOrgSection: belongsToSection ? null : (req.user.section || "__NO_ORG_SECTION__"),
     sectionMember: belongsToSection ? 1 : 0
