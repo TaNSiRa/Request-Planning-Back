@@ -241,6 +241,23 @@ router.patch("/:id/cancel", audit("CANCEL", "REQUEST"), asyncHandler(async (req,
     id,
     reason: req.body.reason || null
   });
+  // Clear anything that was still waiting on this request so it doesn't linger in
+  // approvers' inboxes: pending/waiting approval steps and any open schedule
+  // extension request + its approval steps.
+  await query(
+    "UPDATE approval_steps SET status='SKIPPED', updated_at=SYSUTCDATETIME() WHERE request_id=@id AND status IN ('PENDING','WAITING')",
+    { id }
+  );
+  await query(
+    `UPDATE schedule_extension_approval_steps SET status='SKIPPED', updated_at=SYSUTCDATETIME()
+     WHERE status IN ('PENDING','WAITING')
+       AND extension_id IN (SELECT id FROM schedule_extension_requests WHERE request_id=@id)`,
+    { id }
+  );
+  await query(
+    "UPDATE schedule_extension_requests SET status='REJECTED' WHERE request_id=@id AND status='PENDING_APPROVAL'",
+    { id }
+  );
   await notifyRequestParticipants(id, "CANCEL", "Request cancelled", row.request_no);
   emitSystem("request.updated", { id, status: "CANCELLED" });
   res.json({ ok: true });

@@ -31,9 +31,10 @@ router.get("/pending", asyncHandler(async (req, res) => {
      LEFT JOIN request_sections rs ON rs.id = r.requester_section_id
      LEFT JOIN users inc ON inc.id = r.incharge_user_id
      LEFT JOIN users sup ON sup.id = r.support_user_id
-     WHERE (r.section_id=@sectionId OR r.requester_section_id=@sectionId)
+     WHERE r.section_id=@sectionId
        AND (@isAdmin = 1 OR a.approver_user_id=@userId)
        AND a.status='PENDING'
+       AND r.status NOT IN ('CANCELLED','REJECTED')
      ORDER BY r.created_at`,
     { userId: req.user.id, sectionId: req.section.id, isAdmin: isAdmin(req.user) ? 1 : 0 }
   );
@@ -189,7 +190,7 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
 }));
 
 router.post("/:stepId/reject", audit("REJECT", "APPROVAL_STEP", req => req.params.stepId), asyncHandler(async (req, res) => {
-  const schema = z.object({ comment: z.string().min(3) });
+  const schema = z.object({ comment: z.string().trim().min(1) });
   const input = schema.parse(req.body);
   const step = await getStep(req.params.stepId, req.user, req.section.id);
   if (!step) return res.status(404).json({ message: "Approval step not found" });
