@@ -15,7 +15,7 @@ router.use(resolveSection);
 
 router.get("/", requireAdmin, asyncHandler(async (req, res) => {
   const result = await query(
-    `SELECT u.id, u.employee_no, u.email, u.display_name, u.branch, u.department, u.section, u.phone, u.is_active, u.role_id,
+    `SELECT u.id, u.employee_no, u.email, u.display_name, u.full_name, u.branch, u.department, u.section, u.phone, u.is_active, u.role_id,
             r.code AS role_code, r.name AS role_name,
             m.can_request, m.can_work, m.is_active AS membership_active,
             (SELECT ms.section_id, ms.can_request, ms.can_work
@@ -38,7 +38,7 @@ router.get("/", requireAdmin, asyncHandler(async (req, res) => {
 
 router.get("/assignees", asyncHandler(async (req, res) => {
   const result = await query(
-    `SELECT u.id, u.employee_no, u.email, u.display_name, u.branch, u.department, u.section, r.code AS role_code
+    `SELECT u.id, u.employee_no, u.email, u.display_name, u.full_name, u.branch, u.department, u.section, r.code AS role_code
      FROM users u
      JOIN roles r ON r.id = u.role_id
      LEFT JOIN user_section_memberships m ON m.user_id = u.id AND m.section_id = @sectionId AND m.is_active = 1
@@ -49,14 +49,51 @@ router.get("/assignees", asyncHandler(async (req, res) => {
      ORDER BY u.branch, u.department, u.section, u.display_name`
     , { sectionId: req.section.id }
   );
-  res.json({ data: result.recordset });
+  const users = result.recordset;
+  const skillsByUser = await getAssigneeSkills(users.map(u => u.id));
+  res.json({ data: users.map(u => ({ ...u, skills: skillsByUser.get(u.id) || [] })) });
 }));
+
+// Each assignee's self-rated skills (item + level), so the approver can judge
+// who is qualified when assigning. Returns an empty map if the skill-matrix
+// tables aren't installed yet.
+async function getAssigneeSkills(userIds) {
+  const map = new Map();
+  if (!userIds.length) return map;
+  try {
+    const rows = (await query(
+      `SELECT usl.user_id, usl.item_id, i.name AS item_name,
+              usl.level_id, l.name AS level_name, l.sort_order
+       FROM user_skill_levels usl
+       JOIN skill_matrix_items i ON i.id = usl.item_id
+       JOIN skill_matrix_levels l ON l.id = usl.level_id
+       WHERE usl.user_id IN (${userIds.map((_, i) => `@u${i}`).join(",")})
+       ORDER BY i.sort_order, i.id`,
+      Object.fromEntries(userIds.map((id, i) => [`u${i}`, id]))
+    )).recordset;
+    for (const r of rows) {
+      if (!map.has(r.user_id)) map.set(r.user_id, []);
+      map.get(r.user_id).push({
+        itemId: r.item_id,
+        itemName: r.item_name,
+        levelId: r.level_id,
+        levelName: r.level_name,
+        sortOrder: r.sort_order
+      });
+    }
+  } catch (err) {
+    if (`${err.message}`.includes("Invalid object name")) return map;
+    throw err;
+  }
+  return map;
+}
 
 router.post("/", requireAdmin, audit("CREATE", "USER", req => req.body.email), asyncHandler(async (req, res) => {
   const schema = z.object({
     employeeNo: z.string().min(1),
     email: z.string().email(),
     displayName: z.string().min(2),
+    fullName: z.string().optional().nullable(),
     password: z.string().min(10),
     roleId: z.number().int(),
     branch: z.string().min(1),
@@ -74,6 +111,7 @@ router.post("/", requireAdmin, audit("CREATE", "USER", req => req.body.email), a
   const values = {
     ...userInput,
     employeeNo: input.employeeNo ?? null,
+    fullName: input.fullName?.trim() ? input.fullName.trim() : null,
     branch: input.branch ?? null,
     department: input.department ?? null,
     section: input.section ?? null,
@@ -81,9 +119,9 @@ router.post("/", requireAdmin, audit("CREATE", "USER", req => req.body.email), a
   };
   const passwordHash = await bcrypt.hash(input.password, env.bcryptRounds);
   const result = await query(
-    `INSERT INTO users (employee_no, email, display_name, password_hash, role_id, branch, department, section, phone)
+    `INSERT INTO users (employee_no, email, display_name, full_name, password_hash, role_id, branch, department, section, phone)
      OUTPUT INSERTED.id
-     VALUES (@employeeNo, @email, @displayName, @passwordHash, @roleId, @branch, @department, @section, @phone)`,
+     VALUES (@employeeNo, @email, @displayName, @fullName, @passwordHash, @roleId, @branch, @department, @section, @phone)`,
     { ...values, email: input.email.toLowerCase(), passwordHash }
   );
   const userId = result.recordset[0].id;
@@ -100,6 +138,7 @@ router.patch("/:id(\\d+)", requireAdmin, audit("EDIT", "USER", req => req.params
     employeeNo: z.string().min(1),
     email: z.string().email(),
     displayName: z.string().min(2),
+    fullName: z.string().optional().nullable(),
     roleId: z.number().int(),
     branch: z.string().min(1),
     department: z.string().min(1),
@@ -113,7 +152,7 @@ router.patch("/:id(\\d+)", requireAdmin, audit("EDIT", "USER", req => req.params
   const input = schema.parse(req.body);
   await query(
     `UPDATE users
-     SET employee_no=@employeeNo, email=@email, display_name=@displayName, role_id=@roleId,
+     SET employee_no=@employeeNo, email=@email, display_name=@displayName, full_name=@fullName, role_id=@roleId,
          branch=@branch, department=@department, section=@section, phone=@phone, is_active=@isActive, updated_at=SYSUTCDATETIME()
      WHERE id=@id`,
     {
@@ -121,6 +160,7 @@ router.patch("/:id(\\d+)", requireAdmin, audit("EDIT", "USER", req => req.params
       employeeNo: input.employeeNo ?? null,
       email: input.email.toLowerCase(),
       displayName: input.displayName,
+      fullName: input.fullName?.trim() ? input.fullName.trim() : null,
       roleId: input.roleId,
       branch: input.branch ?? null,
       department: input.department ?? null,
@@ -151,6 +191,7 @@ router.post("/:id(\\d+)/reset-password", requireAdmin, audit("RESET_PASSWORD", "
 router.patch("/me", audit("EDIT_PROFILE", "USER", req => req.user.id), asyncHandler(async (req, res) => {
   const schema = z.object({
     displayName: z.string().min(2),
+    fullName: z.string().optional().nullable(),
     phone: z.string().optional().nullable(),
     branch: z.string().min(1),
     department: z.string().min(1),
@@ -159,13 +200,14 @@ router.patch("/me", audit("EDIT_PROFILE", "USER", req => req.user.id), asyncHand
   const input = schema.parse(req.body);
   const values = {
     ...input,
+    fullName: input.fullName?.trim() ? input.fullName.trim() : null,
     phone: input.phone ?? null,
     branch: input.branch ?? null,
     department: input.department ?? null,
     section: input.section ?? null
   };
   await query(
-    `UPDATE users SET display_name=@displayName, phone=@phone, branch=@branch, department=@department, section=@section, updated_at=SYSUTCDATETIME()
+    `UPDATE users SET display_name=@displayName, full_name=@fullName, phone=@phone, branch=@branch, department=@department, section=@section, updated_at=SYSUTCDATETIME()
      WHERE id=@id`,
     { ...values, id: req.user.id }
   );

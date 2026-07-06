@@ -19,6 +19,7 @@ router.get("/", asyncHandler(async (req, res) => {
   const canViewAll = req.sectionAccess.canViewAll ? 1 : 0;
   const result = await query(
     `SELECT r.*, u.display_name AS requester_name, au.display_name AS incharge_name, su.display_name AS support_name,
+            u.full_name AS requester_full_name, au.full_name AS incharge_full_name, su.full_name AS support_full_name,
             u.branch AS requester_branch, u.department AS requester_department, u.section AS requester_section,
             au.branch AS incharge_branch, au.department AS incharge_department, au.section AS incharge_section,
             su.branch AS support_branch, su.department AS support_department, su.section AS support_section,
@@ -119,8 +120,13 @@ router.get("/:id", asyncHandler(async (req, res) => {
     { id }
   )).recordset;
   const supTypes = (await query(
-    "SELECT sup_type FROM request_support_types WHERE request_id=@id ORDER BY sup_type", { id }
-  )).recordset.map(r => r.sup_type);
+    "SELECT sup_type, item_id, level_id, level_name FROM request_support_types WHERE request_id=@id ORDER BY sup_type", { id }
+  )).recordset.map(r => ({
+    supType: r.sup_type,
+    itemId: r.item_id,
+    levelId: r.level_id,
+    levelName: r.level_name
+  }));
   res.json({ data: { ...request, todos, approvals, attachments, extensionHistory, supTypes } });
 }));
 

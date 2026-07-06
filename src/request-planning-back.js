@@ -18,6 +18,7 @@ const settingsRoutes = require("./modules/settings/settings.routes");
 const kpiRoutes = require("./modules/kpi/kpi.routes");
 const notificationRoutes = require("./modules/notifications/notifications.routes");
 const skillMatrixRoutes = require("./modules/skillmatrix/skillmatrix.routes");
+const weeklyPlanRoutes = require("./modules/weeklyplan/weeklyplan.routes");
 const healthRoutes = require("./modules/health/health.routes");
 
 const app = express();
@@ -68,6 +69,7 @@ app.use("/api/settings", settingsRoutes);
 app.use("/api/kpi", kpiRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/skill-matrix", skillMatrixRoutes);
+app.use("/api/weekly-plan", weeklyPlanRoutes);
 
 app.use(notFound);
 app.use(errorHandler);

@@ -168,6 +168,43 @@ router.get("/sup-type-summary", asyncHandler(async (req, res) => {
   res.json({ supTypes: rows.recordset });
 }));
 
+// Skill-matrix workload + capacity per (item, level): how many requests need
+// that skill at that level vs. how many section workers hold it. Powers the
+// Sup-type Summary matrix box. Returns empty lists if the skill-matrix tables
+// aren't installed. Level-tagged requests only (matrix-mode assignments).
+router.get("/skill-matrix-workload", asyncHandler(async (req, res) => {
+  const { scope = "all" } = req.query;
+  const mine = scope === "mine" ? 1 : 0;
+  const { requesterOrgSection } = analyticsScope(req);
+  try {
+    const workload = (await query(
+      `SELECT st.item_id AS itemId, st.level_id AS levelId, COUNT(*) AS total
+       FROM request_support_types st
+       JOIN requests r ON r.id = st.request_id
+       WHERE st.item_id IS NOT NULL AND st.level_id IS NOT NULL
+         AND r.section_id=@sectionId
+         AND ((@mine=1 AND r.incharge_user_id=@userId) OR (@mine=0 AND (@requesterOrgSection IS NULL OR r.requester_user_id IN (SELECT id FROM users WHERE section=@requesterOrgSection))))
+       GROUP BY st.item_id, st.level_id`,
+      { mine, userId: req.user.id, requesterOrgSection, sectionId: req.section.id }
+    )).recordset;
+    const capacity = (await query(
+      `SELECT usl.item_id AS itemId, usl.level_id AS levelId, COUNT(DISTINCT usl.user_id) AS total
+       FROM user_skill_levels usl
+       JOIN user_section_memberships m ON m.user_id = usl.user_id
+         AND m.section_id=@sectionId AND m.is_active=1 AND m.can_work=1
+       GROUP BY usl.item_id, usl.level_id`,
+      { sectionId: req.section.id }
+    )).recordset;
+    res.json({ workload, capacity });
+  } catch (err) {
+    const msg = `${err.message}`;
+    if (msg.includes("Invalid object name") || msg.includes("Invalid column name")) {
+      return res.json({ workload: [], capacity: [] });
+    }
+    throw err;
+  }
+}));
+
 router.get("/export.csv", asyncHandler(async (req, res) => {
   const { requesterOrgSection, sectionMember } = analyticsScope(req);
   const rows = (await query(
