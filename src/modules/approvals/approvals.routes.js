@@ -111,7 +111,13 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
 
   const isCloseApproval = step.sequence_no >= 100;
 
-  if (!isCloseApproval && step.can_assign_work) {
+  // Assignment (incharge/period/support types) is only the job of a handling-
+  // section member. A cross-section (origin) approver — e.g. an Automation
+  // approver acting in the Maintenance inbox where they don't work — just
+  // approves; the handling section assigns to their own people.
+  const canAssign = !isCloseApproval && step.can_assign_work && req.sectionAccess.canWork === true;
+
+  if (canAssign) {
     if (!values.inchargeUserId || !values.plannedStart || !values.plannedEnd) {
       return res.status(400).json({ message: "Approval must assign incharge and project period" });
     }
@@ -135,7 +141,7 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
     { stepId: Number(req.params.stepId), comment: values.comment }
   );
 
-  if (!isCloseApproval && step.can_assign_work) {
+  if (canAssign) {
     await query(
       `UPDATE requests SET incharge_user_id=@inchargeUserId, support_user_id=@supportUserId, planned_start=@plannedStart, planned_end=@plannedEnd, is_kpi=@isKpi,
        status='PENDING_APPROVAL', updated_at=SYSUTCDATETIME() WHERE id=@requestId`,
