@@ -202,6 +202,7 @@ function sanitizeUser(user) {
     employeeNo: user.employee_no,
     email: user.email,
     displayName: user.display_name,
+    fullName: user.full_name,
     branch: user.branch,
     department: user.department,
     section: user.section,

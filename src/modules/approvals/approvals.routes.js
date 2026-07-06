@@ -40,9 +40,14 @@ router.get("/pending", asyncHandler(async (req, res) => {
   const rows = [];
   for (const row of result.recordset) {
     const supTypes = (await query(
-      "SELECT sup_type FROM request_support_types WHERE request_id=@id ORDER BY sup_type",
+      "SELECT sup_type, item_id, level_id, level_name FROM request_support_types WHERE request_id=@id ORDER BY sup_type",
       { id: row.request_id }
-    )).recordset.map(r => r.sup_type);
+    )).recordset.map(r => ({
+      supType: r.sup_type,
+      itemId: r.item_id,
+      levelId: r.level_id,
+      levelName: r.level_name
+    }));
     rows.push({ ...row, attachments: await getAttachments(row.request_id), supTypes });
   }
   res.json({ data: rows });
@@ -77,9 +82,21 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
     plannedStart: z.string().optional().nullable(),
     plannedEnd: z.string().optional().nullable(),
     isKpi: z.boolean().optional().nullable(),
-    supTypes: z.array(z.string().trim().min(1)).optional().nullable()
+    // A support type is either a plain string (matrix off) or an object carrying
+    // the picked skill item + required level (matrix on).
+    supTypes: z.array(z.union([
+      z.string().trim().min(1),
+      z.object({
+        supType: z.string().trim().min(1).optional(),
+        name: z.string().trim().min(1).optional(),
+        itemId: z.number().int().optional().nullable(),
+        levelId: z.number().int().optional().nullable(),
+        levelName: z.string().optional().nullable()
+      })
+    ])).optional().nullable()
   });
   const input = schema.parse(req.body);
+  const normalizedSupTypes = normalizeSupTypes(input.supTypes);
   const values = {
     comment: input.comment ?? null,
     inchargeUserId: input.inchargeUserId ?? null,
@@ -100,6 +117,15 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
     if (new Date(values.plannedStart) > new Date(values.plannedEnd)) {
       return res.status(400).json({ message: "Project start must be before project end" });
     }
+    // Skill-matrix gate: when the picked support types carry a required level,
+    // the incharge must be qualified — unless a qualified support covers it.
+    const required = normalizedSupTypes.filter(s => s.itemId && s.levelId);
+    if (required.length) {
+      const skill = await evaluateSkillSufficiency(required, values.inchargeUserId, values.supportUserId);
+      if (!skill.inchargeOk && !skill.supportOk) {
+        return res.status(400).json({ message: "INCHARGE_SKILL_INSUFFICIENT" });
+      }
+    }
   }
 
   await query(
@@ -115,12 +141,12 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
       { ...values, requestId: step.request_id }
     );
     // Replace the request's support-type tags with the approver's selection.
-    const supTypes = [...new Set((input.supTypes ?? []).map(s => s.trim()).filter(Boolean))];
     await query("DELETE FROM request_support_types WHERE request_id=@requestId", { requestId: step.request_id });
-    for (const supType of supTypes) {
+    for (const st of normalizedSupTypes) {
       await query(
-        "INSERT INTO request_support_types (request_id, sup_type) VALUES (@requestId, @supType)",
-        { requestId: step.request_id, supType }
+        `INSERT INTO request_support_types (request_id, sup_type, item_id, level_id, level_name)
+         VALUES (@requestId, @supType, @itemId, @levelId, @levelName)`,
+        { requestId: step.request_id, supType: st.supType, itemId: st.itemId, levelId: st.levelId, levelName: st.levelName }
       );
     }
     if (step.sequence_no === 1 ||
@@ -346,6 +372,67 @@ async function notifyAssignedUsers(requestId, requestNo, inchargeUserId, support
       type: "ASSIGN"
     });
   }
+}
+
+// Collapse the approver's supTypes payload (strings and/or objects) into a
+// de-duplicated list of { supType, itemId, levelId, levelName }. sup_type (the
+// skill item name) is always kept so KPI aggregation by name keeps working.
+function normalizeSupTypes(raw) {
+  const seen = new Set();
+  const out = [];
+  for (const entry of raw ?? []) {
+    let name;
+    let itemId = null;
+    let levelId = null;
+    let levelName = null;
+    if (typeof entry === "string") {
+      name = entry.trim();
+    } else if (entry && typeof entry === "object") {
+      name = `${entry.supType ?? entry.name ?? ""}`.trim();
+      itemId = Number.isInteger(entry.itemId) ? entry.itemId : null;
+      levelId = Number.isInteger(entry.levelId) ? entry.levelId : null;
+      levelName = entry.levelName ? `${entry.levelName}`.slice(0, 200) : null;
+    }
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    out.push({ supType: name, itemId, levelId, levelName });
+  }
+  return out;
+}
+
+// A person is "sufficient" when, for every required (itemId, levelId), they hold
+// that skill at a rank (level sort_order) >= the required rank. Missing skill or
+// a lower level = insufficient. Used to gate assignment on the server.
+async function evaluateSkillSufficiency(required, inchargeUserId, supportUserId) {
+  const levels = (await query("SELECT id, sort_order FROM skill_matrix_levels")).recordset;
+  const rank = new Map(levels.map(l => [l.id, l.sort_order]));
+  const userIds = [inchargeUserId, supportUserId].filter(Boolean);
+  const skillRows = userIds.length
+    ? (await query(
+      `SELECT user_id, item_id, level_id FROM user_skill_levels
+         WHERE user_id IN (${userIds.map((_, i) => `@u${i}`).join(",")})`,
+      Object.fromEntries(userIds.map((id, i) => [`u${i}`, id]))
+    )).recordset
+    : [];
+  const byUser = new Map();
+  for (const row of skillRows) {
+    if (!byUser.has(row.user_id)) byUser.set(row.user_id, new Map());
+    byUser.get(row.user_id).set(row.item_id, row.level_id);
+  }
+  const isSufficient = userId => {
+    if (!userId) return false;
+    const skills = byUser.get(userId);
+    if (!skills) return false;
+    for (const req of required) {
+      const have = skills.get(req.itemId);
+      if (have == null) return false;
+      const haveRank = rank.get(have);
+      const needRank = rank.get(req.levelId);
+      if (haveRank == null || needRank == null || haveRank < needRank) return false;
+    }
+    return true;
+  };
+  return { inchargeOk: isSufficient(inchargeUserId), supportOk: isSufficient(supportUserId) };
 }
 
 async function getAttachments(requestId) {
