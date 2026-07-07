@@ -2,11 +2,11 @@
   "name": "request-and-planning-api",
   "version": "1.0.0",
   "description": "Request & Planning backend API",
-  "main": "src/server.js",
+  "main": "src/request-planning-back.js",
   "scripts": {
-    "dev": "nodemon src/server.js",
-    "start": "node src/server.js",
-    "lint": "node --check src/server.js"
+    "dev": "nodemon src/request-planning-back.js",
+    "start": "node src/request-planning-back.js",
+    "lint": "node --check src/request-planning-back.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

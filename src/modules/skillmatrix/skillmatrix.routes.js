@@ -2,7 +2,7 @@ const express = require("express");
 const { sql, getPool, query } = require("../../db/pool");
 const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
-const { requireAdmin } = require("../../services/sectionService");
+const { requireSectionManager, resolveSection } = require("../../services/sectionService");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -49,16 +49,22 @@ router.get("/me", asyncHandler(async (req, res) => {
 // Set or clear the user's level for a single skill. levelId = null clears it,
 // so tapping the already-selected level toggles it off on the client.
 router.put("/me", asyncHandler(async (req, res) => {
-  const itemId = Number(req.body?.itemId);
-  const hasLevel = req.body?.levelId !== null && req.body?.levelId !== undefined;
-  const levelId = hasLevel ? Number(req.body.levelId) : null;
+  await setSkillLevel(req.user.id, req.body, res);
+}));
+
+// Set or clear one skill level for [userId]. Shared by the self endpoint and the
+// admin per-member endpoint. Writes the response itself (validation errors or ok).
+async function setSkillLevel(userId, body, res) {
+  const itemId = Number(body?.itemId);
+  const hasLevel = body?.levelId !== null && body?.levelId !== undefined;
+  const levelId = hasLevel ? Number(body.levelId) : null;
   if (!Number.isInteger(itemId)) return res.status(400).json({ message: "itemId is required" });
 
   const item = await query("SELECT 1 FROM skill_matrix_items WHERE id = @id", { id: itemId });
   if (!item.recordset.length) return res.status(404).json({ message: "Skill not found" });
 
   await query("DELETE FROM user_skill_levels WHERE user_id = @userId AND item_id = @itemId", {
-    userId: req.user.id,
+    userId,
     itemId
   });
 
@@ -69,19 +75,65 @@ router.put("/me", asyncHandler(async (req, res) => {
     await query(
       `INSERT INTO user_skill_levels (user_id, item_id, level_id, updated_at)
        VALUES (@userId, @itemId, @levelId, SYSUTCDATETIME())`,
-      { userId: req.user.id, itemId, levelId }
+      { userId, itemId, levelId }
     );
   }
   res.json({ ok: true });
+}
+
+// ---------------------------------------------------------------------------
+// Admin / section admin / internal-route approver: manage each section member's
+// ratings. Both endpoints are section-scoped (resolveSection) so a non-global
+// manager only reaches their own section's members.
+// ---------------------------------------------------------------------------
+router.get("/users", resolveSection, requireSectionManager, asyncHandler(async (req, res) => {
+  const users = (await query(
+    `SELECT u.id, u.display_name, u.full_name
+     FROM users u
+     JOIN user_section_memberships m
+       ON m.user_id = u.id AND m.section_id = @sectionId AND m.is_active = 1 AND m.can_work = 1
+     WHERE u.is_active = 1
+     ORDER BY u.display_name`,
+    { sectionId: req.section.id }
+  )).recordset;
+
+  let selections = [];
+  if (users.length) {
+    const params = Object.fromEntries(users.map((u, i) => [`u${i}`, u.id]));
+    selections = (await query(
+      `SELECT user_id, item_id, level_id FROM user_skill_levels
+       WHERE user_id IN (${users.map((_, i) => `@u${i}`).join(",")})`,
+      params
+    )).recordset;
+  }
+
+  res.json({
+    users: users.map(u => ({ userId: u.id, displayName: u.display_name, fullName: u.full_name })),
+    selections: selections.map(r => ({ userId: r.user_id, itemId: r.item_id, levelId: r.level_id }))
+  });
+}));
+
+router.put("/users/:userId(\\d+)", resolveSection, requireSectionManager, asyncHandler(async (req, res) => {
+  const targetId = Number(req.params.userId);
+  const member = await query(
+    `SELECT 1 FROM user_section_memberships
+     WHERE user_id = @targetId AND section_id = @sectionId AND is_active = 1`,
+    { targetId, sectionId: req.section.id }
+  );
+  if (!member.recordset.length) {
+    return res.status(403).json({ message: "User is not a member of this section" });
+  }
+  await setSkillLevel(targetId, req.body, res);
 }));
 
 // ---------------------------------------------------------------------------
-// Admin: replace the whole matrix in one transactional save. The client sends
-// every level and item (with a stable `key`); rows/columns keep their id when
+// Section managers (global admin / section admin / internal-route approver):
+// replace the whole matrix in one transactional save. The client sends every
+// level and item (with a stable `key`); rows/columns keep their id when
 // edited, get a new id when added, and are removed when dropped. Cell text is
 // rebuilt from each item's `cells` map (keyed by level `key`).
 // ---------------------------------------------------------------------------
-router.put("/", requireAdmin, asyncHandler(async (req, res) => {
+router.put("/", resolveSection, requireSectionManager, asyncHandler(async (req, res) => {
   const body = req.body || {};
   const cornerLabel = `${body.cornerLabel ?? "Items/Level"}`.slice(0, 200);
   const levels = Array.isArray(body.levels) ? body.levels : [];
