@@ -40,7 +40,16 @@ async function getUserSections(user) {
               WHERE ar.section_id = s.id
                 AND ar.is_active = 1
                 AND ars.default_approver_user_id = @userId
-            ) THEN 1 ELSE 0 END AS BIT) AS is_approver
+            ) THEN 1 ELSE 0 END AS BIT) AS is_approver,
+            CAST(CASE WHEN EXISTS (
+              SELECT 1
+              FROM approval_routes ar
+              JOIN approval_route_steps ars ON ars.route_id = ar.id
+              WHERE ar.section_id = s.id
+                AND ar.is_active = 1
+                AND ar.requester_section_id IS NULL
+                AND ars.default_approver_user_id = @userId
+            ) THEN 1 ELSE 0 END AS BIT) AS is_internal_approver
      FROM request_sections s
      LEFT JOIN user_section_memberships m
        ON m.section_id = s.id AND m.user_id = @userId AND m.is_active = 1
@@ -60,6 +69,9 @@ async function getUserSections(user) {
     isAdmin: section.is_admin === true || section.is_admin === 1,
     isSectionAdmin: section.is_section_admin === true || section.is_section_admin === 1,
     isApprover: section.is_approver === true || section.is_approver === 1,
+    // Approver on one of the section's OWN routes (not a cross-section stage-1
+    // route) — grants section-manager tools like the skill matrix.
+    isInternalApprover: section.is_internal_approver === true || section.is_internal_approver === 1,
     unreadCount: section.unread_count || 0
   }));
 }
@@ -79,7 +91,16 @@ async function resolveSection(req, res, next) {
                 WHERE ar.section_id = s.id
                   AND ar.is_active = 1
                   AND ars.default_approver_user_id = @userId
-              ) THEN 1 ELSE 0 END AS BIT) AS is_approver
+              ) THEN 1 ELSE 0 END AS BIT) AS is_approver,
+              CAST(CASE WHEN EXISTS (
+                SELECT 1
+                FROM approval_routes ar
+                JOIN approval_route_steps ars ON ars.route_id = ar.id
+                WHERE ar.section_id = s.id
+                  AND ar.is_active = 1
+                  AND ar.requester_section_id IS NULL
+                  AND ars.default_approver_user_id = @userId
+              ) THEN 1 ELSE 0 END AS BIT) AS is_internal_approver
        FROM request_sections s
        LEFT JOIN user_section_memberships m
          ON m.section_id = s.id AND m.user_id = @userId AND m.is_active = 1
@@ -110,6 +131,10 @@ async function resolveSection(req, res, next) {
       canRequest: admin || section.can_request === true || section.can_request === 1,
       canWork: admin || section.can_work === true || section.can_work === 1,
       isApprover: admin || section.is_approver === true || section.is_approver === 1,
+      // Approver on one of the section's OWN routes (cross-section stage-1
+      // routes don't count) — grants section-manager tools like the skill matrix.
+      isInternalApprover:
+        section.is_internal_approver === true || section.is_internal_approver === 1,
       canViewAll: admin || sectionAdmin || section.is_approver === true || section.is_approver === 1
     };
     next();
@@ -142,6 +167,15 @@ function requireSectionAdmin(req, res, next) {
   return res.status(403).json({ message: "Forbidden" });
 }
 
+// Like requireSectionAdmin, but ALSO passes for an approver on one of the
+// section's own (non-cross-section) approval routes. Used for section-manager
+// tools such as the skill matrix. Must run AFTER resolveSection.
+function requireSectionManager(req, res, next) {
+  const access = req.sectionAccess || {};
+  if (isAdmin(req.user) || access.isSectionAdmin || access.isInternalApprover) return next();
+  return res.status(403).json({ message: "Forbidden" });
+}
+
 module.exports = {
   canManageTargetRole,
   getSectionName,
@@ -151,5 +185,6 @@ module.exports = {
   normalizeSectionCode,
   requireAdmin,
   requireSectionAdmin,
+  requireSectionManager,
   resolveSection
 };

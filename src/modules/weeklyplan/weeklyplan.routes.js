@@ -73,8 +73,12 @@ router.get("/", asyncHandler(async (req, res) => {
     for (const d of defCars) {
       cars.push({ id: null, label: d.label ?? "", plate: d.plate ?? "", cells: DAYS.map(() => "") });
     }
+    // Company holidays override defaults: nobody visits customers on a holiday,
+    // so those days stay blank ("–") instead of the seeded value. Plain Sat/Sun
+    // defaults are honoured — setting one there is an explicit choice.
+    const holidayIdx = await holidayDayIndexes(weekStart);
     for (const [uid, cells] of (await loadDefaultUserValues(req.section.id))) {
-      userRowById.set(uid, cells);
+      userRowById.set(uid, cells.map((v, i) => (holidayIdx.has(i) ? "" : v)));
     }
   }
 
@@ -218,6 +222,23 @@ router.put("/default-cars", requireSectionAdmin, asyncHandler(async (req, res) =
 // Per-section, per-user default cell values (edited in Settings as a
 // users × day grid). Seed a fresh current week.
 // ---------------------------------------------------------------------------
+// Day indexes (0=Mon … 6=Sun) of the week that are company holidays. Empty when
+// the external holiday DB isn't configured (getHolidayDates never throws).
+async function holidayDayIndexes(weekStart) {
+  const start = new Date(`${weekStart}T00:00:00Z`);
+  const end = new Date(start);
+  end.setUTCDate(end.getUTCDate() + 6);
+  const ymd = d =>
+    `${d.getUTCFullYear()}-${`${d.getUTCMonth() + 1}`.padStart(2, "0")}-${`${d.getUTCDate()}`.padStart(2, "0")}`;
+  const { dates } = await getHolidayDates(weekStart, ymd(end));
+  const indexes = new Set();
+  for (const date of dates) {
+    const idx = Math.round((new Date(`${date}T00:00:00Z`) - start) / 86400000);
+    if (idx >= 0 && idx <= 6) indexes.add(idx);
+  }
+  return indexes;
+}
+
 async function loadDefaultUserValues(sectionId) {
   const rows = (await query(
     "SELECT user_id, day_index, value FROM weekly_plan_default_user_values WHERE section_id = @sectionId",
