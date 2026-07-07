@@ -3,7 +3,7 @@ const { z } = require("zod");
 const { sql, getPool, query } = require("../../db/pool");
 const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
-const { resolveSection, requireAdmin } = require("../../services/sectionService");
+const { resolveSection, requireSectionAdmin } = require("../../services/sectionService");
 const { getHolidayDates } = require("../../db/holidayPool");
 
 const router = express.Router();
@@ -174,7 +174,7 @@ router.get("/default-cars", asyncHandler(async (req, res) => {
   res.json({ cars: rows.map(r => ({ label: r.label ?? "", plate: r.plate ?? "" })) });
 }));
 
-router.put("/default-cars", requireAdmin, asyncHandler(async (req, res) => {
+router.put("/default-cars", requireSectionAdmin, asyncHandler(async (req, res) => {
   const schema = z.object({
     cars: z.array(z.object({
       label: z.string().optional().nullable(),
@@ -244,7 +244,7 @@ router.get("/default-user-values", asyncHandler(async (req, res) => {
   });
 }));
 
-router.put("/default-user-values", requireAdmin, asyncHandler(async (req, res) => {
+router.put("/default-user-values", requireSectionAdmin, asyncHandler(async (req, res) => {
   const schema = z.object({
     users: z.array(z.object({
       userId: z.number().int(),

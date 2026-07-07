@@ -8,6 +8,21 @@ function isAdmin(user) {
   return user?.roleCode === "ADMIN";
 }
 
+// Whether the account is the section-admin "kind". Actual authority is still
+// scoped per section by the is_section_admin membership flag (see resolveSection
+// / getUserSections) — this only says the role permits it.
+function isSectionAdminRole(user) {
+  return user?.roleCode === "SECTION_ADMIN";
+}
+
+// Guard against privilege escalation: a global ADMIN can manage anyone; a
+// section admin may only create/edit/reset plain REQUESTER accounts (never
+// another admin or section admin).
+function canManageTargetRole(actor, targetRoleCode) {
+  if (isAdmin(actor)) return true;
+  return targetRoleCode === "REQUESTER";
+}
+
 async function getUserSections(user) {
   if (!user?.id) return [];
   const result = await query(
@@ -15,6 +30,7 @@ async function getUserSections(user) {
             CAST(CASE WHEN @isAdmin = 1 THEN 1 ELSE COALESCE(m.can_request, 0) END AS BIT) AS can_request,
             CAST(CASE WHEN @isAdmin = 1 THEN 1 ELSE COALESCE(m.can_work, 0) END AS BIT) AS can_work,
             CAST(CASE WHEN @isAdmin = 1 THEN 1 ELSE 0 END AS BIT) AS is_admin,
+            CAST(CASE WHEN @isSectionAdminRole = 1 AND m.is_section_admin = 1 THEN 1 ELSE 0 END AS BIT) AS is_section_admin,
             (SELECT COUNT(1) FROM notifications n
                WHERE n.user_id = @userId AND n.section_id = s.id AND n.read_at IS NULL) AS unread_count,
             CAST(CASE WHEN EXISTS (
@@ -31,7 +47,7 @@ async function getUserSections(user) {
      WHERE s.is_active = 1
        AND (@isAdmin = 1 OR m.id IS NOT NULL)
      ORDER BY s.name`,
-    { userId: user.id, isAdmin: isAdmin(user) ? 1 : 0 }
+    { userId: user.id, isAdmin: isAdmin(user) ? 1 : 0, isSectionAdminRole: isSectionAdminRole(user) ? 1 : 0 }
   );
   return result.recordset.map(section => ({
     id: section.id,
@@ -42,6 +58,7 @@ async function getUserSections(user) {
     canRequest: section.can_request === true || section.can_request === 1,
     canWork: section.can_work === true || section.can_work === 1,
     isAdmin: section.is_admin === true || section.is_admin === 1,
+    isSectionAdmin: section.is_section_admin === true || section.is_section_admin === 1,
     isApprover: section.is_approver === true || section.is_approver === 1,
     unreadCount: section.unread_count || 0
   }));
@@ -54,7 +71,7 @@ async function resolveSection(req, res, next) {
 
     const result = await query(
       `SELECT TOP 1 s.id, s.code, s.name, s.description, s.request_prefix,
-              m.can_request, m.can_work,
+              m.can_request, m.can_work, m.is_section_admin,
               CAST(CASE WHEN EXISTS (
                 SELECT 1
                 FROM approval_routes ar
@@ -76,6 +93,10 @@ async function resolveSection(req, res, next) {
     }
 
     const admin = isAdmin(req.user);
+    // Section admin only for THIS section: the role permits it and the membership
+    // flag scopes it. Never grants cross-section access (that stays global-admin only).
+    const sectionAdmin = isSectionAdminRole(req.user) &&
+      (section.is_section_admin === true || section.is_section_admin === 1);
     req.section = {
       id: section.id,
       code: section.code,
@@ -85,10 +106,11 @@ async function resolveSection(req, res, next) {
     };
     req.sectionAccess = {
       isAdmin: admin,
+      isSectionAdmin: sectionAdmin,
       canRequest: admin || section.can_request === true || section.can_request === 1,
       canWork: admin || section.can_work === true || section.can_work === 1,
       isApprover: admin || section.is_approver === true || section.is_approver === 1,
-      canViewAll: admin || section.is_approver === true || section.is_approver === 1
+      canViewAll: admin || sectionAdmin || section.is_approver === true || section.is_approver === 1
     };
     next();
   } catch (err) {
@@ -113,11 +135,21 @@ function requireAdmin(req, res, next) {
   return res.status(403).json({ message: "Forbidden" });
 }
 
+// Passes for a global admin OR a section admin of the resolved section. Must run
+// AFTER resolveSection (relies on req.sectionAccess).
+function requireSectionAdmin(req, res, next) {
+  if (isAdmin(req.user) || req.sectionAccess?.isSectionAdmin) return next();
+  return res.status(403).json({ message: "Forbidden" });
+}
+
 module.exports = {
+  canManageTargetRole,
   getSectionName,
   getUserSections,
   isAdmin,
+  isSectionAdminRole,
   normalizeSectionCode,
   requireAdmin,
+  requireSectionAdmin,
   resolveSection
 };
