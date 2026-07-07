@@ -110,7 +110,7 @@ router.post("/", requireSectionAdmin, audit("CREATE", "USER", req => req.body.em
     email: z.string().email(),
     displayName: z.string().min(2),
     fullName: z.string().optional().nullable(),
-    password: z.string().min(10),
+    password: z.string().min(1),
     roleId: z.number().int(),
     branch: z.string().min(1),
     department: z.string().min(1),
@@ -200,7 +200,7 @@ router.patch("/:id(\\d+)", requireSectionAdmin, audit("EDIT", "USER", req => req
 }));
 
 router.post("/:id(\\d+)/reset-password", requireSectionAdmin, audit("RESET_PASSWORD", "USER", req => req.params.id), asyncHandler(async (req, res) => {
-  const schema = z.object({ password: z.string().min(10) });
+  const schema = z.object({ password: z.string().min(1) });
   const input = schema.parse(req.body);
   if (!canManageTargetRole(req.user, await targetRoleCode(Number(req.params.id)))) {
     return res.status(403).json({ message: "You cannot manage this user" });
@@ -240,7 +240,7 @@ router.patch("/me", audit("EDIT_PROFILE", "USER", req => req.user.id), asyncHand
 }));
 
 router.patch("/me/password", audit("CHANGE_PASSWORD", "USER", req => req.user.id), asyncHandler(async (req, res) => {
-  const schema = z.object({ currentPassword: z.string(), newPassword: z.string().min(10) });
+  const schema = z.object({ currentPassword: z.string(), newPassword: z.string().min(1) });
   const input = schema.parse(req.body);
   const user = (await query("SELECT password_hash FROM users WHERE id=@id", { id: req.user.id })).recordset[0];
   if (!user || !(await bcrypt.compare(input.currentPassword, user.password_hash))) {
