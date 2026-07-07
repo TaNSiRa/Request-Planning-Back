@@ -98,6 +98,53 @@ router.get("/org-options", asyncHandler(async (req, res) => {
   });
 }));
 
+// Meeting-mode group ordering, shared by the whole section (everyone in the
+// meeting sees the same order). Any section member may read and update it —
+// the meeting screen is a collaborative view, so no admin gate.
+// Stored per grouping mode as app_settings key 'meeting.groupOrder.<mode>'
+// (0 incharge, 1 type, 2 status, 3 priority) holding a JSON array of group
+// titles, first = top; groups not listed follow the default order.
+router.get("/meeting-group-order", asyncHandler(async (req, res) => {
+  const rows = (await query(
+    `SELECT setting_key, setting_value FROM app_settings
+     WHERE section_id=@sectionId AND setting_key LIKE 'meeting.groupOrder.%'`,
+    { sectionId: req.section.id }
+  )).recordset;
+  const data = {};
+  for (const row of rows) {
+    const mode = row.setting_key.split(".").pop();
+    try {
+      const parsed = JSON.parse(row.setting_value);
+      if (Array.isArray(parsed)) data[mode] = parsed.map(v => `${v}`);
+    } catch {
+      // Ignore malformed rows; the client falls back to the default order.
+    }
+  }
+  res.json({ data });
+}));
+
+router.put("/meeting-group-order", asyncHandler(async (req, res) => {
+  const schema = z.object({
+    groupBy: z.number().int().min(0).max(3),
+    order: z.array(z.string().max(300)).max(500)
+  });
+  const input = schema.parse(req.body);
+  await query(
+    `MERGE app_settings AS target
+     USING (SELECT @key AS setting_key, @sectionId AS section_id) AS source
+     ON target.setting_key = source.setting_key AND COALESCE(target.section_id, 0) = COALESCE(source.section_id, 0)
+     WHEN MATCHED THEN UPDATE SET setting_value=@value, updated_at=SYSUTCDATETIME()
+     WHEN NOT MATCHED THEN INSERT (section_id, setting_key, setting_value, value_type, is_public)
+       VALUES (@sectionId, @key, @value, 'json', 1);`,
+    {
+      sectionId: req.section.id,
+      key: `meeting.groupOrder.${input.groupBy}`,
+      value: JSON.stringify(input.order)
+    }
+  );
+  res.json({ ok: true });
+}));
+
 router.put("/:key", requireSectionAdmin, audit("EDIT", "SETTING", req => req.params.key), asyncHandler(async (req, res) => {
   const schema = z.object({ value: z.string(), valueType: z.string().optional().default("string"), isPublic: z.boolean().optional().default(false) });
   const input = schema.parse(req.body);
