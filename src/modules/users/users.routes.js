@@ -6,32 +6,48 @@ const { query } = require("../../db/pool");
 const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
 const { audit } = require("../../middleware/audit");
-const { requireAdmin, resolveSection } = require("../../services/sectionService");
+const { requireSectionAdmin, resolveSection, isAdmin, canManageTargetRole } = require("../../services/sectionService");
 
 const router = express.Router();
 
 router.use(requireAuth);
 router.use(resolveSection);
 
-router.get("/", requireAdmin, asyncHandler(async (req, res) => {
+router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
+  // Global admins see every admin + this section's members. A section admin only
+  // manages plain requesters in their own section, so they see just those.
+  const fullAdmin = isAdmin(req.user) ? 1 : 0;
   const result = await query(
     `SELECT u.id, u.employee_no, u.email, u.display_name, u.full_name, u.branch, u.department, u.section, u.phone, u.is_active, u.role_id,
             r.code AS role_code, r.name AS role_name,
-            m.can_request, m.can_work, m.is_active AS membership_active,
-            (SELECT ms.section_id, ms.can_request, ms.can_work
+            m.can_request, m.can_work, m.is_section_admin, m.is_active AS membership_active,
+            (SELECT ms.section_id, ms.can_request, ms.can_work, ms.is_section_admin
                FROM user_section_memberships ms
                WHERE ms.user_id = u.id AND ms.is_active = 1
-               FOR JSON PATH) AS memberships_json
+               FOR JSON PATH) AS memberships_json,
+            (SELECT DISTINCT s2.name
+               FROM approval_route_steps ars
+               JOIN approval_routes ar ON ar.id = ars.route_id AND ar.is_active = 1
+               JOIN request_sections s2 ON s2.id = ar.section_id
+               WHERE ars.default_approver_user_id = u.id
+               FOR JSON PATH) AS approver_sections_json
      FROM users u
      JOIN roles r ON r.id = u.role_id
      LEFT JOIN user_section_memberships m ON m.user_id = u.id AND m.section_id = @sectionId
-     WHERE r.code = 'ADMIN' OR m.id IS NOT NULL
+     WHERE (@fullAdmin = 1 AND (r.code = 'ADMIN' OR m.id IS NOT NULL))
+        OR (@fullAdmin = 0 AND m.id IS NOT NULL AND m.is_active = 1 AND r.code = 'REQUESTER')
      ORDER BY u.display_name`,
-    { sectionId: req.section.id }
+    { sectionId: req.section.id, fullAdmin }
   );
   const rows = result.recordset.map(row => {
-    const { memberships_json, ...rest } = row;
-    return { ...rest, memberships: memberships_json ? JSON.parse(memberships_json) : [] };
+    const { memberships_json, approver_sections_json, ...rest } = row;
+    return {
+      ...rest,
+      memberships: memberships_json ? JSON.parse(memberships_json) : [],
+      approver_sections: approver_sections_json
+        ? JSON.parse(approver_sections_json).map(s => s.name)
+        : []
+    };
   });
   res.json({ data: rows });
 }));
@@ -88,7 +104,7 @@ async function getAssigneeSkills(userIds) {
   return map;
 }
 
-router.post("/", requireAdmin, audit("CREATE", "USER", req => req.body.email), asyncHandler(async (req, res) => {
+router.post("/", requireSectionAdmin, audit("CREATE", "USER", req => req.body.email), asyncHandler(async (req, res) => {
   const schema = z.object({
     employeeNo: z.string().min(1),
     email: z.string().email(),
@@ -105,6 +121,10 @@ router.post("/", requireAdmin, audit("CREATE", "USER", req => req.body.email), a
     memberships: membershipsSchema
   });
   const input = schema.parse(req.body);
+  // Privilege guard: a section admin (non-global) may only create plain requesters.
+  if (!canManageTargetRole(req.user, await roleCodeById(input.roleId))) {
+    return res.status(403).json({ message: "You can only assign the Requester role" });
+  }
   // Exclude non-column fields (arrays/flags) from the INSERT params — passing an
   // array to mssql throws "Invalid string".
   const { memberships, canRequest, canWork, ...userInput } = input;
@@ -125,15 +145,11 @@ router.post("/", requireAdmin, audit("CREATE", "USER", req => req.body.email), a
     { ...values, email: input.email.toLowerCase(), passwordHash }
   );
   const userId = result.recordset[0].id;
-  if (input.memberships && input.memberships.length) {
-    await setMemberships(userId, input.memberships);
-  } else {
-    await upsertMembership(userId, req.section.id, input.canRequest, input.canWork);
-  }
+  await applyMembershipsForActor(req, userId, input);
   res.status(201).json({ id: userId });
 }));
 
-router.patch("/:id(\\d+)", requireAdmin, audit("EDIT", "USER", req => req.params.id), asyncHandler(async (req, res) => {
+router.patch("/:id(\\d+)", requireSectionAdmin, audit("EDIT", "USER", req => req.params.id), asyncHandler(async (req, res) => {
   const schema = z.object({
     employeeNo: z.string().min(1),
     email: z.string().email(),
@@ -150,6 +166,16 @@ router.patch("/:id(\\d+)", requireAdmin, audit("EDIT", "USER", req => req.params
     memberships: membershipsSchema
   });
   const input = schema.parse(req.body);
+  // Privilege guards for a section admin (non-global): may not touch admins/section
+  // admins, and may only assign the Requester role.
+  if (!isAdmin(req.user)) {
+    if (!canManageTargetRole(req.user, await targetRoleCode(Number(req.params.id)))) {
+      return res.status(403).json({ message: "You cannot manage this user" });
+    }
+    if (!canManageTargetRole(req.user, await roleCodeById(input.roleId))) {
+      return res.status(403).json({ message: "You can only assign the Requester role" });
+    }
+  }
   await query(
     `UPDATE users
      SET employee_no=@employeeNo, email=@email, display_name=@displayName, full_name=@fullName, role_id=@roleId,
@@ -169,17 +195,16 @@ router.patch("/:id(\\d+)", requireAdmin, audit("EDIT", "USER", req => req.params
       isActive: input.isActive
     }
   );
-  if (input.memberships) {
-    await setMemberships(Number(req.params.id), input.memberships);
-  } else {
-    await upsertMembership(Number(req.params.id), req.section.id, input.canRequest, input.canWork);
-  }
+  await applyMembershipsForActor(req, Number(req.params.id), input);
   res.json({ ok: true });
 }));
 
-router.post("/:id(\\d+)/reset-password", requireAdmin, audit("RESET_PASSWORD", "USER", req => req.params.id), asyncHandler(async (req, res) => {
+router.post("/:id(\\d+)/reset-password", requireSectionAdmin, audit("RESET_PASSWORD", "USER", req => req.params.id), asyncHandler(async (req, res) => {
   const schema = z.object({ password: z.string().min(10) });
   const input = schema.parse(req.body);
+  if (!canManageTargetRole(req.user, await targetRoleCode(Number(req.params.id)))) {
+    return res.status(403).json({ message: "You cannot manage this user" });
+  }
   const passwordHash = await bcrypt.hash(input.password, env.bcryptRounds);
   await query("UPDATE users SET password_hash=@passwordHash, updated_at=SYSUTCDATETIME() WHERE id=@id", {
     id: Number(req.params.id),
@@ -231,34 +256,66 @@ router.get("/roles", asyncHandler(async (req, res) => {
   res.json({ data: result.recordset });
 }));
 
-async function upsertMembership(userId, sectionId, canRequest = true, canWork = true) {
+async function upsertMembership(userId, sectionId, canRequest = true, canWork = true, isSectionAdmin = false) {
   await query(
     `MERGE user_section_memberships AS target
      USING (SELECT @userId AS user_id, @sectionId AS section_id) AS source
      ON target.user_id = source.user_id AND target.section_id = source.section_id
-     WHEN MATCHED THEN UPDATE SET can_request=@canRequest, can_work=@canWork, is_active=1
+     WHEN MATCHED THEN UPDATE SET can_request=@canRequest, can_work=@canWork, is_section_admin=@isSectionAdmin, is_active=1
      WHEN NOT MATCHED THEN
-       INSERT (user_id, section_id, can_request, can_work, is_active)
-       VALUES (@userId, @sectionId, @canRequest, @canWork, 1);`,
-    { userId, sectionId, canRequest, canWork }
+       INSERT (user_id, section_id, can_request, can_work, is_section_admin, is_active)
+       VALUES (@userId, @sectionId, @canRequest, @canWork, @isSectionAdmin, 1);`,
+    { userId, sectionId, canRequest, canWork, isSectionAdmin }
   );
 }
 
 // Per-section access chosen in the user form: which sections the user can
-// request/work in. Deactivates any section not in the list.
+// request/work in (and, for global admins, administer). Deactivates any section
+// not in the list. is_section_admin is only honoured when allowSectionAdmin is
+// true (i.e. the actor is a global admin) — a section admin can never mint another.
 const membershipsSchema = z
   .array(z.object({
     sectionId: z.number().int().positive(),
     canRequest: z.boolean().optional().default(true),
-    canWork: z.boolean().optional().default(true)
+    canWork: z.boolean().optional().default(true),
+    isSectionAdmin: z.boolean().optional().default(false)
   }))
   .optional();
 
-async function setMemberships(userId, memberships) {
+async function setMemberships(userId, memberships, allowSectionAdmin = false) {
   await query("UPDATE user_section_memberships SET is_active=0 WHERE user_id=@userId", { userId });
   for (const m of memberships) {
-    await upsertMembership(userId, m.sectionId, m.canRequest !== false, m.canWork !== false);
+    await upsertMembership(userId, m.sectionId, m.canRequest !== false, m.canWork !== false,
+      allowSectionAdmin && m.isSectionAdmin === true);
   }
+}
+
+async function roleCodeById(roleId) {
+  const row = (await query("SELECT code FROM roles WHERE id=@roleId", { roleId })).recordset[0];
+  return row?.code || null;
+}
+
+async function targetRoleCode(userId) {
+  const row = (await query(
+    "SELECT r.code FROM users u JOIN roles r ON r.id=u.role_id WHERE u.id=@userId", { userId }
+  )).recordset[0];
+  return row?.code || null;
+}
+
+// Apply the section-membership part of a create/edit. A global admin gets full
+// replace-all control (including granting section-admin). A section admin may
+// only touch THEIR OWN section's membership for the user — never deactivating
+// the user's memberships in other sections, never granting section-admin.
+async function applyMembershipsForActor(req, userId, input) {
+  if (isAdmin(req.user)) {
+    if (input.memberships) await setMemberships(userId, input.memberships, true);
+    else await upsertMembership(userId, req.section.id, input.canRequest, input.canWork, false);
+    return;
+  }
+  const own = (input.memberships || []).find(m => m.sectionId === req.section.id);
+  const canRequest = own ? own.canRequest !== false : input.canRequest !== false;
+  const canWork = own ? own.canWork !== false : input.canWork !== false;
+  await upsertMembership(userId, req.section.id, canRequest, canWork, false);
 }
 
 module.exports = router;

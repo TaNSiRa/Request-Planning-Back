@@ -4,7 +4,7 @@ const { query } = require("../../db/pool");
 const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
 const { audit } = require("../../middleware/audit");
-const { requireAdmin, resolveSection } = require("../../services/sectionService");
+const { requireSectionAdmin, resolveSection } = require("../../services/sectionService");
 const { verifyMail, isMailConfigured, sendMail } = require("../../services/mailService");
 const { verifyHoliday } = require("../../db/holidayPool");
 
@@ -13,17 +13,17 @@ router.use(requireAuth);
 router.use(resolveSection);
 
 // Test the external holiday DB connection (SAR / Master_Holiday).
-router.get("/holiday/verify", requireAdmin, asyncHandler(async (req, res) => {
+router.get("/holiday/verify", requireSectionAdmin, asyncHandler(async (req, res) => {
   res.json(await verifyHoliday());
 }));
 
 // Check the SMTP connection/credentials without sending anything.
-router.get("/mail/verify", requireAdmin, asyncHandler(async (req, res) => {
+router.get("/mail/verify", requireSectionAdmin, asyncHandler(async (req, res) => {
   res.json({ configured: isMailConfigured(), ...(await verifyMail()) });
 }));
 
 // Send a real test email to prove end-to-end delivery works.
-router.post("/mail/test", requireAdmin, audit("TEST", "MAIL"), asyncHandler(async (req, res) => {
+router.post("/mail/test", requireSectionAdmin, audit("TEST", "MAIL"), asyncHandler(async (req, res) => {
   const schema = z.object({ to: z.string().email() });
   const input = schema.parse(req.body);
   const result = await sendMail({
@@ -37,7 +37,7 @@ router.post("/mail/test", requireAdmin, audit("TEST", "MAIL"), asyncHandler(asyn
   res.json(result);
 }));
 
-router.get("/", requireAdmin, asyncHandler(async (req, res) => {
+router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
   const result = await query(
     `SELECT setting_key, setting_value, value_type, is_public, section_id
      FROM app_settings
@@ -98,7 +98,7 @@ router.get("/org-options", asyncHandler(async (req, res) => {
   });
 }));
 
-router.put("/:key", requireAdmin, audit("EDIT", "SETTING", req => req.params.key), asyncHandler(async (req, res) => {
+router.put("/:key", requireSectionAdmin, audit("EDIT", "SETTING", req => req.params.key), asyncHandler(async (req, res) => {
   const schema = z.object({ value: z.string(), valueType: z.string().optional().default("string"), isPublic: z.boolean().optional().default(false) });
   const input = schema.parse(req.body);
   const sectionId = isGlobalSetting(req.params.key) ? null : req.section.id;
@@ -114,7 +114,7 @@ router.put("/:key", requireAdmin, audit("EDIT", "SETTING", req => req.params.key
   res.json({ ok: true });
 }));
 
-router.get("/approval-routes", requireAdmin, asyncHandler(async (req, res) => {
+router.get("/approval-routes", requireSectionAdmin, asyncHandler(async (req, res) => {
   const result = await query(
     `SELECT ar.id AS route_id, ar.name, ar.request_type, ar.is_default, ar.is_active,
             ar.requester_section_id, rs.name AS requester_section_name,
@@ -132,7 +132,7 @@ router.get("/approval-routes", requireAdmin, asyncHandler(async (req, res) => {
   res.json({ data: nestRoutes(result.recordset) });
 }));
 
-router.post("/approval-routes", requireAdmin, audit("CREATE", "APPROVAL_ROUTE", req => req.body.name), asyncHandler(async (req, res) => {
+router.post("/approval-routes", requireSectionAdmin, audit("CREATE", "APPROVAL_ROUTE", req => req.body.name), asyncHandler(async (req, res) => {
   const input = routeSchema.parse(req.body);
   const result = await query(
     `INSERT INTO approval_routes (section_id, requester_section_id, name, request_type, is_default, is_active)
@@ -152,7 +152,7 @@ router.post("/approval-routes", requireAdmin, audit("CREATE", "APPROVAL_ROUTE", 
   res.status(201).json({ id: routeId });
 }));
 
-router.put("/approval-routes/:routeId", requireAdmin, audit("EDIT", "APPROVAL_ROUTE", req => req.params.routeId), asyncHandler(async (req, res) => {
+router.put("/approval-routes/:routeId", requireSectionAdmin, audit("EDIT", "APPROVAL_ROUTE", req => req.params.routeId), asyncHandler(async (req, res) => {
   const routeId = Number(req.params.routeId);
   const input = routeSchema.parse(req.body);
   const existing = (await query("SELECT id FROM approval_routes WHERE id=@routeId AND section_id=@sectionId", {
@@ -179,7 +179,7 @@ router.put("/approval-routes/:routeId", requireAdmin, audit("EDIT", "APPROVAL_RO
   res.json({ ok: true });
 }));
 
-router.delete("/approval-routes/:routeId", requireAdmin, audit("DELETE", "APPROVAL_ROUTE", req => req.params.routeId), asyncHandler(async (req, res) => {
+router.delete("/approval-routes/:routeId", requireSectionAdmin, audit("DELETE", "APPROVAL_ROUTE", req => req.params.routeId), asyncHandler(async (req, res) => {
   const routeId = Number(req.params.routeId);
   await query("UPDATE approval_routes SET is_active=0 WHERE id=@routeId AND section_id=@sectionId", {
     routeId,
