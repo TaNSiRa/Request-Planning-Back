@@ -270,14 +270,14 @@ function renderEmail(opts) {
 
   const cta = (primary || secondary)
     ? `<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:6px 0 4px;"><tr><td>`
-      + (primary ? button(primary.label, primary.url, primary.bg || BRAND) : "")
-      + (secondary ? ghostButton(secondary.label, secondary.url) : "")
-      + `</td></tr></table>`
-      + (primary && primary.url
-        ? `<p style="font-size:12px;color:${FAINT};line-height:1.6;margin:12px 0 4px;`
-          + `font-family:'IBM Plex Sans',Segoe UI,Arial,sans-serif;">หากปุ่มกดไม่ได้ ให้คัดลอกลิงก์นี้เปิดในเบราว์เซอร์:<br>`
-          + `<a href="${esc(primary.url)}" target="_blank" style="color:#2f6bed;word-break:break-all;">${esc(primary.url)}</a></p>`
-        : "")
+    + (primary ? button(primary.label, primary.url, primary.bg || BRAND) : "")
+    + (secondary ? ghostButton(secondary.label, secondary.url) : "")
+    + `</td></tr></table>`
+    + (primary && primary.url
+      ? `<p style="font-size:12px;color:${FAINT};line-height:1.6;margin:12px 0 4px;`
+      + `font-family:'IBM Plex Sans',Segoe UI,Arial,sans-serif;">หากปุ่มกดไม่ได้ ให้คัดลอกลิงก์นี้เปิดในเบราว์เซอร์:<br>`
+      + `<a href="${esc(primary.url)}" target="_blank" style="color:#2f6bed;word-break:break-all;">${esc(primary.url)}</a></p>`
+      : "")
     : "";
 
   return `<!DOCTYPE html>
@@ -316,7 +316,7 @@ function renderEmail(opts) {
   <h1 style="font-size:21px;line-height:1.25;margin:0 0 12px;color:${INK};font-weight:700;`
     + `font-family:'IBM Plex Sans',Segoe UI,Arial,sans-serif;">${esc(headline)}</h1>`
     + (greetingName
-      ? `<p style="font-size:14px;color:${TEXT};line-height:1.6;margin:0 0 14px;font-family:'IBM Plex Sans',Segoe UI,Arial,sans-serif;">เรียน <strong style="color:${INK};">คุณ${esc(greetingName)}</strong></p>`
+      ? `<p style="font-size:14px;color:${TEXT};line-height:1.6;margin:0 0 14px;font-family:'IBM Plex Sans',Segoe UI,Arial,sans-serif;">เรียน <strong style="color:${INK};">คุณ ${esc(greetingName)}</strong></p>`
       : "")
     + `${paras}
   ${detailTitle ? detailCard("รายละเอียดคำขอ", detailTitle, detailRows) : ""}
@@ -641,6 +641,115 @@ async function buildParticipantEmail(requestId, type, { greetingName, comment, i
   return buildStatusEmail(requestId, { event, greetingName, comment });
 }
 
+// ---------------------------------------------------------------------------
+// Schedule-extension templates — these ALWAYS spell out the project period both
+// BEFORE and AFTER the requested change so the reader can see exactly what moves.
+// ---------------------------------------------------------------------------
+function periodText(start, end) {
+  return `${formatThaiDate(start) || "-"} – ${formatThaiDate(end) || "-"}`;
+}
+
+async function loadExtensionContext(extensionId) {
+  return (await query(
+    `SELECT e.id AS extension_id, e.request_id, e.requested_by,
+            e.previous_start, e.previous_end, e.requested_start, e.requested_end, e.reason, e.status,
+            rb.display_name AS requested_by_name,
+            r.request_no, r.title,
+            r.requester_user_id, r.incharge_user_id, r.support_user_id,
+            s.name AS section_name
+     FROM schedule_extension_requests e
+     JOIN requests r ON r.id = e.request_id
+     JOIN users rb ON rb.id = e.requested_by
+     JOIN request_sections s ON s.id = r.section_id
+     WHERE e.id=@extensionId`,
+    { extensionId }
+  )).recordset[0] || null;
+}
+
+function extensionPeriodRows(ctx, newLabel) {
+  return kvRow("ผู้ขอเลื่อน", `<span style="color:${INK};font-weight:600;">${esc(ctx.requested_by_name)}</span>`)
+    + kvRow("ช่วงเวลาเดิม (ก่อนเปลี่ยน)", esc(periodText(ctx.previous_start, ctx.previous_end)))
+    + kvRow(newLabel, `<strong style="color:${INK};">${esc(periodText(ctx.requested_start, ctx.requested_end))}</strong>`)
+    + (ctx.reason ? kvRow("เหตุผล", esc(ctx.reason)) : "");
+}
+
+// Sent to the approver whose turn it is to review a schedule-extension request.
+async function buildExtensionApproverEmail(extensionId, { greetingName } = {}) {
+  const ctx = await loadExtensionContext(extensionId);
+  if (!ctx) return null;
+  const opts = {
+    sectionName: ctx.section_name,
+    requestNo: ctx.request_no,
+    accent: ACCENTS.amber,
+    pillText: "ต้องดำเนินการ · รออนุมัติขอเลื่อนเวลา",
+    headline: "มีคำขอเลื่อนช่วงเวลาโครงการรออนุมัติ",
+    greetingName,
+    paragraphs: [
+      `<strong>${esc(ctx.requested_by_name)}</strong> ขอเลื่อนช่วงเวลาโครงการของคำขอ <strong>${esc(ctx.request_no)}</strong> `
+      + `กรุณาตรวจสอบช่วงเวลาเดิมเทียบกับช่วงเวลาใหม่ด้านล่าง แล้วพิจารณาอนุมัติหรือปฏิเสธ`
+    ],
+    detailTitle: ctx.title,
+    detailRows: extensionPeriodRows(ctx, "ช่วงเวลาใหม่ (ที่ขอเลื่อนเป็น)"),
+    primary: { label: "ตรวจสอบ & อนุมัติ →", url: buildDeeplink(ctx.request_id, "approval"), bg: "#15803d" },
+    secondary: { label: "ดูรายละเอียด", url: buildDeeplink(ctx.request_id) },
+    footerNote: "คุณได้รับอีเมลนี้เพราะเป็นผู้อนุมัติในขั้นตอนนี้"
+  };
+  return {
+    subject: `🔔 รอคุณอนุมัติขอเลื่อนเวลา · ${ctx.request_no}`,
+    html: renderEmail(opts),
+    text: renderText({
+      ...opts,
+      plainParagraphs: ["มีคำขอเลื่อนช่วงเวลาโครงการรออนุมัติ"],
+      plainRows: [
+        ["ช่วงเวลาเดิม", periodText(ctx.previous_start, ctx.previous_end)],
+        ["ช่วงเวลาใหม่", periodText(ctx.requested_start, ctx.requested_end)]
+      ]
+    }),
+    type: "EXTENSION"
+  };
+}
+
+// Sent to the requester + incharge (+ support/requester-of-extension) when a
+// schedule extension is approved or rejected. event: "APPROVED" | "REJECTED".
+async function buildExtensionResultEmail(extensionId, { event, greetingName, comment } = {}) {
+  const ctx = await loadExtensionContext(extensionId);
+  if (!ctx) return null;
+  const approved = event === "APPROVED";
+  const paragraphs = [
+    approved
+      ? `คำขอเลื่อนช่วงเวลาโครงการของ <strong>${esc(ctx.request_no)}</strong> ได้รับการอนุมัติแล้ว ช่วงเวลาโครงการถูกปรับปรุงตามด้านล่างเรียบร้อย`
+      : `คำขอเลื่อนช่วงเวลาโครงการของ <strong>${esc(ctx.request_no)}</strong> ไม่ได้รับการอนุมัติ ช่วงเวลาโครงการยังคงเป็นช่วงเวลาเดิม`
+  ];
+  if (comment) paragraphs.push(`<span style="color:${MUTED};">หมายเหตุ:</span> ${esc(comment)}`);
+  const opts = {
+    sectionName: ctx.section_name,
+    requestNo: ctx.request_no,
+    accent: approved ? ACCENTS.blue : ACCENTS.amber,
+    pillText: approved ? "อัปเดตช่วงเวลาโครงการแล้ว" : "คำขอเลื่อนเวลาถูกปฏิเสธ",
+    headline: approved ? "อนุมัติเลื่อนช่วงเวลาโครงการแล้ว" : "คำขอเลื่อนช่วงเวลาโครงการถูกปฏิเสธ",
+    greetingName,
+    paragraphs,
+    detailTitle: ctx.title,
+    detailRows: extensionPeriodRows(ctx, approved ? "ช่วงเวลาใหม่ (มีผลแล้ว)" : "ช่วงเวลาที่ขอเลื่อนเป็น"),
+    primary: { label: "ดูคำขอ →", url: buildDeeplink(ctx.request_id) }
+  };
+  return {
+    subject: approved
+      ? `🗓️ อัปเดตช่วงเวลาโครงการ · ${ctx.request_no}`
+      : `⚠️ คำขอเลื่อนเวลาถูกปฏิเสธ · ${ctx.request_no}`,
+    html: renderEmail(opts),
+    text: renderText({
+      ...opts,
+      plainParagraphs: [approved ? "อนุมัติเลื่อนช่วงเวลาโครงการแล้ว" : "คำขอเลื่อนช่วงเวลาโครงการถูกปฏิเสธ"],
+      plainRows: [
+        ["ช่วงเวลาเดิม", periodText(ctx.previous_start, ctx.previous_end)],
+        ["ช่วงเวลาใหม่", periodText(ctx.requested_start, ctx.requested_end)]
+      ]
+    }),
+    type: "EXTENSION"
+  };
+}
+
 module.exports = {
   buildDeeplink,
   loadRequestContext,
@@ -648,5 +757,7 @@ module.exports = {
   buildApproverEmail,
   buildAssigneeEmail,
   buildStatusEmail,
-  buildParticipantEmail
+  buildParticipantEmail,
+  buildExtensionApproverEmail,
+  buildExtensionResultEmail
 };

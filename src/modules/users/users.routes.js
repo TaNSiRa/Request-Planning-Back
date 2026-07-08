@@ -215,6 +215,8 @@ router.post("/:id(\\d+)/reset-password", requireSectionAdmin, audit("RESET_PASSW
 
 router.patch("/me", audit("EDIT_PROFILE", "USER", req => req.user.id), asyncHandler(async (req, res) => {
   const schema = z.object({
+    employeeNo: z.string().trim().min(1),
+    email: z.string().trim().email(),
     displayName: z.string().min(2),
     fullName: z.string().optional().nullable(),
     phone: z.string().optional().nullable(),
@@ -223,8 +225,21 @@ router.patch("/me", audit("EDIT_PROFILE", "USER", req => req.user.id), asyncHand
     section: z.string().min(1)
   });
   const input = schema.parse(req.body);
+  const email = input.email.toLowerCase();
+  // Email is a hard unique key (also a login identifier) and employee_no is used
+  // to log in too — block a change that would collide with another account and
+  // return a clear message instead of a raw DB constraint error.
+  const clash = (await query(
+    `SELECT TOP 1 CASE WHEN LOWER(email)=@email THEN 'EMAIL_TAKEN' ELSE 'EMPLOYEE_NO_TAKEN' END AS reason
+     FROM users
+     WHERE id<>@id AND (LOWER(email)=@email OR employee_no=@employeeNo)
+     ORDER BY CASE WHEN LOWER(email)=@email THEN 0 ELSE 1 END`,
+    { email, employeeNo: input.employeeNo, id: req.user.id }
+  )).recordset[0];
+  if (clash) return res.status(409).json({ message: clash.reason });
   const values = {
     ...input,
+    email,
     fullName: input.fullName?.trim() ? input.fullName.trim() : null,
     phone: input.phone ?? null,
     branch: input.branch ?? null,
@@ -232,7 +247,7 @@ router.patch("/me", audit("EDIT_PROFILE", "USER", req => req.user.id), asyncHand
     section: input.section ?? null
   };
   await query(
-    `UPDATE users SET display_name=@displayName, full_name=@fullName, phone=@phone, branch=@branch, department=@department, section=@section, updated_at=SYSUTCDATETIME()
+    `UPDATE users SET employee_no=@employeeNo, email=@email, display_name=@displayName, full_name=@fullName, phone=@phone, branch=@branch, department=@department, section=@section, updated_at=SYSUTCDATETIME()
      WHERE id=@id`,
     { ...values, id: req.user.id }
   );

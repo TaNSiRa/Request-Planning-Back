@@ -5,7 +5,7 @@ const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
 const { audit } = require("../../middleware/audit");
 const { sendMail } = require("../../services/mailService");
-const { buildApproverEmail, buildParticipantEmail } = require("../../services/emailTemplates");
+const { buildApproverEmail, buildParticipantEmail, buildExtensionApproverEmail } = require("../../services/emailTemplates");
 const { notify } = require("../../services/notificationService");
 const { emitSystem } = require("../../services/realtimeService");
 const { storeDataUrlAttachment, readAttachmentAsDataUrl, deleteStoredAttachment } = require("../../services/attachmentStorage");
@@ -593,7 +593,7 @@ async function notifyFirstExtensionApprover(requestId, extensionId) {
     title: "Schedule extension needs approval",
     body: `${row.request_no} extension #${extensionId}`
   });
-  const mail = await buildApproverEmail(requestId, { greetingName: row.display_name, kind: "EXTENSION" });
+  const mail = await buildExtensionApproverEmail(extensionId, { greetingName: row.display_name });
   if (mail && row.email) {
     await sendMail({ to: row.email, subject: mail.subject, html: mail.html, text: mail.text, requestId, type: mail.type });
   }
@@ -874,7 +874,8 @@ async function notifyRequestParticipants(requestId, type, title, body, comment) 
     { requestId }
   )).recordset[0];
   if (!row) return;
-  const ids = [...new Set([row.requester_user_id, row.incharge_user_id, row.support_user_id].filter(Boolean))];
+  // Support is intentionally excluded from ALL notifications (in-app + email).
+  const ids = [...new Set([row.requester_user_id, row.incharge_user_id].filter(Boolean))];
   for (const userId of ids) {
     const user = (await query("SELECT email, display_name FROM users WHERE id=@userId", { userId })).recordset[0];
     await notify({

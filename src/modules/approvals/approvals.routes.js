@@ -6,7 +6,13 @@ const { requireAuth } = require("../../middleware/auth");
 const { audit } = require("../../middleware/audit");
 const { notify } = require("../../services/notificationService");
 const { sendMail } = require("../../services/mailService");
-const { buildApproverEmail, buildAssigneeEmail, buildParticipantEmail } = require("../../services/emailTemplates");
+const {
+  buildApproverEmail,
+  buildAssigneeEmail,
+  buildParticipantEmail,
+  buildExtensionApproverEmail,
+  buildExtensionResultEmail
+} = require("../../services/emailTemplates");
 const { emitSystem } = require("../../services/realtimeService");
 const { isAdmin, resolveSection, getSectionName } = require("../../services/sectionService");
 
@@ -157,11 +163,10 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
         { requestId: step.request_id, supType: st.supType, itemId: st.itemId, levelId: st.levelId, levelName: st.levelName }
       );
     }
-    if (step.sequence_no === 1 ||
-      step.incharge_user_id !== values.inchargeUserId ||
-      step.support_user_id !== values.supportUserId) {
-      await notifyAssignedUsers(step.request_id, step.request_no, values.inchargeUserId, values.supportUserId, req.user.displayName);
-    }
+    // NOTE: the assignee is NOT notified here. Assignment can happen at an early
+    // step (e.g. the section manager assigns at step 1) while later approvers
+    // haven't signed off yet — telling the incharge now would be premature. The
+    // assign notification/email is fired only on FINAL approval (see below).
   }
 
   const next = (await query(
@@ -191,7 +196,16 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
       emitSystem("request.updated", { id: step.request_id, status: "COMPLETED" });
     } else {
       await query("UPDATE requests SET status='IN_PROGRESS', approved_at=SYSUTCDATETIME(), updated_at=SYSUTCDATETIME() WHERE id=@id", { id: step.request_id });
-      await notifyRequestParticipants(step.request_id, "APPROVE", "Request approved", `${step.request_no} is now in progress`);
+      const info = (await query(
+        "SELECT request_no, requester_user_id, incharge_user_id, support_user_id FROM requests WHERE id=@id",
+        { id: step.request_id }
+      )).recordset[0];
+      // The requester learns their request cleared every approval step...
+      await notifyParticipant(step.request_id, info.requester_user_id, "APPROVE", "Request approved",
+        `${step.request_no} is now in progress`);
+      // ...and only now — after the FINAL approver signed off — do the assigned
+      // incharge/support get told they own the work.
+      await notifyAssignedUsers(step.request_id, step.request_no, info.incharge_user_id, info.support_user_id, req.user.displayName);
       emitSystem("request.updated", { id: step.request_id, status: "IN_PROGRESS" });
     }
   }
@@ -262,7 +276,7 @@ router.post("/extension/:extensionId/approve", audit("APPROVE", "EXTENSION_REQUE
       title: "Schedule extension needs approval",
       body: `${step.request_no} extension #${step.extension_id}`
     });
-    const mail = await buildApproverEmail(step.request_id, { greetingName: next.display_name, kind: "EXTENSION" });
+    const mail = await buildExtensionApproverEmail(step.extension_id, { greetingName: next.display_name });
     if (mail && next.email) {
       await sendMail({ to: next.email, subject: mail.subject, html: mail.html, text: mail.text, requestId: step.request_id, type: mail.type });
     }
@@ -275,7 +289,8 @@ router.post("/extension/:extensionId/approve", audit("APPROVE", "EXTENSION_REQUE
     await query("UPDATE schedule_extension_requests SET status='APPROVED' WHERE id=@extensionId", {
       extensionId: step.extension_id
     });
-    await notifyRequestParticipants(step.request_id, "EXTENSION", "Project period updated", "Schedule extension approved");
+    // Email both the request creator AND the incharge who requested the change.
+    await notifyExtensionParticipants(step.extension_id, step.request_id, "APPROVED");
     emitSystem("request.updated", { id: step.request_id, status: "SCHEDULE_UPDATED" });
   }
   res.json({ ok: true });
@@ -303,13 +318,9 @@ router.post("/extension/:extensionId/reject", audit("REJECT", "EXTENSION_REQUEST
      WHERE extension_id=@extensionId AND status='WAITING'`,
     { extensionId: step.extension_id }
   );
-  await notify({
-    userId: step.requested_by,
-    requestId: step.request_id,
-    type: "EXTENSION",
-    title: "Schedule extension rejected",
-    body: `Extension #${step.extension_id} was rejected`
-  });
+  // Notify (in-app + email) the incharge who requested the change AND the request
+  // creator, so both know the project period stays as-is.
+  await notifyExtensionParticipants(step.extension_id, step.request_id, "REJECTED");
   res.json({ ok: true });
 }));
 
@@ -357,28 +368,27 @@ async function getExtensionStep(extensionId, user, sectionId) {
 }
 
 async function notifyAssignedUsers(requestId, requestNo, inchargeUserId, supportUserId, assignedByName) {
-  const ids = [inchargeUserId, supportUserId].filter(Boolean);
-  if (!ids.length) return;
+  // Only the incharge is notified — support gets no assignment notification/email.
+  if (!inchargeUserId) return;
   const sectionName = await getSectionName(requestId);
-  const result = await query(
-    `SELECT id, email, display_name FROM users WHERE id IN (${ids.map((_, index) => `@id${index}`).join(",")})`,
-    Object.fromEntries(ids.map((id, index) => [`id${index}`, id]))
-  );
-  for (const user of result.recordset) {
-    const roleLabel = user.id === inchargeUserId
-      ? "ผู้รับผิดชอบหลัก (Incharge)"
-      : "ผู้สนับสนุน (Support)";
-    await notify({
-      userId: user.id,
-      requestId,
-      type: "ASSIGN",
-      title: `${sectionName} assigned`,
-      body: requestNo
-    });
-    const mail = await buildAssigneeEmail(requestId, { greetingName: user.display_name, roleLabel, assignedByName });
-    if (mail && user.email) {
-      await sendMail({ to: user.email, subject: mail.subject, html: mail.html, text: mail.text, requestId, type: mail.type });
-    }
+  const user = (await query(
+    "SELECT id, email, display_name FROM users WHERE id=@id", { id: inchargeUserId }
+  )).recordset[0];
+  if (!user) return;
+  await notify({
+    userId: user.id,
+    requestId,
+    type: "ASSIGN",
+    title: `${sectionName} assigned`,
+    body: requestNo
+  });
+  const mail = await buildAssigneeEmail(requestId, {
+    greetingName: user.display_name,
+    roleLabel: "ผู้รับผิดชอบหลัก (Incharge)",
+    assignedByName
+  });
+  if (mail && user.email) {
+    await sendMail({ to: user.email, subject: mail.subject, html: mail.html, text: mail.text, requestId, type: mail.type });
   }
 }
 
@@ -467,25 +477,60 @@ async function notifyRequestParticipants(requestId, type, title, body, comment) 
     { requestId }
   )).recordset[0];
   if (!row) return;
-  const ids = [...new Set([row.requester_user_id, row.incharge_user_id, row.support_user_id].filter(Boolean))];
+  // Support is intentionally excluded from ALL notifications (in-app + email).
+  const ids = [...new Set([row.requester_user_id, row.incharge_user_id].filter(Boolean))];
+  for (const userId of ids) {
+    await notifyParticipant(requestId, userId, type, title, body || row.request_no, comment, row);
+  }
+}
+
+// Schedule-extension outcome fan-out to the request creator, the incharge, and
+// whoever raised the extension (in-app + email). Support is excluded entirely.
+// event: APPROVED|REJECTED.
+async function notifyExtensionParticipants(extensionId, requestId, event, comment) {
+  const row = (await query(
+    "SELECT request_no, requester_user_id, incharge_user_id FROM requests WHERE id=@requestId",
+    { requestId }
+  )).recordset[0];
+  if (!row) return;
+  const ext = (await query(
+    "SELECT requested_by FROM schedule_extension_requests WHERE id=@extensionId", { extensionId }
+  )).recordset[0];
+  const approved = event === "APPROVED";
+  const title = approved ? "Project period updated" : "Schedule extension rejected";
+  const ids = [...new Set(
+    [row.requester_user_id, row.incharge_user_id, ext?.requested_by].filter(Boolean)
+  )];
   for (const userId of ids) {
     const user = (await query("SELECT email, display_name FROM users WHERE id=@userId", { userId })).recordset[0];
-    await notify({
-      userId,
-      requestId,
-      type,
-      title,
-      body: body || row.request_no
-    });
+    await notify({ userId, requestId, type: "EXTENSION", title, body: row.request_no });
     if (user?.email) {
-      const mail = await buildParticipantEmail(requestId, type, {
-        greetingName: user.display_name,
-        comment,
-        isRequester: userId === row.requester_user_id
-      });
+      const mail = await buildExtensionResultEmail(extensionId, { event, greetingName: user.display_name, comment });
       if (mail) {
         await sendMail({ to: user.email, subject: mail.subject, html: mail.html, text: mail.text, requestId, type: mail.type });
       }
+    }
+  }
+}
+
+// Notify a single participant in-app + by email (the email template is chosen
+// from `type` via buildParticipantEmail). `row` is an optional pre-loaded
+// request row so callers in a loop don't re-query it each time.
+async function notifyParticipant(requestId, userId, type, title, body, comment, row) {
+  if (!userId) return;
+  const request = row || (await query(
+    "SELECT request_no, requester_user_id FROM requests WHERE id=@requestId", { requestId }
+  )).recordset[0];
+  const user = (await query("SELECT email, display_name FROM users WHERE id=@userId", { userId })).recordset[0];
+  await notify({ userId, requestId, type, title, body: body || request?.request_no });
+  if (user?.email) {
+    const mail = await buildParticipantEmail(requestId, type, {
+      greetingName: user.display_name,
+      comment,
+      isRequester: userId === request?.requester_user_id
+    });
+    if (mail) {
+      await sendMail({ to: user.email, subject: mail.subject, html: mail.html, text: mail.text, requestId, type: mail.type });
     }
   }
 }
