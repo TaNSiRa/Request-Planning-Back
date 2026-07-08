@@ -5,10 +5,11 @@ const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
 const { audit } = require("../../middleware/audit");
 const { sendMail } = require("../../services/mailService");
+const { buildApproverEmail, buildParticipantEmail } = require("../../services/emailTemplates");
 const { notify } = require("../../services/notificationService");
 const { emitSystem } = require("../../services/realtimeService");
 const { storeDataUrlAttachment, readAttachmentAsDataUrl, deleteStoredAttachment } = require("../../services/attachmentStorage");
-const { isAdmin, resolveSection, getSectionName } = require("../../services/sectionService");
+const { isAdmin, resolveSection } = require("../../services/sectionService");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -566,20 +567,16 @@ async function notifyFirstApprover(requestId, requestNo) {
     { requestId }
   )).recordset[0];
   if (!approver) return;
-  const sectionName = await getSectionName(requestId);
   await notify({ userId: approver.id, requestId, type: "APPROVAL", title: "New request needs approval", body: requestNo });
-  await sendMail({
-    to: approver.email,
-    subject: `[${sectionName}] Approval required: ${requestNo}`,
-    html: `<p>Please review ${sectionName.toLowerCase()} <strong>${requestNo}</strong>.</p>`,
-    requestId,
-    type: "APPROVAL"
-  });
+  const mail = await buildApproverEmail(requestId, { greetingName: approver.display_name, kind: "REQUEST" });
+  if (mail && approver.email) {
+    await sendMail({ to: approver.email, subject: mail.subject, html: mail.html, text: mail.text, requestId, type: mail.type });
+  }
 }
 
 async function notifyFirstExtensionApprover(requestId, extensionId) {
   const row = (await query(
-    `SELECT TOP 1 u.id, u.email, r.request_no
+    `SELECT TOP 1 u.id, u.email, u.display_name, r.request_no
      FROM schedule_extension_approval_steps a
      JOIN schedule_extension_requests e ON e.id = a.extension_id
      JOIN requests r ON r.id = e.request_id
@@ -589,7 +586,6 @@ async function notifyFirstExtensionApprover(requestId, extensionId) {
     { requestId, extensionId }
   )).recordset[0];
   if (!row) return;
-  const sectionName = await getSectionName(requestId);
   await notify({
     userId: row.id,
     requestId,
@@ -597,13 +593,10 @@ async function notifyFirstExtensionApprover(requestId, extensionId) {
     title: "Schedule extension needs approval",
     body: `${row.request_no} extension #${extensionId}`
   });
-  await sendMail({
-    to: row.email,
-    subject: `[${sectionName}] Extension approval required: ${row.request_no}`,
-    html: `<p>Please review schedule extension request for <strong>${row.request_no}</strong>.</p>`,
-    requestId,
-    type: "EXTENSION"
-  });
+  const mail = await buildApproverEmail(requestId, { greetingName: row.display_name, kind: "EXTENSION" });
+  if (mail && row.email) {
+    await sendMail({ to: row.email, subject: mail.subject, html: mail.html, text: mail.text, requestId, type: mail.type });
+  }
 }
 
 async function getAttachments(requestId) {
@@ -851,7 +844,7 @@ async function generateRequestNumber(sectionId, requestPrefix = "AR") {
 
 async function notifyFirstCloseApprover(requestId) {
   const row = (await query(
-    `SELECT TOP 1 u.id, u.email, r.request_no
+    `SELECT TOP 1 u.id, u.email, u.display_name, r.request_no
      FROM approval_steps a
      JOIN users u ON u.id = a.approver_user_id
      JOIN requests r ON r.id = a.request_id
@@ -860,7 +853,6 @@ async function notifyFirstCloseApprover(requestId) {
     { requestId }
   )).recordset[0];
   if (!row) return;
-  const sectionName = await getSectionName(requestId);
   await notify({
     userId: row.id,
     requestId,
@@ -868,16 +860,13 @@ async function notifyFirstCloseApprover(requestId) {
     title: "Work complete needs close approval",
     body: row.request_no
   });
-  await sendMail({
-    to: row.email,
-    subject: `[${sectionName}] Close approval required: ${row.request_no}`,
-    html: `<p>Work is submitted complete. Please close <strong>${row.request_no}</strong>.</p>`,
-    requestId,
-    type: "CLOSE"
-  });
+  const mail = await buildApproverEmail(requestId, { greetingName: row.display_name, kind: "CLOSE" });
+  if (mail && row.email) {
+    await sendMail({ to: row.email, subject: mail.subject, html: mail.html, text: mail.text, requestId, type: mail.type });
+  }
 }
 
-async function notifyRequestParticipants(requestId, type, title, body) {
+async function notifyRequestParticipants(requestId, type, title, body, comment) {
   const row = (await query(
     `SELECT r.request_no, r.requester_user_id, r.incharge_user_id, r.support_user_id
      FROM requests r
@@ -885,10 +874,9 @@ async function notifyRequestParticipants(requestId, type, title, body) {
     { requestId }
   )).recordset[0];
   if (!row) return;
-  const sectionName = await getSectionName(requestId);
   const ids = [...new Set([row.requester_user_id, row.incharge_user_id, row.support_user_id].filter(Boolean))];
   for (const userId of ids) {
-    const user = (await query("SELECT email FROM users WHERE id=@userId", { userId })).recordset[0];
+    const user = (await query("SELECT email, display_name FROM users WHERE id=@userId", { userId })).recordset[0];
     await notify({
       userId,
       requestId,
@@ -897,13 +885,14 @@ async function notifyRequestParticipants(requestId, type, title, body) {
       body: body || row.request_no
     });
     if (user?.email) {
-      await sendMail({
-        to: user.email,
-        subject: `[${sectionName}] ${title}: ${row.request_no}`,
-        html: `<p>${body || row.request_no}</p>`,
-        requestId,
-        type
+      const mail = await buildParticipantEmail(requestId, type, {
+        greetingName: user.display_name,
+        comment,
+        isRequester: userId === row.requester_user_id
       });
+      if (mail) {
+        await sendMail({ to: user.email, subject: mail.subject, html: mail.html, text: mail.text, requestId, type: mail.type });
+      }
     }
   }
 }
