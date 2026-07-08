@@ -256,6 +256,16 @@ router.get("/roles", asyncHandler(async (req, res) => {
   res.json({ data: result.recordset });
 }));
 
+// All active request sections — feeds the user form's section-access editor so
+// a section admin can grant can_request/can_work in any section (not just the
+// one they administer). Read-only lookup, so requireSectionAdmin is enough.
+router.get("/manage-sections", requireSectionAdmin, asyncHandler(async (req, res) => {
+  const result = await query(
+    "SELECT id, code, name FROM request_sections WHERE is_active=1 ORDER BY name"
+  );
+  res.json({ data: result.recordset });
+}));
+
 async function upsertMembership(userId, sectionId, canRequest = true, canWork = true, isSectionAdmin = false) {
   await query(
     `MERGE user_section_memberships AS target
@@ -303,19 +313,16 @@ async function targetRoleCode(userId) {
 }
 
 // Apply the section-membership part of a create/edit. A global admin gets full
-// replace-all control (including granting section-admin). A section admin may
-// only touch THEIR OWN section's membership for the user — never deactivating
-// the user's memberships in other sections, never granting section-admin.
+// replace-all control (including granting section-admin). A section admin gets
+// the same replace-all control over can_request/can_work for EVERY section
+// (managed users are plain requesters), but can never grant section-admin.
 async function applyMembershipsForActor(req, userId, input) {
-  if (isAdmin(req.user)) {
-    if (input.memberships) await setMemberships(userId, input.memberships, true);
-    else await upsertMembership(userId, req.section.id, input.canRequest, input.canWork, false);
+  const allowSectionAdmin = isAdmin(req.user);
+  if (input.memberships) {
+    await setMemberships(userId, input.memberships, allowSectionAdmin);
     return;
   }
-  const own = (input.memberships || []).find(m => m.sectionId === req.section.id);
-  const canRequest = own ? own.canRequest !== false : input.canRequest !== false;
-  const canWork = own ? own.canWork !== false : input.canWork !== false;
-  await upsertMembership(userId, req.section.id, canRequest, canWork, false);
+  await upsertMembership(userId, req.section.id, input.canRequest, input.canWork, false);
 }
 
 module.exports = router;

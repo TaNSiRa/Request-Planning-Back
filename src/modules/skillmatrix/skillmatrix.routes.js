@@ -46,10 +46,10 @@ router.get("/me", asyncHandler(async (req, res) => {
   res.json({ selections: rows.recordset.map(r => ({ itemId: r.item_id, levelId: r.level_id })) });
 }));
 
-// Set or clear the user's level for a single skill. levelId = null clears it,
-// so tapping the already-selected level toggles it off on the client.
+// Users may view their own levels, but level edits are managed by a section
+// manager from the section-scoped member endpoint below.
 router.put("/me", asyncHandler(async (req, res) => {
-  await setSkillLevel(req.user.id, req.body, res);
+  res.status(403).json({ message: "Skill levels are read-only for your own account" });
 }));
 
 // Set or clear one skill level for [userId]. Shared by the self endpoint and the

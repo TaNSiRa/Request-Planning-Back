@@ -4,7 +4,7 @@ const { query } = require("../../db/pool");
 const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
 const { audit } = require("../../middleware/audit");
-const { requireSectionAdmin, resolveSection } = require("../../services/sectionService");
+const { requireAdmin, requireSectionAdmin, resolveSection, isAdmin } = require("../../services/sectionService");
 const { verifyMail, isMailConfigured, sendMail } = require("../../services/mailService");
 const { verifyHoliday } = require("../../db/holidayPool");
 
@@ -12,18 +12,29 @@ const router = express.Router();
 router.use(requireAuth);
 router.use(resolveSection);
 
+// System-level settings only a global admin may see or edit — a section admin
+// manages section-level settings only. Kept in sync with the frontend list in
+// settings_page.dart (SettingsPage.isSystemSetting).
+function isSystemSetting(key) {
+  return key === "mail.enabled" ||
+    key === "microsoft365.enabled" ||
+    key === "security.idleTimeoutMinutes" ||
+    `${key}`.startsWith("org.") ||
+    `${key}`.startsWith("holiday.");
+}
+
 // Test the external holiday DB connection (SAR / Master_Holiday).
-router.get("/holiday/verify", requireSectionAdmin, asyncHandler(async (req, res) => {
+router.get("/holiday/verify", requireAdmin, asyncHandler(async (req, res) => {
   res.json(await verifyHoliday());
 }));
 
 // Check the SMTP connection/credentials without sending anything.
-router.get("/mail/verify", requireSectionAdmin, asyncHandler(async (req, res) => {
+router.get("/mail/verify", requireAdmin, asyncHandler(async (req, res) => {
   res.json({ configured: isMailConfigured(), ...(await verifyMail()) });
 }));
 
 // Send a real test email to prove end-to-end delivery works.
-router.post("/mail/test", requireSectionAdmin, audit("TEST", "MAIL"), asyncHandler(async (req, res) => {
+router.post("/mail/test", requireAdmin, audit("TEST", "MAIL"), asyncHandler(async (req, res) => {
   const schema = z.object({ to: z.string().email() });
   const input = schema.parse(req.body);
   const result = await sendMail({
@@ -45,7 +56,10 @@ router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
      ORDER BY CASE WHEN section_id IS NULL THEN 0 ELSE 1 END, setting_key`,
     { sectionId: req.section.id }
   );
-  res.json({ data: result.recordset });
+  const rows = isAdmin(req.user)
+    ? result.recordset
+    : result.recordset.filter(row => !isSystemSetting(row.setting_key));
+  res.json({ data: rows });
 }));
 
 router.get("/request-options", asyncHandler(async (req, res) => {
@@ -146,6 +160,9 @@ router.put("/meeting-group-order", asyncHandler(async (req, res) => {
 }));
 
 router.put("/:key", requireSectionAdmin, audit("EDIT", "SETTING", req => req.params.key), asyncHandler(async (req, res) => {
+  if (!isAdmin(req.user) && isSystemSetting(req.params.key)) {
+    return res.status(403).json({ message: "Only a system administrator can edit this setting" });
+  }
   const schema = z.object({ value: z.string(), valueType: z.string().optional().default("string"), isPublic: z.boolean().optional().default(false) });
   const input = schema.parse(req.body);
   const sectionId = isGlobalSetting(req.params.key) ? null : req.section.id;
