@@ -245,7 +245,22 @@ router.put("/approval-routes/:routeId", requireSectionAdmin, audit("EDIT", "APPR
 
 router.delete("/approval-routes/:routeId", requireSectionAdmin, audit("DELETE", "APPROVAL_ROUTE", req => req.params.routeId), asyncHandler(async (req, res) => {
   const routeId = Number(req.params.routeId);
-  await query("UPDATE approval_routes SET is_active=0 WHERE id=@routeId AND section_id=@sectionId", {
+  const existing = (await query("SELECT id FROM approval_routes WHERE id=@routeId AND section_id=@sectionId", {
+    routeId,
+    sectionId: req.section.id
+  })).recordset[0];
+  if (!existing) return res.status(404).json({ message: "Approval route not found" });
+  // A route that has already driven a real request (or extension) is referenced by
+  // approval_steps history and can't be hard-deleted without losing that trail —
+  // block it and let the admin turn the route off ("Active") instead.
+  const used = (await query(
+    `SELECT (SELECT COUNT(*) FROM approval_steps WHERE route_id=@routeId)
+          + (SELECT COUNT(*) FROM schedule_extension_approval_steps WHERE route_id=@routeId) AS used`,
+    { routeId }
+  )).recordset[0].used;
+  if (used > 0) return res.status(409).json({ message: "ROUTE_IN_USE" });
+  await query("DELETE FROM approval_route_steps WHERE route_id=@routeId", { routeId });
+  await query("DELETE FROM approval_routes WHERE id=@routeId AND section_id=@sectionId", {
     routeId,
     sectionId: req.section.id
   });

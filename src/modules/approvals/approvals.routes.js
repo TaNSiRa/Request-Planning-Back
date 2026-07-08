@@ -6,6 +6,7 @@ const { requireAuth } = require("../../middleware/auth");
 const { audit } = require("../../middleware/audit");
 const { notify } = require("../../services/notificationService");
 const { sendMail } = require("../../services/mailService");
+const { buildApproverEmail, buildAssigneeEmail, buildParticipantEmail } = require("../../services/emailTemplates");
 const { emitSystem } = require("../../services/realtimeService");
 const { isAdmin, resolveSection, getSectionName } = require("../../services/sectionService");
 
@@ -159,7 +160,7 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
     if (step.sequence_no === 1 ||
       step.incharge_user_id !== values.inchargeUserId ||
       step.support_user_id !== values.supportUserId) {
-      await notifyAssignedUsers(step.request_id, step.request_no, values.inchargeUserId, values.supportUserId);
+      await notifyAssignedUsers(step.request_id, step.request_no, values.inchargeUserId, values.supportUserId, req.user.displayName);
     }
   }
 
@@ -176,7 +177,10 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
     await query("UPDATE approval_steps SET status='PENDING', updated_at=SYSUTCDATETIME() WHERE id=@id", { id: next.id });
     const title = isCloseApproval ? "Close request needs approval" : "Request needs approval";
     await notify({ userId: next.approver_user_id, requestId: step.request_id, type: "APPROVAL", title, body: step.request_no });
-    await sendMail({ to: next.email, subject: `[${req.section.name}] Approval required: ${step.request_no}`, html: `<p>Please approve ${step.request_no}</p>`, requestId: step.request_id, type: "APPROVAL" });
+    const mail = await buildApproverEmail(step.request_id, { greetingName: next.display_name, kind: isCloseApproval ? "CLOSE" : "REQUEST" });
+    if (mail && next.email) {
+      await sendMail({ to: next.email, subject: mail.subject, html: mail.html, text: mail.text, requestId: step.request_id, type: mail.type });
+    }
   } else {
     if (isCloseApproval) {
       await query("UPDATE requests SET status='COMPLETED', closed_by=@userId, closed_at=SYSUTCDATETIME(), updated_at=SYSUTCDATETIME() WHERE id=@id", {
@@ -214,14 +218,14 @@ router.post("/:stepId/reject", audit("REJECT", "APPROVAL_STEP", req => req.param
     await query("UPDATE approval_steps SET status='SKIPPED', updated_at=SYSUTCDATETIME() WHERE request_id=@id AND sequence_no >= 100 AND status='WAITING'", {
       id: step.request_id
     });
-    await notifyRequestParticipants(step.request_id, "REJECT", "Close approval rejected", `${step.request_no}: ${input.comment}`);
+    await notifyRequestParticipants(step.request_id, "CLOSE_REJECT", "Close approval rejected", `${step.request_no}: ${input.comment}`, input.comment);
     emitSystem("request.updated", { id: step.request_id, status: "IN_PROGRESS" });
   } else {
     await query("UPDATE requests SET status='REJECTED', reject_reason=@comment, updated_at=SYSUTCDATETIME() WHERE id=@id", {
       id: step.request_id,
       comment: input.comment
     });
-    await notifyRequestParticipants(step.request_id, "REJECT", "Request rejected", `${step.request_no}: ${input.comment}`);
+    await notifyRequestParticipants(step.request_id, "REJECT", "Request rejected", `${step.request_no}: ${input.comment}`, input.comment);
     emitSystem("request.updated", { id: step.request_id, status: "REJECTED" });
   }
   res.json({ ok: true });
@@ -258,13 +262,10 @@ router.post("/extension/:extensionId/approve", audit("APPROVE", "EXTENSION_REQUE
       title: "Schedule extension needs approval",
       body: `${step.request_no} extension #${step.extension_id}`
     });
-    await sendMail({
-      to: next.email,
-      subject: `[${req.section.name}] Extension approval required: ${step.request_no}`,
-      html: `<p>Please review schedule extension request for <strong>${step.request_no}</strong>.</p>`,
-      requestId: step.request_id,
-      type: "EXTENSION"
-    });
+    const mail = await buildApproverEmail(step.request_id, { greetingName: next.display_name, kind: "EXTENSION" });
+    if (mail && next.email) {
+      await sendMail({ to: next.email, subject: mail.subject, html: mail.html, text: mail.text, requestId: step.request_id, type: mail.type });
+    }
   } else {
     await query("UPDATE requests SET planned_start=@start, planned_end=@end, updated_at=SYSUTCDATETIME() WHERE id=@requestId", {
       requestId: step.request_id,
@@ -355,7 +356,7 @@ async function getExtensionStep(extensionId, user, sectionId) {
   )).recordset[0];
 }
 
-async function notifyAssignedUsers(requestId, requestNo, inchargeUserId, supportUserId) {
+async function notifyAssignedUsers(requestId, requestNo, inchargeUserId, supportUserId, assignedByName) {
   const ids = [inchargeUserId, supportUserId].filter(Boolean);
   if (!ids.length) return;
   const sectionName = await getSectionName(requestId);
@@ -364,6 +365,9 @@ async function notifyAssignedUsers(requestId, requestNo, inchargeUserId, support
     Object.fromEntries(ids.map((id, index) => [`id${index}`, id]))
   );
   for (const user of result.recordset) {
+    const roleLabel = user.id === inchargeUserId
+      ? "ผู้รับผิดชอบหลัก (Incharge)"
+      : "ผู้สนับสนุน (Support)";
     await notify({
       userId: user.id,
       requestId,
@@ -371,13 +375,10 @@ async function notifyAssignedUsers(requestId, requestNo, inchargeUserId, support
       title: `${sectionName} assigned`,
       body: requestNo
     });
-    await sendMail({
-      to: user.email,
-      subject: `[${sectionName}] Assigned: ${requestNo}`,
-      html: `<p>You have been assigned to ${sectionName.toLowerCase()} <strong>${requestNo}</strong>.</p>`,
-      requestId,
-      type: "ASSIGN"
-    });
+    const mail = await buildAssigneeEmail(requestId, { greetingName: user.display_name, roleLabel, assignedByName });
+    if (mail && user.email) {
+      await sendMail({ to: user.email, subject: mail.subject, html: mail.html, text: mail.text, requestId, type: mail.type });
+    }
   }
 }
 
@@ -458,7 +459,7 @@ async function getAttachments(requestId) {
   }
 }
 
-async function notifyRequestParticipants(requestId, type, title, body) {
+async function notifyRequestParticipants(requestId, type, title, body, comment) {
   const row = (await query(
     `SELECT r.request_no, r.requester_user_id, r.incharge_user_id, r.support_user_id
      FROM requests r
@@ -466,10 +467,9 @@ async function notifyRequestParticipants(requestId, type, title, body) {
     { requestId }
   )).recordset[0];
   if (!row) return;
-  const sectionName = await getSectionName(requestId);
   const ids = [...new Set([row.requester_user_id, row.incharge_user_id, row.support_user_id].filter(Boolean))];
   for (const userId of ids) {
-    const user = (await query("SELECT email FROM users WHERE id=@userId", { userId })).recordset[0];
+    const user = (await query("SELECT email, display_name FROM users WHERE id=@userId", { userId })).recordset[0];
     await notify({
       userId,
       requestId,
@@ -478,13 +478,14 @@ async function notifyRequestParticipants(requestId, type, title, body) {
       body: body || row.request_no
     });
     if (user?.email) {
-      await sendMail({
-        to: user.email,
-        subject: `[${sectionName}] ${title}: ${row.request_no}`,
-        html: `<p>${body || row.request_no}</p>`,
-        requestId,
-        type
+      const mail = await buildParticipantEmail(requestId, type, {
+        greetingName: user.display_name,
+        comment,
+        isRequester: userId === row.requester_user_id
       });
+      if (mail) {
+        await sendMail({ to: user.email, subject: mail.subject, html: mail.html, text: mail.text, requestId, type: mail.type });
+      }
     }
   }
 }
