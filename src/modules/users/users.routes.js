@@ -66,14 +66,14 @@ router.get("/assignees", asyncHandler(async (req, res) => {
     , { sectionId: req.section.id }
   );
   const users = result.recordset;
-  const skillsByUser = await getAssigneeSkills(users.map(u => u.id));
+  const skillsByUser = await getAssigneeSkills(users.map(u => u.id), req.section.id);
   res.json({ data: users.map(u => ({ ...u, skills: skillsByUser.get(u.id) || [] })) });
 }));
 
 // Each assignee's self-rated skills (item + level), so the approver can judge
 // who is qualified when assigning. Returns an empty map if the skill-matrix
 // tables aren't installed yet.
-async function getAssigneeSkills(userIds) {
+async function getAssigneeSkills(userIds, sectionId) {
   const map = new Map();
   if (!userIds.length) return map;
   try {
@@ -81,11 +81,11 @@ async function getAssigneeSkills(userIds) {
       `SELECT usl.user_id, usl.item_id, i.name AS item_name,
               usl.level_id, l.name AS level_name, l.sort_order
        FROM user_skill_levels usl
-       JOIN skill_matrix_items i ON i.id = usl.item_id
+       JOIN skill_matrix_items i ON i.id = usl.item_id AND i.section_id = @sectionId
        JOIN skill_matrix_levels l ON l.id = usl.level_id
        WHERE usl.user_id IN (${userIds.map((_, i) => `@u${i}`).join(",")})
        ORDER BY i.sort_order, i.id`,
-      Object.fromEntries(userIds.map((id, i) => [`u${i}`, id]))
+      { ...Object.fromEntries(userIds.map((id, i) => [`u${i}`, id])), sectionId }
     )).recordset;
     for (const r of rows) {
       if (!map.has(r.user_id)) map.set(r.user_id, []);
