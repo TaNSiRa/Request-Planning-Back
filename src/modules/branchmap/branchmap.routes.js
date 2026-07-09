@@ -35,6 +35,16 @@ async function tryQuery(sql, params) {
   }
 }
 
+// Fire-and-forget write that must not 500 when an optional table (branch_maps /
+// section_branches) hasn't been created by the DB patch yet.
+async function tryExec(sql, params) {
+  try {
+    await query(sql, params);
+  } catch {
+    /* table missing or nothing to update — safe to ignore */
+  }
+}
+
 async function getOrgBranches() {
   const rows = await tryQuery(
     "SELECT setting_value FROM app_settings WHERE setting_key='org.branches' AND section_id IS NULL"
@@ -43,6 +53,27 @@ async function getOrgBranches() {
     .split(",")
     .map(item => item.trim())
     .filter(Boolean);
+}
+
+// Persist the ordered branch list back into the org.branches CSV setting
+// (upsert on the single global row).
+async function setOrgBranches(names) {
+  const value = names.join(",");
+  const existing = await tryQuery(
+    "SELECT id FROM app_settings WHERE setting_key='org.branches' AND section_id IS NULL"
+  );
+  if (existing && existing.length) {
+    await query(
+      "UPDATE app_settings SET setting_value=@value, value_type='csv', updated_at=SYSUTCDATETIME() WHERE setting_key='org.branches' AND section_id IS NULL",
+      { value }
+    );
+  } else {
+    await query(
+      `INSERT INTO app_settings (section_id, setting_key, setting_value, value_type, is_public, description)
+       VALUES (NULL, 'org.branches', @value, 'csv', 1, 'Organization branch dropdown options')`,
+      { value }
+    );
+  }
 }
 
 // Branch list for the picker dropdown: org.branches order first, then any
@@ -165,6 +196,62 @@ router.post("/sections", requireAdmin, audit("CREATE", "REQUEST_SECTION", req =>
     }
   }
   res.status(201).json({ id: sectionId, code });
+}));
+
+// ---------------------------------------------------------------------------
+// Branch management (add / rename / delete). Branch names live in the
+// org.branches CSV setting; renaming/deleting also cascades to the branch's map
+// image (branch_maps) and its section membership (section_branches) so those
+// don't dangle. Registered BEFORE "/:branch" so "branches" isn't read as a
+// branch name. System admin only.
+// ---------------------------------------------------------------------------
+const branchNameSchema = z.object({
+  branch: z.string().trim().min(1).max(100)
+    .regex(/^[^,]+$/, "Branch name may not contain a comma")
+});
+
+router.post("/branches", requireAdmin, audit("CREATE", "BRANCH", req => req.body && req.body.branch), asyncHandler(async (req, res) => {
+  const { branch } = branchNameSchema.parse(req.body);
+  const key = normalizeBranch(branch);
+  const orgBranches = await getOrgBranches();
+  if (orgBranches.some(name => normalizeBranch(name) === key)) {
+    return res.status(409).json({ message: "A branch with this name already exists" });
+  }
+  await setOrgBranches([...orgBranches, branch.trim()]);
+  res.status(201).json({ ok: true, branch: branch.trim() });
+}));
+
+router.put("/branches/:branch", requireAdmin, audit("EDIT", "BRANCH", req => req.params.branch), asyncHandler(async (req, res) => {
+  const from = normalizeBranch(req.params.branch);
+  const { branch: toRaw } = branchNameSchema.parse(req.body);
+  const to = toRaw.trim();
+  const toKey = normalizeBranch(to);
+  const orgBranches = await getOrgBranches();
+  const index = orgBranches.findIndex(name => normalizeBranch(name) === from);
+  if (index === -1) return res.status(404).json({ message: "Branch not found" });
+  if (toKey !== from && orgBranches.some(name => normalizeBranch(name) === toKey)) {
+    return res.status(409).json({ message: "A branch with this name already exists" });
+  }
+  const next = [...orgBranches];
+  next[index] = to;
+  await setOrgBranches(next);
+  // Carry the image + section links over to the new name.
+  await tryExec("UPDATE branch_maps SET branch=@to WHERE UPPER(branch)=@from", { to, from });
+  await tryExec("UPDATE section_branches SET branch=@to WHERE UPPER(branch)=@from", { to, from });
+  res.json({ ok: true, branch: to });
+}));
+
+router.delete("/branches/:branch", requireAdmin, audit("DELETE", "BRANCH", req => req.params.branch), asyncHandler(async (req, res) => {
+  const key = normalizeBranch(req.params.branch);
+  const orgBranches = await getOrgBranches();
+  if (!orgBranches.some(name => normalizeBranch(name) === key)) {
+    return res.status(404).json({ message: "Branch not found" });
+  }
+  await setOrgBranches(orgBranches.filter(name => normalizeBranch(name) !== key));
+  // Remove the branch's map image and section membership (sections themselves stay).
+  await tryExec("DELETE FROM branch_maps WHERE UPPER(branch)=@branch", { branch: key });
+  await tryExec("DELETE FROM section_branches WHERE UPPER(branch)=@branch", { branch: key });
+  res.json({ ok: true });
 }));
 
 // Section ids that belong to a branch: those explicitly assigned to it, plus
