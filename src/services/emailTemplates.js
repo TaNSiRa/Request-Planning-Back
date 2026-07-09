@@ -100,11 +100,14 @@ function priorityChip(priority) {
 // Deep link — opens the SPA straight onto this request (and the approval inbox
 // when view=approval). The frontend reads these query params on boot.
 // ---------------------------------------------------------------------------
-function buildDeeplink(requestId, view) {
+function buildDeeplink(requestId, view, sectionCode) {
   const base = (env.frontendOrigin || "").replace(/\/+$/, "");
   if (!base || !requestId) return null;
   const params = new URLSearchParams({ request: `${requestId}` });
   if (view) params.set("view", view);
+  // Carry the request's section so the SPA can auto-select it on boot instead of
+  // asking the recipient to pick a section before the deep link resolves.
+  if (sectionCode) params.set("section", `${sectionCode}`);
   return `${base}/?${params.toString()}`;
 }
 
@@ -120,7 +123,7 @@ async function loadRequestContext(requestId) {
             requester.branch AS requester_branch, requester.department AS requester_department,
             requester.section AS requester_section,
             inc.display_name AS incharge_name, sup.display_name AS support_name,
-            s.name AS section_name
+            s.name AS section_name, s.code AS section_code
      FROM requests r
      JOIN users requester ON requester.id = r.requester_user_id
      LEFT JOIN users inc ON inc.id = r.incharge_user_id
@@ -424,7 +427,7 @@ async function buildRequesterCreatedEmail(requestId) {
     detailRows: baseDetailRows(ctx),
     description: ctx.description,
     attachments: ctx.attachments,
-    primary: { label: "ดูคำขอของฉัน →", url: buildDeeplink(ctx.id) },
+    primary: { label: "ดูคำขอของฉัน →", url: buildDeeplink(ctx.id, null, ctx.section_code) },
     footerNote: "คุณได้รับอีเมลนี้เพราะเป็นผู้สร้างคำขอ"
   };
   return {
@@ -474,8 +477,8 @@ async function buildApproverEmail(requestId, { greetingName, kind = "REQUEST" } 
     detailRows: baseDetailRows(ctx, { impact: true, period: true }),
     description: ctx.description,
     attachments: ctx.attachments,
-    primary: { label: "ตรวจสอบ & อนุมัติ →", url: buildDeeplink(ctx.id, "approval"), bg: "#15803d" },
-    secondary: { label: "ดูรายละเอียด", url: buildDeeplink(ctx.id) },
+    primary: { label: "ตรวจสอบ & อนุมัติ →", url: buildDeeplink(ctx.id, "approval", ctx.section_code), bg: "#15803d" },
+    secondary: { label: "ดูรายละเอียด", url: buildDeeplink(ctx.id, null, ctx.section_code) },
     footerNote: "คุณได้รับอีเมลนี้เพราะเป็นผู้อนุมัติในขั้นตอนนี้"
   };
   return {
@@ -507,7 +510,7 @@ async function buildAssigneeEmail(requestId, { greetingName, roleLabel, assigned
     detailRows: baseDetailRows(ctx, { roleLabel, period: true }),
     description: ctx.description,
     attachments: ctx.attachments,
-    primary: { label: "เปิดงานของฉัน →", url: buildDeeplink(ctx.id) },
+    primary: { label: "เปิดงานของฉัน →", url: buildDeeplink(ctx.id, null, ctx.section_code) },
     footerNote: "คุณได้รับอีเมลนี้เพราะถูกมอบหมายให้รับผิดชอบคำขอนี้"
   };
   return {
@@ -606,7 +609,7 @@ async function buildStatusEmail(requestId, { event, greetingName, comment } = {}
     paragraphs,
     detailTitle: ctx.title,
     detailRows: baseDetailRows(ctx, { period: event === "EXTENSION" || event === "APPROVED" }),
-    primary: { label: "ดูคำขอ →", url: buildDeeplink(ctx.id) }
+    primary: { label: "ดูคำขอ →", url: buildDeeplink(ctx.id, null, ctx.section_code) }
   };
   return {
     subject: cfg.subject,
@@ -656,7 +659,7 @@ async function loadExtensionContext(extensionId) {
             rb.display_name AS requested_by_name,
             r.request_no, r.title,
             r.requester_user_id, r.incharge_user_id, r.support_user_id,
-            s.name AS section_name
+            s.name AS section_name, s.code AS section_code
      FROM schedule_extension_requests e
      JOIN requests r ON r.id = e.request_id
      JOIN users rb ON rb.id = e.requested_by
@@ -690,8 +693,8 @@ async function buildExtensionApproverEmail(extensionId, { greetingName } = {}) {
     ],
     detailTitle: ctx.title,
     detailRows: extensionPeriodRows(ctx, "ช่วงเวลาใหม่ (ที่ขอเลื่อนเป็น)"),
-    primary: { label: "ตรวจสอบ & อนุมัติ →", url: buildDeeplink(ctx.request_id, "approval"), bg: "#15803d" },
-    secondary: { label: "ดูรายละเอียด", url: buildDeeplink(ctx.request_id) },
+    primary: { label: "ตรวจสอบ & อนุมัติ →", url: buildDeeplink(ctx.request_id, "approval", ctx.section_code), bg: "#15803d" },
+    secondary: { label: "ดูรายละเอียด", url: buildDeeplink(ctx.request_id, null, ctx.section_code) },
     footerNote: "คุณได้รับอีเมลนี้เพราะเป็นผู้อนุมัติในขั้นตอนนี้"
   };
   return {
@@ -731,7 +734,7 @@ async function buildExtensionResultEmail(extensionId, { event, greetingName, com
     paragraphs,
     detailTitle: ctx.title,
     detailRows: extensionPeriodRows(ctx, approved ? "ช่วงเวลาใหม่ (มีผลแล้ว)" : "ช่วงเวลาที่ขอเลื่อนเป็น"),
-    primary: { label: "ดูคำขอ →", url: buildDeeplink(ctx.request_id) }
+    primary: { label: "ดูคำขอ →", url: buildDeeplink(ctx.request_id, null, ctx.section_code) }
   };
   return {
     subject: approved

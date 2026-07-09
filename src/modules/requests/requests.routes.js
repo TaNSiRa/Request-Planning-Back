@@ -904,9 +904,22 @@ async function assertTodoWindow(requestId, sectionId, plannedStart, plannedEnd) 
     { requestId, sectionId }
   )).recordset[0];
   if (!row?.planned_start || !row?.planned_end) return;
-  const start = new Date(plannedStart);
-  const end = new Date(plannedEnd);
-  if (start < row.planned_start || end > row.planned_end || start > end) {
+  // Compare at day granularity. The frontend already constrains todo dates to the
+  // project period at the date level; the stored timestamps carry a time-of-day
+  // (and mssql reads DATE/DATETIME columns back as UTC midnight), so a full
+  // timestamp comparison spuriously rejected a boundary-day todo whenever the
+  // server ran off UTC (e.g. Asia/Bangkok +07).
+  const dayOf = (value) => {
+    if (value instanceof Date) return value.toISOString().slice(0, 10);
+    const s = `${value}`;
+    const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+    return m ? m[1] : new Date(s).toISOString().slice(0, 10);
+  };
+  const todoStart = dayOf(plannedStart);
+  const todoEnd = dayOf(plannedEnd);
+  const projectStart = dayOf(row.planned_start);
+  const projectEnd = dayOf(row.planned_end);
+  if (todoStart < projectStart || todoEnd > projectEnd || todoStart > todoEnd) {
     const err = new Error("Todo period must be inside assigned project period");
     err.status = 400;
     throw err;

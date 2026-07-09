@@ -8,21 +8,30 @@ const router = express.Router();
 router.use(requireAuth);
 
 // ---------------------------------------------------------------------------
-// Read the whole matrix (all authenticated users).
+// Read this section's matrix (any member of the section). The matrix is scoped
+// per section, so the section is taken from the x-section-code header.
 // ---------------------------------------------------------------------------
-router.get("/", asyncHandler(async (req, res) => {
-  res.json(await loadMatrix());
+router.get("/", resolveSection, asyncHandler(async (req, res) => {
+  res.json(await loadMatrix(req.section.id));
 }));
 
-async function loadMatrix() {
-  const meta = await query("SELECT TOP 1 corner_label FROM skill_matrix_meta WHERE id = 1");
+async function loadMatrix(sectionId) {
+  const meta = await query(
+    "SELECT TOP 1 corner_label FROM skill_matrix_meta WHERE section_id = @sectionId",
+    { sectionId }
+  );
   const levels = await query(
-    "SELECT id, name, sort_order FROM skill_matrix_levels ORDER BY sort_order, id"
+    "SELECT id, name, sort_order FROM skill_matrix_levels WHERE section_id = @sectionId ORDER BY sort_order, id",
+    { sectionId }
   );
   const items = await query(
-    "SELECT id, name, sort_order FROM skill_matrix_items ORDER BY sort_order, id"
+    "SELECT id, name, sort_order FROM skill_matrix_items WHERE section_id = @sectionId ORDER BY sort_order, id",
+    { sectionId }
   );
-  const cells = await query("SELECT item_id, level_id, description FROM skill_matrix_cells");
+  const cells = await query(
+    "SELECT item_id, level_id, description FROM skill_matrix_cells WHERE section_id = @sectionId",
+    { sectionId }
+  );
   return {
     cornerLabel: meta.recordset[0]?.corner_label ?? "Items/Level",
     levels: levels.recordset.map(r => ({ id: r.id, name: r.name, sortOrder: r.sort_order })),
@@ -38,10 +47,13 @@ async function loadMatrix() {
 // ---------------------------------------------------------------------------
 // The current user's own level per skill (one level per item, or none).
 // ---------------------------------------------------------------------------
-router.get("/me", asyncHandler(async (req, res) => {
+router.get("/me", resolveSection, asyncHandler(async (req, res) => {
   const rows = await query(
-    "SELECT item_id, level_id FROM user_skill_levels WHERE user_id = @userId",
-    { userId: req.user.id }
+    `SELECT usl.item_id, usl.level_id
+     FROM user_skill_levels usl
+     JOIN skill_matrix_items i ON i.id = usl.item_id AND i.section_id = @sectionId
+     WHERE usl.user_id = @userId`,
+    { userId: req.user.id, sectionId: req.section.id }
   );
   res.json({ selections: rows.recordset.map(r => ({ itemId: r.item_id, levelId: r.level_id })) });
 }));
@@ -54,13 +66,17 @@ router.put("/me", asyncHandler(async (req, res) => {
 
 // Set or clear one skill level for [userId]. Shared by the self endpoint and the
 // admin per-member endpoint. Writes the response itself (validation errors or ok).
-async function setSkillLevel(userId, body, res) {
+async function setSkillLevel(userId, body, res, sectionId) {
   const itemId = Number(body?.itemId);
   const hasLevel = body?.levelId !== null && body?.levelId !== undefined;
   const levelId = hasLevel ? Number(body.levelId) : null;
   if (!Number.isInteger(itemId)) return res.status(400).json({ message: "itemId is required" });
 
-  const item = await query("SELECT 1 FROM skill_matrix_items WHERE id = @id", { id: itemId });
+  // The item/level must belong to THIS section's matrix.
+  const item = await query(
+    "SELECT 1 FROM skill_matrix_items WHERE id = @id AND section_id = @sectionId",
+    { id: itemId, sectionId }
+  );
   if (!item.recordset.length) return res.status(404).json({ message: "Skill not found" });
 
   await query("DELETE FROM user_skill_levels WHERE user_id = @userId AND item_id = @itemId", {
@@ -70,7 +86,10 @@ async function setSkillLevel(userId, body, res) {
 
   if (levelId !== null) {
     if (!Number.isInteger(levelId)) return res.status(400).json({ message: "Invalid levelId" });
-    const level = await query("SELECT 1 FROM skill_matrix_levels WHERE id = @id", { id: levelId });
+    const level = await query(
+      "SELECT 1 FROM skill_matrix_levels WHERE id = @id AND section_id = @sectionId",
+      { id: levelId, sectionId }
+    );
     if (!level.recordset.length) return res.status(404).json({ message: "Level not found" });
     await query(
       `INSERT INTO user_skill_levels (user_id, item_id, level_id, updated_at)
@@ -101,9 +120,11 @@ router.get("/users", resolveSection, requireSectionManager, asyncHandler(async (
   if (users.length) {
     const params = Object.fromEntries(users.map((u, i) => [`u${i}`, u.id]));
     selections = (await query(
-      `SELECT user_id, item_id, level_id FROM user_skill_levels
-       WHERE user_id IN (${users.map((_, i) => `@u${i}`).join(",")})`,
-      params
+      `SELECT usl.user_id, usl.item_id, usl.level_id
+       FROM user_skill_levels usl
+       JOIN skill_matrix_items i ON i.id = usl.item_id AND i.section_id = @sectionId
+       WHERE usl.user_id IN (${users.map((_, i) => `@u${i}`).join(",")})`,
+      { ...params, sectionId: req.section.id }
     )).recordset;
   }
 
@@ -123,7 +144,7 @@ router.put("/users/:userId(\\d+)", resolveSection, requireSectionManager, asyncH
   if (!member.recordset.length) {
     return res.status(403).json({ message: "User is not a member of this section" });
   }
-  await setSkillLevel(targetId, req.body, res);
+  await setSkillLevel(targetId, req.body, res, req.section.id);
 }));
 
 // ---------------------------------------------------------------------------
@@ -135,6 +156,7 @@ router.put("/users/:userId(\\d+)", resolveSection, requireSectionManager, asyncH
 // ---------------------------------------------------------------------------
 router.put("/", resolveSection, requireSectionManager, asyncHandler(async (req, res) => {
   const body = req.body || {};
+  const sectionId = req.section.id;
   const cornerLabel = `${body.cornerLabel ?? "Items/Level"}`.slice(0, 200);
   const levels = Array.isArray(body.levels) ? body.levels : [];
   const items = Array.isArray(body.items) ? body.items : [];
@@ -158,8 +180,12 @@ router.put("/", resolveSection, requireSectionManager, asyncHandler(async (req, 
       return request.query(text);
     };
 
-    const existingLevels = (await run("SELECT id FROM skill_matrix_levels")).recordset.map(r => r.id);
-    const existingItems = (await run("SELECT id FROM skill_matrix_items")).recordset.map(r => r.id);
+    const existingLevels = (await run(
+      "SELECT id FROM skill_matrix_levels WHERE section_id = @sectionId", { sectionId }
+    )).recordset.map(r => r.id);
+    const existingItems = (await run(
+      "SELECT id FROM skill_matrix_items WHERE section_id = @sectionId", { sectionId }
+    )).recordset.map(r => r.id);
 
     // Upsert levels; remember which client key maps to which real id.
     const levelKeyToId = new Map();
@@ -169,15 +195,14 @@ router.put("/", resolveSection, requireSectionManager, asyncHandler(async (req, 
       const name = `${l.name}`.slice(0, 200);
       let id = Number(l.id);
       if (Number.isInteger(id) && existingLevels.includes(id)) {
-        await run("UPDATE skill_matrix_levels SET name = @name, sort_order = @sort WHERE id = @id", {
-          name,
-          sort: i,
-          id
-        });
+        await run(
+          "UPDATE skill_matrix_levels SET name = @name, sort_order = @sort WHERE id = @id AND section_id = @sectionId",
+          { name, sort: i, id, sectionId }
+        );
       } else {
         const inserted = await run(
-          "INSERT INTO skill_matrix_levels (name, sort_order) OUTPUT INSERTED.id AS id VALUES (@name, @sort)",
-          { name, sort: i }
+          "INSERT INTO skill_matrix_levels (name, sort_order, section_id) OUTPUT INSERTED.id AS id VALUES (@name, @sort, @sectionId)",
+          { name, sort: i, sectionId }
         );
         id = inserted.recordset[0].id;
       }
@@ -193,15 +218,14 @@ router.put("/", resolveSection, requireSectionManager, asyncHandler(async (req, 
       const name = `${it.name}`.slice(0, 300);
       let id = Number(it.id);
       if (Number.isInteger(id) && existingItems.includes(id)) {
-        await run("UPDATE skill_matrix_items SET name = @name, sort_order = @sort WHERE id = @id", {
-          name,
-          sort: i,
-          id
-        });
+        await run(
+          "UPDATE skill_matrix_items SET name = @name, sort_order = @sort WHERE id = @id AND section_id = @sectionId",
+          { name, sort: i, id, sectionId }
+        );
       } else {
         const inserted = await run(
-          "INSERT INTO skill_matrix_items (name, sort_order) OUTPUT INSERTED.id AS id VALUES (@name, @sort)",
-          { name, sort: i }
+          "INSERT INTO skill_matrix_items (name, sort_order, section_id) OUTPUT INSERTED.id AS id VALUES (@name, @sort, @sectionId)",
+          { name, sort: i, sectionId }
         );
         id = inserted.recordset[0].id;
       }
@@ -214,7 +238,7 @@ router.put("/", resolveSection, requireSectionManager, asyncHandler(async (req, 
 
     // Rebuild the whole cell grid, then drop the rows/columns that went away
     // (along with any user selections that pointed at them).
-    await run("DELETE FROM skill_matrix_cells");
+    await run("DELETE FROM skill_matrix_cells WHERE section_id = @sectionId", { sectionId });
     for (const id of removedLevelIds) {
       await run("DELETE FROM user_skill_levels WHERE level_id = @id", { id });
     }
@@ -236,18 +260,18 @@ router.put("/", resolveSection, requireSectionManager, asyncHandler(async (req, 
         const description = `${rawDesc ?? ""}`.trim();
         if (!itemId || !levelId || !description) continue;
         await run(
-          "INSERT INTO skill_matrix_cells (item_id, level_id, description) VALUES (@itemId, @levelId, @description)",
-          { itemId, levelId, description }
+          "INSERT INTO skill_matrix_cells (item_id, level_id, description, section_id) VALUES (@itemId, @levelId, @description, @sectionId)",
+          { itemId, levelId, description, sectionId }
         );
       }
     }
 
     await run(
       `MERGE skill_matrix_meta AS target
-       USING (SELECT 1 AS id) AS src ON target.id = src.id
+       USING (SELECT @sectionId AS section_id) AS src ON target.section_id = src.section_id
        WHEN MATCHED THEN UPDATE SET corner_label = @corner
-       WHEN NOT MATCHED THEN INSERT (id, corner_label) VALUES (1, @corner);`,
-      { corner: cornerLabel }
+       WHEN NOT MATCHED THEN INSERT (section_id, corner_label) VALUES (@sectionId, @corner);`,
+      { corner: cornerLabel, sectionId }
     );
 
     await tx.commit();
@@ -256,7 +280,7 @@ router.put("/", resolveSection, requireSectionManager, asyncHandler(async (req, 
     throw err;
   }
 
-  res.json(await loadMatrix());
+  res.json(await loadMatrix(sectionId));
 }));
 
 module.exports = router;
