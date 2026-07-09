@@ -101,14 +101,19 @@ router.get("/features", asyncHandler(async (req, res) => {
 router.get("/org-options", asyncHandler(async (req, res) => {
   const result = await query(
     `SELECT setting_key, setting_value FROM app_settings
-     WHERE setting_key IN ('org.branches', 'org.departments', 'org.sections') AND section_id IS NULL`
+     WHERE setting_key IN ('org.branches', 'org.departments') AND section_id IS NULL`
   );
   const map = {};
   for (const row of result.recordset) map[row.setting_key] = row.setting_value;
+  // Section options are the live request sections — no separate org.sections CSV
+  // to keep in sync (that duplicated the "Sections & branches" card).
+  const sectionRows = (await query(
+    "SELECT name FROM request_sections WHERE is_active = 1 ORDER BY name"
+  )).recordset;
   res.json({
     branches: splitCsv(map["org.branches"], []),
     departments: splitCsv(map["org.departments"], []),
-    sections: splitCsv(map["org.sections"], [])
+    sections: sectionRows.map(row => row.name).filter(Boolean)
   });
 }));
 

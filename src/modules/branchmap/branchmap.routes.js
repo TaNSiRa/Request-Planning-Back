@@ -107,7 +107,7 @@ router.get("/", asyncHandler(async (req, res) => {
 // registered BEFORE "/:branch" so it isn't captured as branch="section-branches".
 router.get("/section-branches", requireAdmin, asyncHandler(async (req, res) => {
   const sections = (await tryQuery(
-    "SELECT id, code, name FROM request_sections WHERE is_active = 1 ORDER BY name"
+    "SELECT id, code, name, description, request_prefix FROM request_sections WHERE is_active = 1 ORDER BY name"
   )) || [];
   const links = await tryQuery("SELECT section_id, branch FROM section_branches");
   if (links === null) {
@@ -124,6 +124,8 @@ router.get("/section-branches", requireAdmin, asyncHandler(async (req, res) => {
       sectionId: section.id,
       sectionCode: section.code,
       sectionName: section.name,
+      sectionDescription: section.description || "",
+      requestPrefix: section.request_prefix || "AR",
       branches: bySection.get(section.id) || []
     }))
   });
@@ -174,15 +176,31 @@ const createSectionSchema = z.object({
 router.post("/sections", requireAdmin, audit("CREATE", "REQUEST_SECTION", req => req.body && req.body.code), asyncHandler(async (req, res) => {
   const input = createSectionSchema.parse(req.body);
   const code = input.code.toUpperCase();
-  const dupe = await query("SELECT TOP 1 id FROM request_sections WHERE UPPER(code)=@code", { code });
-  if (dupe.recordset[0]) return res.status(409).json({ message: "A section with this code already exists" });
-  const result = await query(
-    `INSERT INTO request_sections (code, name, description, request_prefix, is_active)
-     OUTPUT INSERTED.id
-     VALUES (@code, @name, @description, @prefix, 1)`,
-    { code, name: input.name, description: input.description || null, prefix: input.requestPrefix || "AR" }
-  );
-  const sectionId = result.recordset[0].id;
+  const dupe = await query("SELECT TOP 1 id, is_active FROM request_sections WHERE UPPER(code)=@code", { code });
+  let sectionId;
+  if (dupe.recordset[0]) {
+    // An active section already owns this code → conflict. A soft-deleted one is
+    // reactivated + updated in place (the code column is UNIQUE, so we can't just
+    // insert a second row).
+    if (dupe.recordset[0].is_active) {
+      return res.status(409).json({ message: "A section with this code already exists" });
+    }
+    sectionId = dupe.recordset[0].id;
+    await query(
+      `UPDATE request_sections
+       SET name=@name, description=@description, request_prefix=@prefix, is_active=1
+       WHERE id=@id`,
+      { id: sectionId, name: input.name, description: input.description || null, prefix: input.requestPrefix || "AR" }
+    );
+  } else {
+    const result = await query(
+      `INSERT INTO request_sections (code, name, description, request_prefix, is_active)
+       OUTPUT INSERTED.id
+       VALUES (@code, @name, @description, @prefix, 1)`,
+      { code, name: input.name, description: input.description || null, prefix: input.requestPrefix || "AR" }
+    );
+    sectionId = result.recordset[0].id;
+  }
   // Optional initial branch membership (ignored if the table isn't there yet).
   const exists = await tryQuery("SELECT TOP 1 1 AS ok FROM section_branches");
   if (exists !== null) {
@@ -196,6 +214,49 @@ router.post("/sections", requireAdmin, audit("CREATE", "REQUEST_SECTION", req =>
     }
   }
   res.status(201).json({ id: sectionId, code });
+}));
+
+const editSectionSchema = z.object({
+  code: z.string().trim().min(2).max(50).regex(/^[A-Za-z0-9_-]+$/, "Code may use letters, numbers, - and _ only"),
+  name: z.string().trim().min(2).max(120),
+  description: z.string().trim().max(255).optional().default(""),
+  requestPrefix: z.string().trim().min(1).max(10).optional().default("AR")
+});
+
+// Edit a request section's code / name / description / prefix (system admin).
+router.put("/sections/:id", requireAdmin, audit("EDIT", "REQUEST_SECTION", req => req.params.id), asyncHandler(async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ message: "Invalid section id" });
+  const input = editSectionSchema.parse(req.body);
+  const code = input.code.toUpperCase();
+  const existing = await query("SELECT TOP 1 id FROM request_sections WHERE id=@id", { id });
+  if (!existing.recordset[0]) return res.status(404).json({ message: "Section not found" });
+  // Code stays UNIQUE — reject if another section already uses it.
+  const clash = await query(
+    "SELECT TOP 1 id FROM request_sections WHERE UPPER(code)=@code AND id<>@id", { code, id }
+  );
+  if (clash.recordset[0]) return res.status(409).json({ message: "Another section already uses this code" });
+  await query(
+    `UPDATE request_sections
+     SET code=@code, name=@name, description=@description, request_prefix=@prefix
+     WHERE id=@id`,
+    { id, code, name: input.name, description: input.description || null, prefix: input.requestPrefix || "AR" }
+  );
+  res.json({ ok: true, id, code });
+}));
+
+// Retire a request section (system admin). Soft delete — is_active=0 — because
+// requests/routes/memberships FK-reference it and must keep resolving for
+// history. Its branch links are cleared so it stops filtering the picker. A
+// later "Add section" with the same code reactivates this row.
+router.delete("/sections/:id", requireAdmin, audit("DELETE", "REQUEST_SECTION", req => req.params.id), asyncHandler(async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ message: "Invalid section id" });
+  const existing = await query("SELECT TOP 1 id FROM request_sections WHERE id=@id AND is_active=1", { id });
+  if (!existing.recordset[0]) return res.status(404).json({ message: "Section not found" });
+  await query("UPDATE request_sections SET is_active=0 WHERE id=@id", { id });
+  await tryExec("DELETE FROM section_branches WHERE section_id=@id", { id });
+  res.json({ ok: true });
 }));
 
 // ---------------------------------------------------------------------------
