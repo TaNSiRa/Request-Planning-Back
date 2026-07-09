@@ -13,6 +13,25 @@ const { isAdmin, resolveSection } = require("../../services/sectionService");
 
 const router = express.Router();
 router.use(requireAuth);
+
+// Which section a request belongs to — used by deep links that lack ?section=
+// so the SPA can auto-enter the right section instead of asking the recipient
+// to pick one first. Registered BEFORE resolveSection because no section is
+// selected yet at that point in the app.
+router.get("/:id/section", asyncHandler(async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ message: "Invalid request id" });
+  const row = (await query(
+    `SELECT s.code, s.name
+     FROM requests r
+     JOIN request_sections s ON s.id = r.section_id
+     WHERE r.id = @id`,
+    { id }
+  )).recordset[0];
+  if (!row) return res.status(404).json({ message: "Request not found" });
+  res.json({ sectionCode: row.code, sectionName: row.name });
+}));
+
 router.use(resolveSection);
 
 router.get("/", asyncHandler(async (req, res) => {
