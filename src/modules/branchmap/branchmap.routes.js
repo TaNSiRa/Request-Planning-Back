@@ -72,6 +72,118 @@ router.get("/", asyncHandler(async (req, res) => {
   });
 }));
 
+// All request sections + the branches each belongs to (admin editor). Must be
+// registered BEFORE "/:branch" so it isn't captured as branch="section-branches".
+router.get("/section-branches", requireAdmin, asyncHandler(async (req, res) => {
+  const sections = (await tryQuery(
+    "SELECT id, code, name FROM request_sections WHERE is_active = 1 ORDER BY name"
+  )) || [];
+  const links = await tryQuery("SELECT section_id, branch FROM section_branches");
+  if (links === null) {
+    return res.status(500).json({ message: "section_branches table is missing — run database/patch_branch_maps.sql" });
+  }
+  const bySection = new Map();
+  for (const link of links) {
+    if (!bySection.has(link.section_id)) bySection.set(link.section_id, []);
+    bySection.get(link.section_id).push(link.branch);
+  }
+  res.json({
+    branches: await getOrgBranches(),
+    data: sections.map(section => ({
+      sectionId: section.id,
+      sectionCode: section.code,
+      sectionName: section.name,
+      branches: bySection.get(section.id) || []
+    }))
+  });
+}));
+
+const sectionBranchesSchema = z.object({
+  assignments: z.array(z.object({
+    sectionId: z.number().int().positive(),
+    branches: z.array(z.string().trim().min(1).max(100)).max(100)
+  })).max(500)
+});
+
+// Replace the branch membership for the given sections (admin editor). Sections
+// not listed are left untouched.
+router.put("/section-branches", requireAdmin, audit("EDIT", "SECTION_BRANCHES"), asyncHandler(async (req, res) => {
+  const input = sectionBranchesSchema.parse(req.body);
+  const exists = await tryQuery("SELECT TOP 1 1 AS ok FROM section_branches");
+  if (exists === null) {
+    return res.status(500).json({ message: "section_branches table is missing — run database/patch_branch_maps.sql" });
+  }
+  for (const assignment of input.assignments) {
+    await query("DELETE FROM section_branches WHERE section_id=@sectionId", { sectionId: assignment.sectionId });
+    // De-dupe (case-insensitive) so the unique index never trips.
+    const seen = new Set();
+    for (const branch of assignment.branches) {
+      const key = normalizeBranch(branch);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      await query(
+        "INSERT INTO section_branches (section_id, branch) VALUES (@sectionId, @branch)",
+        { sectionId: assignment.sectionId, branch: branch.trim() }
+      );
+    }
+  }
+  res.json({ ok: true });
+}));
+
+const createSectionSchema = z.object({
+  code: z.string().trim().min(2).max(50).regex(/^[A-Za-z0-9_-]+$/, "Code may use letters, numbers, - and _ only"),
+  name: z.string().trim().min(2).max(120),
+  description: z.string().trim().max(255).optional().default(""),
+  requestPrefix: z.string().trim().min(1).max(10).optional().default("AR"),
+  branches: z.array(z.string().trim().min(1).max(100)).max(100).optional().default([])
+});
+
+// Create a brand-new request section (system admin only). Also registered
+// before "/:branch" (POST, so no route clash, but kept together for clarity).
+router.post("/sections", requireAdmin, audit("CREATE", "REQUEST_SECTION", req => req.body && req.body.code), asyncHandler(async (req, res) => {
+  const input = createSectionSchema.parse(req.body);
+  const code = input.code.toUpperCase();
+  const dupe = await query("SELECT TOP 1 id FROM request_sections WHERE UPPER(code)=@code", { code });
+  if (dupe.recordset[0]) return res.status(409).json({ message: "A section with this code already exists" });
+  const result = await query(
+    `INSERT INTO request_sections (code, name, description, request_prefix, is_active)
+     OUTPUT INSERTED.id
+     VALUES (@code, @name, @description, @prefix, 1)`,
+    { code, name: input.name, description: input.description || null, prefix: input.requestPrefix || "AR" }
+  );
+  const sectionId = result.recordset[0].id;
+  // Optional initial branch membership (ignored if the table isn't there yet).
+  const exists = await tryQuery("SELECT TOP 1 1 AS ok FROM section_branches");
+  if (exists !== null) {
+    const seen = new Set();
+    for (const branch of input.branches) {
+      const key = normalizeBranch(branch);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      await query("INSERT INTO section_branches (section_id, branch) VALUES (@sectionId, @branch)",
+        { sectionId, branch: branch.trim() });
+    }
+  }
+  res.status(201).json({ id: sectionId, code });
+}));
+
+// Section ids that belong to a branch: those explicitly assigned to it, plus
+// any section with no assignments at all (treated as belonging everywhere).
+// Returns null when the section_branches table is missing (→ no filtering).
+async function branchSectionIds(branch) {
+  const rows = await tryQuery(
+    `SELECT s.id
+     FROM request_sections s
+     WHERE s.is_active = 1
+       AND (
+         EXISTS (SELECT 1 FROM section_branches sb WHERE sb.section_id = s.id AND UPPER(sb.branch) = @branch)
+         OR NOT EXISTS (SELECT 1 FROM section_branches sb2 WHERE sb2.section_id = s.id)
+       )`,
+    { branch }
+  );
+  return rows === null ? null : rows.map(row => row.id);
+}
+
 // Full map of one branch: the image data URL + polygon areas enriched with the
 // live section code/name/description (labels stay current after renames).
 router.get("/:branch", asyncHandler(async (req, res) => {
@@ -95,17 +207,28 @@ router.get("/:branch", asyncHandler(async (req, res) => {
       sectionDescription: section?.description || null,
       label: `${area.label || ""}`,
       detail: `${area.detail || ""}`,
+      color: area.color || null,
+      labelPos: Array.isArray(area.labelPos) && area.labelPos.length === 2 ? area.labelPos : null,
       points: Array.isArray(area.points) ? area.points : []
     };
   });
-  res.json({ branch: row?.branch || req.params.branch, image: row?.image_data || null, areas });
+  res.json({
+    branch: row?.branch || req.params.branch,
+    image: row?.image_data || null,
+    areas,
+    branchSectionIds: await branchSectionIds(branch)
+  });
 }));
 
 const areaSchema = z.object({
   id: z.string().max(64).optional().default(""),
   sectionId: z.number().int().positive(),
-  label: z.string().max(120).optional().default(""),
+  label: z.string().max(300).optional().default(""),
   detail: z.string().max(500).optional().default(""),
+  // Fill colour as #RRGGBB / #AARRGGBB (null = fall back to a default hue).
+  color: z.string().regex(/^#?[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$/).nullable().optional(),
+  // Optional custom label anchor (normalized 0..1); null = polygon centroid.
+  labelPos: z.array(z.number().min(0).max(1)).length(2).nullable().optional(),
   points: z.array(z.array(z.number().min(0).max(1)).length(2)).min(3).max(200)
 });
 
