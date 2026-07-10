@@ -3,6 +3,7 @@ const { query } = require("../../db/pool");
 const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
 const { resolveSection, isAdmin } = require("../../services/sectionService");
+const { buildMboWorkbook } = require("../../services/mboExport");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -224,6 +225,47 @@ router.get("/export.csv", asyncHandler(async (req, res) => {
   const csv = [header.join(","), ...rows.map(row => header.map(key => JSON.stringify(row[key] ?? "")).join(","))].join("\n");
   res.header("Content-Type", "text/csv");
   res.attachment("automation-kpi.csv").send(csv);
+}));
+
+// Personal MBO appraisal form (company Excel template) filled with the
+// caller's KPI-flagged requests: goal = request title, action plan = todos,
+// start-end = the approver-set period, equal weights summing to 60%, and a
+// provisional self-assessment score of 5. Optional from/to narrows requests
+// by period overlap (same rule as /summary).
+router.get("/export-mbo.xlsx", asyncHandler(async (req, res) => {
+  const { from, to } = req.query;
+  const me = (await query(
+    `SELECT full_name, display_name, employee_no, branch, department, section FROM users WHERE id=@userId`,
+    { userId: req.user.id }
+  )).recordset[0] || {};
+  const requests = (await query(
+    `SELECT TOP 7 id, title, planned_start, planned_end
+     FROM requests
+     WHERE is_kpi = 1
+       AND section_id=@sectionId
+       AND incharge_user_id=@userId
+       AND status NOT IN ('DRAFT','REJECTED','CANCELLED')
+       AND (@from IS NULL OR planned_end IS NULL OR planned_end >= @from)
+       AND (@to IS NULL OR planned_start IS NULL OR planned_start <= @to)
+     ORDER BY planned_start, created_at`,
+    { sectionId: req.section.id, userId: req.user.id, from: from || null, to: to || null }
+  )).recordset;
+  for (const r of requests) {
+    r.todos = (await query(
+      `SELECT title FROM request_todos WHERE request_id=@requestId ORDER BY sort_order, id`,
+      { requestId: r.id }
+    )).recordset.map(t => t.title);
+  }
+  const buffer = buildMboWorkbook({
+    fullName: me.full_name || me.display_name || "",
+    employeeNo: me.employee_no,
+    branch: me.branch,
+    department: me.department,
+    section: me.section,
+    requests
+  });
+  res.header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.attachment("mbo-form.xlsx").send(buffer);
 }));
 
 module.exports = router;
