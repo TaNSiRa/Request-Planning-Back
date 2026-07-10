@@ -281,11 +281,16 @@ router.post("/extension/:extensionId/approve", audit("APPROVE", "EXTENSION_REQUE
       await sendMail({ to: next.email, subject: mail.subject, html: mail.html, text: mail.text, requestId: step.request_id, type: mail.type });
     }
   } else {
-    await query("UPDATE requests SET planned_start=@start, planned_end=@end, updated_at=SYSUTCDATETIME() WHERE id=@requestId", {
-      requestId: step.request_id,
-      start: step.requested_start,
-      end: step.requested_end
-    });
+    // The end date moved — clear the one-shot overdue stamp so the end-date
+    // reminder job can warn again if the NEW end date is missed too.
+    await query(
+      "UPDATE requests SET planned_start=@start, planned_end=@end, overdue_notified_at=NULL, updated_at=SYSUTCDATETIME() WHERE id=@requestId",
+      {
+        requestId: step.request_id,
+        start: step.requested_start,
+        end: step.requested_end
+      }
+    );
     await query("UPDATE schedule_extension_requests SET status='APPROVED' WHERE id=@extensionId", {
       extensionId: step.extension_id
     });

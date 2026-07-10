@@ -207,6 +207,7 @@ function sanitizeUser(user) {
     department: user.department,
     section: user.section,
     phone: user.phone,
+    endDateNotifyDays: user.end_date_notify_days ?? 5,
     roleCode: user.role_code,
     pdpaConsentAccepted,
     pdpaConsentAt: user.pdpa_consent_at,

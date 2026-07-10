@@ -9,6 +9,7 @@ const { env } = require("./config/env");
 const { notFound, errorHandler } = require("./middleware/errorHandler");
 const { csrfProtection, forceHttps, sessionMiddleware } = require("./services/securityService");
 const { registerRealtime } = require("./services/realtimeService");
+const { startEndDateReminderScheduler } = require("./services/endDateReminderService");
 
 const authRoutes = require("./modules/auth/auth.routes");
 const userRoutes = require("./modules/users/users.routes");
@@ -78,4 +79,6 @@ app.use(errorHandler);
 
 server.listen(env.apiPort, env.apiHost, () => {
   console.log(`Request & Planning API running at http://${env.apiHost}:${env.apiPort}`);
+  // Daily 08:30 end-date reminder digests (skips company holidays).
+  startEndDateReminderScheduler();
 });

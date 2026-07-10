@@ -6,6 +6,7 @@ const { requireAuth } = require("../../middleware/auth");
 const { audit } = require("../../middleware/audit");
 const { requireAdmin, requireSectionAdmin, resolveSection, isAdmin } = require("../../services/sectionService");
 const { verifyMail, isMailConfigured, sendMail } = require("../../services/mailService");
+const { normalizeMaxAttachments, getUserDisplayOrder } = require("../../services/settingsService");
 const { verifyHoliday } = require("../../db/holidayPool");
 
 const router = express.Router();
@@ -48,6 +49,14 @@ router.post("/mail/test", requireAdmin, audit("TEST", "MAIL"), asyncHandler(asyn
   res.json(result);
 }));
 
+// Section-level settings that must always be visible in the Settings UI even
+// before a row exists in app_settings — shown with their default until edited
+// (PUT /settings/:key inserts the row on first save).
+const SECTION_SETTING_DEFAULTS = [
+  { key: "request.maxAttachments", value: "5", type: "number", description: "Max files attached to a request" },
+  { key: "todo.maxAttachments", value: "5", type: "number", description: "Max files attached to a todo item" }
+];
+
 router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
   const result = await query(
     `SELECT setting_key, setting_value, value_type, is_public, section_id
@@ -59,6 +68,17 @@ router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
   const rows = isAdmin(req.user)
     ? result.recordset
     : result.recordset.filter(row => !isSystemSetting(row.setting_key));
+  for (const def of SECTION_SETTING_DEFAULTS) {
+    if (!rows.some(row => row.setting_key === def.key && row.section_id === req.section.id)) {
+      rows.push({
+        setting_key: def.key,
+        setting_value: def.value,
+        value_type: def.type,
+        is_public: true,
+        section_id: req.section.id
+      });
+    }
+  }
   res.json({ data: rows });
 }));
 
@@ -66,7 +86,7 @@ router.get("/request-options", asyncHandler(async (req, res) => {
   const result = await query(
     `SELECT setting_key, setting_value
      FROM app_settings
-     WHERE setting_key IN ('request.types', 'request.priorities', 'request.supTypes')
+     WHERE setting_key IN ('request.types', 'request.priorities', 'request.supTypes', 'request.maxAttachments', 'todo.maxAttachments')
        AND (section_id=@sectionId OR section_id IS NULL)
      ORDER BY CASE WHEN section_id=@sectionId THEN 0 ELSE 1 END`
     , { sectionId: req.section.id }
@@ -78,7 +98,9 @@ router.get("/request-options", asyncHandler(async (req, res) => {
   res.json({
     types: splitCsv(map["request.types"], ["PLC", "SCADA", "Touch Screen", "Flutter App", "Express.js", "Node-RED", "Report", "Other"]),
     priorities: splitCsv(map["request.priorities"], ["LOW", "NORMAL", "HIGH", "URGENT"]),
-    supTypes: splitCsv(map["request.supTypes"], [])
+    supTypes: splitCsv(map["request.supTypes"], []),
+    maxRequestAttachments: normalizeMaxAttachments(map["request.maxAttachments"]),
+    maxTodoAttachments: normalizeMaxAttachments(map["todo.maxAttachments"])
   });
 }));
 
@@ -158,6 +180,34 @@ router.put("/meeting-group-order", asyncHandler(async (req, res) => {
     {
       sectionId: req.section.id,
       key: `meeting.groupOrder.${input.groupBy}`,
+      value: JSON.stringify(input.order)
+    }
+  );
+  res.json({ ok: true });
+}));
+
+// Fixed display order of the section's users (JSON array of user ids, first =
+// top), edited with the arrows on the Meeting weekly plan. Like the meeting
+// group order, any section member may read AND update it — the meeting screen
+// is collaborative and everyone must see the same arrangement. Registered
+// BEFORE the generic "/:key" PUT so it isn't swallowed by it.
+router.get("/user-order", asyncHandler(async (req, res) => {
+  res.json({ order: await getUserDisplayOrder(req.section.id) });
+}));
+
+router.put("/user-order", asyncHandler(async (req, res) => {
+  const schema = z.object({ order: z.array(z.number().int().positive()).max(500) });
+  const input = schema.parse(req.body);
+  await query(
+    `MERGE app_settings AS target
+     USING (SELECT @key AS setting_key, @sectionId AS section_id) AS source
+     ON target.setting_key = source.setting_key AND COALESCE(target.section_id, 0) = COALESCE(source.section_id, 0)
+     WHEN MATCHED THEN UPDATE SET setting_value=@value, updated_at=SYSUTCDATETIME()
+     WHEN NOT MATCHED THEN INSERT (section_id, setting_key, setting_value, value_type, is_public, description)
+       VALUES (@sectionId, @key, @value, 'json', 1, 'Fixed user display order (user ids, first = top)');`,
+    {
+      sectionId: req.section.id,
+      key: "users.displayOrder",
       value: JSON.stringify(input.order)
     }
   );
