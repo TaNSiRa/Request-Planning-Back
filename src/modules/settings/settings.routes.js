@@ -49,6 +49,18 @@ router.post("/mail/test", requireAdmin, audit("TEST", "MAIL"), asyncHandler(asyn
   res.json(result);
 }));
 
+// Rows that live in app_settings but are NOT user-facing settings, so the
+// Settings page must not list them as editable raw values:
+//  - endDateReminder.*   — job bookkeeping (the daily 08:30 end-date reminder
+//    stamps the date it last ran so a restart never re-sends that day's mails)
+//  - meeting.groupOrder.* / users.displayOrder — saved UI arrangements, edited
+//    with the arrows on the Meeting page / weekly plan, not as raw JSON here
+function isInternalSetting(key) {
+  return `${key}`.startsWith("endDateReminder.") ||
+    `${key}`.startsWith("meeting.groupOrder.") ||
+    key === "users.displayOrder";
+}
+
 // Section-level settings that must always be visible in the Settings UI even
 // before a row exists in app_settings — shown with their default until edited
 // (PUT /settings/:key inserts the row on first save).
@@ -65,9 +77,10 @@ router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
      ORDER BY CASE WHEN section_id IS NULL THEN 0 ELSE 1 END, setting_key`,
     { sectionId: req.section.id }
   );
+  const visible = result.recordset.filter(row => !isInternalSetting(row.setting_key));
   const rows = isAdmin(req.user)
-    ? result.recordset
-    : result.recordset.filter(row => !isSystemSetting(row.setting_key));
+    ? visible
+    : visible.filter(row => !isSystemSetting(row.setting_key));
   for (const def of SECTION_SETTING_DEFAULTS) {
     if (!rows.some(row => row.setting_key === def.key && row.section_id === req.section.id)) {
       rows.push({

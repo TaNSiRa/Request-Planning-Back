@@ -40,7 +40,10 @@ router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
      ORDER BY u.display_name`,
     { sectionId: req.section.id, fullAdmin }
   );
-  const rows = result.recordset.map(row => {
+  // Same fixed user order as the assignee dropdowns / weekly plan (set with the
+  // weekly-plan arrows); users not in the saved order stay alphabetical.
+  const ordered = sortUsersByDisplayOrder(result.recordset, await getUserDisplayOrder(req.section.id));
+  const rows = ordered.map(row => {
     const { memberships_json, approver_sections_json, ...rest } = row;
     return {
       ...rest,
