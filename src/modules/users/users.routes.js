@@ -42,8 +42,11 @@ router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
   );
   // Same fixed user order as the assignee dropdowns / weekly plan (set with the
   // weekly-plan arrows); users not in the saved order stay alphabetical.
+  // System administrators always come first, keeping that order among themselves.
   const ordered = sortUsersByDisplayOrder(result.recordset, await getUserDisplayOrder(req.section.id));
-  const rows = ordered.map(row => {
+  const admins = ordered.filter(row => row.role_code === "ADMIN");
+  const rest = ordered.filter(row => row.role_code !== "ADMIN");
+  const rows = [...admins, ...rest].map(row => {
     const { memberships_json, approver_sections_json, ...rest } = row;
     return {
       ...rest,
