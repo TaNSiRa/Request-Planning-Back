@@ -5,11 +5,12 @@ const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
 const { audit } = require("../../middleware/audit");
 const { sendMail } = require("../../services/mailService");
-const { buildApproverEmail, buildParticipantEmail, buildExtensionApproverEmail } = require("../../services/emailTemplates");
+const { buildApproverEmail, buildParticipantEmail, buildExtensionApproverEmail, buildImportantTodoDoneEmail } = require("../../services/emailTemplates");
 const { notify } = require("../../services/notificationService");
 const { emitSystem } = require("../../services/realtimeService");
 const { storeDataUrlAttachment, readAttachmentAsDataUrl, deleteStoredAttachment } = require("../../services/attachmentStorage");
 const { isAdmin, resolveSection } = require("../../services/sectionService");
+const { getMaxAttachments, MAX_ATTACHMENTS_CEILING } = require("../../services/settingsService");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -44,7 +45,7 @@ router.get("/", asyncHandler(async (req, res) => {
             au.branch AS incharge_branch, au.department AS incharge_department, au.section AS incharge_section,
             su.branch AS support_branch, su.department AS support_department, su.section AS support_section,
             todo.todo_total, todo.todo_done, todo.todo_progress_percent,
-            (SELECT t2.id, t2.title, t2.planned_start, t2.planned_end, t2.is_done
+            (SELECT t2.id, t2.title, t2.planned_start, t2.planned_end, t2.is_done, t2.is_important
                FROM request_todos t2
                WHERE t2.request_id = r.id
                ORDER BY t2.sort_order, t2.id
@@ -227,6 +228,8 @@ router.post("/", audit("CREATE", "REQUEST", req => req.body.title), asyncHandler
   // section). The requester's home section (from their profile) is the origin;
   // if it differs, a stage-1 origin approval is inserted ahead of this section's
   // route. See resolveRequesterSection.
+  const maxAttachments = await getMaxAttachments(req.section.id, "request");
+  assertAttachmentLimit(attachments, maxAttachments);
   const requesterSectionId = await resolveRequesterSection(req.user.section, req.section.id);
   const number = await generateRequestNumber(req.section.id, req.section.requestPrefix || "AR");
   const insert = await query(
@@ -238,7 +241,7 @@ router.post("/", audit("CREATE", "REQUEST", req => req.body.title), asyncHandler
     { ...values, sectionId: req.section.id, requesterSectionId, number, userId: req.user.id }
   );
   const requestId = insert.recordset[0].id;
-  await saveAttachments(requestId, attachments);
+  await saveAttachments(requestId, attachments, maxAttachments);
   await createApprovalSteps(requestId, req.section.id, requesterSectionId, input.requestType);
   await notifyRequestParticipants(requestId, "CREATE", "Request submitted", number);
   await notifyFirstApprover(requestId, number);
@@ -290,6 +293,7 @@ router.post("/:id/todos", audit("CREATE", "TODO"), asyncHandler(async (req, res)
     plannedStart: z.string(),
     plannedEnd: z.string(),
     sortOrder: z.number().int().optional().default(0),
+    isImportant: z.boolean().optional().default(false),
     attachments: attachmentSchema()
   });
   const input = schema.parse(req.body);
@@ -302,13 +306,15 @@ router.post("/:id/todos", audit("CREATE", "TODO"), asyncHandler(async (req, res)
     allowSectionMember: req.query.meeting === "1"
   });
   await assertTodoWindow(Number(req.params.id), req.section.id, input.plannedStart, input.plannedEnd);
+  const maxAttachments = await getMaxAttachments(req.section.id, "todo");
+  assertAttachmentLimit(attachments, maxAttachments);
   const result = await query(
-    `INSERT INTO request_todos (request_id, title, description, planned_start, planned_end, sort_order, created_by)
-     OUTPUT INSERTED.id VALUES (@id, @title, @description, @plannedStart, @plannedEnd, @sortOrder, @userId)`,
+    `INSERT INTO request_todos (request_id, title, description, planned_start, planned_end, sort_order, is_important, created_by)
+     OUTPUT INSERTED.id VALUES (@id, @title, @description, @plannedStart, @plannedEnd, @sortOrder, @isImportant, @userId)`,
     { ...values, id: Number(req.params.id), userId: req.user.id }
   );
   const todoId = result.recordset[0].id;
-  await saveTodoAttachments(Number(req.params.id), todoId, attachments);
+  await saveTodoAttachments(Number(req.params.id), todoId, attachments, maxAttachments);
   res.status(201).json({ id: todoId });
 }));
 
@@ -319,26 +325,48 @@ router.patch("/:id/todos/:todoId", audit("EDIT", "TODO", req => req.params.todoI
     plannedStart: z.string(),
     plannedEnd: z.string(),
     isDone: z.boolean().optional().default(false),
+    // Optional so callers that don't know about the star (e.g. the done-toggle)
+    // leave the stored value untouched via COALESCE below.
+    isImportant: z.boolean().optional(),
     attachments: attachmentSchema({ defaultEmpty: false })
   });
   const input = schema.parse(req.body);
   const { attachments, ...todoInput } = input;
   const values = {
     ...todoInput,
-    description: input.description ?? null
+    description: input.description ?? null,
+    isImportant: input.isImportant === undefined ? null : input.isImportant
   };
   await assertCanManageRequestWork(Number(req.params.id), req.user, req.sectionAccess, req.section.id, {
     allowSectionMember: req.query.meeting === "1"
   });
   await assertTodoWindow(Number(req.params.id), req.section.id, input.plannedStart, input.plannedEnd);
+  // Snapshot before the update so we can detect an important todo flipping to
+  // done (that transition emails the requester, incharge, and approvers).
+  const before = (await query(
+    "SELECT is_done, is_important FROM request_todos WHERE id=@todoId AND request_id=@id",
+    { todoId: Number(req.params.todoId), id: Number(req.params.id) }
+  )).recordset[0];
   await query(
     `UPDATE request_todos SET title=@title, description=@description, planned_start=@plannedStart, planned_end=@plannedEnd,
-      is_done=@isDone, completed_at=CASE WHEN @isDone=1 THEN SYSUTCDATETIME() ELSE NULL END, updated_at=SYSUTCDATETIME()
+      is_done=@isDone, is_important=COALESCE(@isImportant, is_important),
+      completed_at=CASE WHEN @isDone=1 THEN SYSUTCDATETIME() ELSE NULL END, updated_at=SYSUTCDATETIME()
      WHERE id=@todoId AND request_id=@id`,
     { ...values, todoId: Number(req.params.todoId), id: Number(req.params.id) }
   );
   if (Object.prototype.hasOwnProperty.call(req.body, "attachments")) {
-    await replaceTodoAttachments(Number(req.params.id), Number(req.params.todoId), attachments);
+    const maxAttachments = await getMaxAttachments(req.section.id, "todo");
+    // Enforce the cap only when NEW files are being added — a todo whose
+    // existing files exceed a later-lowered cap must stay editable as-is.
+    if ((attachments || []).some(isNewAttachment)) {
+      assertAttachmentLimit(attachments, maxAttachments);
+    }
+    await replaceTodoAttachments(Number(req.params.id), Number(req.params.todoId), attachments, maxAttachments);
+  }
+  const wasDone = before?.is_done === true || before?.is_done === 1;
+  const importantNow = input.isImportant ?? (before?.is_important === true || before?.is_important === 1);
+  if (before && !wasDone && input.isDone && importantNow) {
+    await notifyImportantTodoDone(Number(req.params.id), Number(req.params.todoId), req.user);
   }
   res.json({ ok: true });
 }));
@@ -655,9 +683,18 @@ async function getTodoAttachments(requestId) {
   }
 }
 
-async function saveAttachments(requestId, attachments = []) {
+// Rejects a payload that exceeds the section's configured attachment cap with a
+// clear message (instead of silently dropping the extras).
+function assertAttachmentLimit(attachments, maxAttachments) {
+  if ((attachments?.length || 0) <= maxAttachments) return;
+  const err = new Error(`Attachments are limited to ${maxAttachments} file${maxAttachments === 1 ? "" : "s"}`);
+  err.status = 400;
+  throw err;
+}
+
+async function saveAttachments(requestId, attachments = [], maxAttachments = 5) {
   const context = await getAttachmentStorageContext(requestId, { bucket: "Request Files" });
-  for (const attachment of attachments.slice(0, 5)) {
+  for (const attachment of attachments.slice(0, maxAttachments)) {
     if (!isNewAttachment(attachment)) continue;
     const stored = await storeDataUrlAttachment(attachment, context);
     await query(
@@ -674,10 +711,10 @@ async function saveAttachments(requestId, attachments = []) {
   }
 }
 
-async function saveTodoAttachments(requestId, todoId, attachments = []) {
+async function saveTodoAttachments(requestId, todoId, attachments = [], maxAttachments = 5) {
   const bucket = await getTodoAttachmentBucket(requestId, todoId);
   const context = await getAttachmentStorageContext(requestId, { bucket });
-  for (const attachment of attachments.slice(0, 5)) {
+  for (const attachment of attachments.slice(0, maxAttachments)) {
     if (!isNewAttachment(attachment)) continue;
     const stored = await storeDataUrlAttachment(attachment, context);
     await query(
@@ -710,7 +747,7 @@ async function getTodoAttachmentBucket(requestId, todoId) {
   return `${String(index).padStart(3, "0")}_todo`;
 }
 
-async function replaceTodoAttachments(requestId, todoId, attachments = []) {
+async function replaceTodoAttachments(requestId, todoId, attachments = [], maxAttachments = 5) {
   const existing = (await query(
     `SELECT id, storage_path
      FROM todo_attachments
@@ -739,7 +776,7 @@ async function replaceTodoAttachments(requestId, todoId, attachments = []) {
       params
     );
   }
-  await saveTodoAttachments(requestId, todoId, attachments);
+  await saveTodoAttachments(requestId, todoId, attachments, maxAttachments);
 }
 
 async function deleteTodoAttachmentFiles(requestId, todoId) {
@@ -837,7 +874,9 @@ function attachmentSchema({ defaultEmpty = true } = {}) {
   }).refine(
     attachment => Boolean(attachment.id) || isNewAttachment(attachment),
     { message: "Attachment must include an existing id or a data URL" }
-  )).max(5);
+    // Hard safety ceiling only — the real per-section cap (default 5) is checked
+    // against the section's request/todo.maxAttachments setting per route.
+  )).max(MAX_ATTACHMENTS_CEILING);
   return defaultEmpty ? schema.optional().default([]) : schema.optional();
 }
 
@@ -882,6 +921,56 @@ async function notifyFirstCloseApprover(requestId) {
   const mail = await buildApproverEmail(requestId, { greetingName: row.display_name, kind: "CLOSE" });
   if (mail && row.email) {
     await sendMail({ to: row.email, subject: mail.subject, html: mail.html, text: mail.text, requestId, type: mail.type });
+  }
+}
+
+// A starred (important) todo was just completed — email + in-app notify the
+// requester, the assigned incharge, and every approver on the request's
+// approval route (main and close steps alike), deduplicated.
+async function notifyImportantTodoDone(requestId, todoId, completedBy) {
+  const request = (await query(
+    `SELECT r.request_no, r.requester_user_id, r.incharge_user_id
+     FROM requests r WHERE r.id=@requestId`,
+    { requestId }
+  )).recordset[0];
+  const todo = (await query(
+    `SELECT t.title, t.description,
+            (SELECT COUNT(1) FROM request_todos WHERE request_id=@requestId) AS todo_total,
+            (SELECT COUNT(1) FROM request_todos WHERE request_id=@requestId AND is_done=1) AS todo_done
+     FROM request_todos t WHERE t.id=@todoId AND t.request_id=@requestId`,
+    { requestId, todoId }
+  )).recordset[0];
+  if (!request || !todo) return;
+  const approverIds = (await query(
+    "SELECT DISTINCT approver_user_id FROM approval_steps WHERE request_id=@requestId AND approver_user_id IS NOT NULL",
+    { requestId }
+  )).recordset.map(r => r.approver_user_id);
+  const ids = [...new Set([request.requester_user_id, request.incharge_user_id, ...approverIds].filter(Boolean))];
+  for (const userId of ids) {
+    const user = (await query(
+      "SELECT email, display_name FROM users WHERE id=@userId AND is_active=1",
+      { userId }
+    )).recordset[0];
+    if (!user) continue;
+    await notify({
+      userId,
+      requestId,
+      type: "TODO_IMPORTANT_DONE",
+      title: "Important todo completed",
+      body: `${request.request_no} · ${todo.title}`
+    });
+    if (!user.email) continue;
+    const mail = await buildImportantTodoDoneEmail(requestId, {
+      greetingName: user.display_name,
+      todoTitle: todo.title,
+      todoDescription: todo.description,
+      completedByName: completedBy?.display_name || completedBy?.displayName || null,
+      todoDone: todo.todo_done,
+      todoTotal: todo.todo_total
+    });
+    if (mail) {
+      await sendMail({ to: user.email, subject: mail.subject, html: mail.html, text: mail.text, requestId, type: mail.type });
+    }
   }
 }
 

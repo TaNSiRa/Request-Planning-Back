@@ -7,6 +7,7 @@ const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
 const { audit } = require("../../middleware/audit");
 const { requireSectionAdmin, resolveSection, isAdmin, canManageTargetRole } = require("../../services/sectionService");
+const { getUserDisplayOrder, sortUsersByDisplayOrder } = require("../../services/settingsService");
 
 const router = express.Router();
 
@@ -65,7 +66,9 @@ router.get("/assignees", asyncHandler(async (req, res) => {
      ORDER BY u.branch, u.department, u.section, u.display_name`
     , { sectionId: req.section.id }
   );
-  const users = result.recordset;
+  // The section's fixed user order (weekly-plan arrows) pins listed people to
+  // their positions; anyone unlisted follows in the SQL order above.
+  const users = sortUsersByDisplayOrder(result.recordset, await getUserDisplayOrder(req.section.id));
   const skillsByUser = await getAssigneeSkills(users.map(u => u.id), req.section.id);
   res.json({ data: users.map(u => ({ ...u, skills: skillsByUser.get(u.id) || [] })) });
 }));
@@ -222,7 +225,10 @@ router.patch("/me", audit("EDIT_PROFILE", "USER", req => req.user.id), asyncHand
     phone: z.string().optional().nullable(),
     branch: z.string().min(1),
     department: z.string().min(1),
-    section: z.string().min(1)
+    section: z.string().min(1),
+    // Working days before a request end date to email a reminder (0 disables
+    // the "near end date" digest; today/overdue reminders still send).
+    endDateNotifyDays: z.number().int().min(0).max(365).optional()
   });
   const input = schema.parse(req.body);
   const email = input.email.toLowerCase();
@@ -244,10 +250,12 @@ router.patch("/me", audit("EDIT_PROFILE", "USER", req => req.user.id), asyncHand
     phone: input.phone ?? null,
     branch: input.branch ?? null,
     department: input.department ?? null,
-    section: input.section ?? null
+    section: input.section ?? null,
+    endDateNotifyDays: input.endDateNotifyDays ?? null
   };
   await query(
-    `UPDATE users SET employee_no=@employeeNo, email=@email, display_name=@displayName, full_name=@fullName, phone=@phone, branch=@branch, department=@department, section=@section, updated_at=SYSUTCDATETIME()
+    `UPDATE users SET employee_no=@employeeNo, email=@email, display_name=@displayName, full_name=@fullName, phone=@phone, branch=@branch, department=@department, section=@section,
+         end_date_notify_days=COALESCE(@endDateNotifyDays, end_date_notify_days), updated_at=SYSUTCDATETIME()
      WHERE id=@id`,
     { ...values, id: req.user.id }
   );

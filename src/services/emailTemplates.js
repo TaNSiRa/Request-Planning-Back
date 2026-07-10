@@ -262,7 +262,7 @@ function renderEmail(opts) {
   const {
     sectionName, requestNo, accent, pillText, headline, greetingName,
     paragraphs = [], detailRows = "", detailTitle, description,
-    attachments = [], primary, secondary, footerNote
+    attachments = [], primary, secondary, footerNote, extraHtml = ""
   } = opts;
 
   const initial = esc(`${sectionName || "R"}`.trim().charAt(0).toUpperCase() || "R");
@@ -322,6 +322,7 @@ function renderEmail(opts) {
       ? `<p style="font-size:14px;color:${TEXT};line-height:1.6;margin:0 0 14px;font-family:'IBM Plex Sans',Segoe UI,Arial,sans-serif;">เรียน <strong style="color:${INK};">คุณ ${esc(greetingName)}</strong></p>`
       : "")
     + `${paras}
+  ${extraHtml}
   ${detailTitle ? detailCard("รายละเอียดคำขอ", detailTitle, detailRows) : ""}
   ${descBlock(description)}
   ${attachmentsBlock(attachments)}
@@ -753,6 +754,152 @@ async function buildExtensionResultEmail(extensionId, { event, greetingName, com
   };
 }
 
+// ---------------------------------------------------------------------------
+// End-date reminder digest — one email per category per incharge, bundling
+// every request that needs attention that day. category: NEAR | TODAY | OVERDUE.
+// Each item: { id, request_no, title, priority, status, planned_end,
+//              requester_name, section_name, section_code,
+//              remaining_workdays (NEAR only), todo_done, todo_total }
+// ---------------------------------------------------------------------------
+const STATUS_TH = {
+  IN_PROGRESS: "กำลังดำเนินการ",
+  ON_HOLD: "พักงานชั่วคราว",
+  WAITING_CLOSE: "รออนุมัติปิดงาน"
+};
+
+const END_DATE_DIGEST = {
+  NEAR: {
+    accent: ACCENTS.blue,
+    pill: "แจ้งเตือนล่วงหน้า · ใกล้ถึงวันสิ้นสุดโครงการ",
+    headline: count => `มีงาน ${count} รายการใกล้ถึงวันสิ้นสุดโครงการ`,
+    subject: count => `⏰ แจ้งเตือน · งานที่คุณรับผิดชอบ ${count} รายการใกล้ถึงวันสิ้นสุดโครงการ`,
+    intro: notifyDays =>
+      `งานที่คุณได้รับมอบหมายตามรายการด้านล่างจะถึงวันสิ้นสุดโครงการภายใน <strong>${notifyDays} วันทำการ</strong> `
+      + `(ไม่นับวันหยุด ตามค่าแจ้งเตือนที่คุณตั้งไว้ในหน้า Profile) กรุณาตรวจสอบความคืบหน้าและวางแผนปิดงานให้ทันกำหนด`,
+    type: "END_DATE_NEAR"
+  },
+  TODAY: {
+    accent: ACCENTS.amber,
+    pill: "ต้องดำเนินการ · ถึงวันสิ้นสุดโครงการวันนี้",
+    headline: count => `มีงาน ${count} รายการถึงวันสิ้นสุดโครงการวันนี้`,
+    subject: count => `📅 วันนี้เป็นวันสิ้นสุดโครงการของงานที่คุณรับผิดชอบ ${count} รายการ`,
+    intro: () =>
+      `วันนี้เป็น<strong>วันสิ้นสุดโครงการ</strong>ของงานตามรายการด้านล่างซึ่งยังไม่ปิดงาน `
+      + `กรุณาเร่งดำเนินการให้เสร็จและส่งปิดงาน หรือยื่นขอขยายเวลาหากไม่ทันกำหนด`,
+    type: "END_DATE_TODAY"
+  },
+  OVERDUE: {
+    accent: ACCENTS.red,
+    pill: "เลยกำหนด · เกินวันสิ้นสุดโครงการแล้ว",
+    headline: count => `มีงาน ${count} รายการเลยวันสิ้นสุดโครงการแล้ว`,
+    subject: count => `⚠️ งานที่คุณรับผิดชอบ ${count} รายการเลยวันสิ้นสุดโครงการแล้ว`,
+    intro: () =>
+      `งานตามรายการด้านล่าง<strong>เลยวันสิ้นสุดโครงการมาแล้ว</strong>และยังไม่ปิดงาน `
+      + `กรุณาเร่งดำเนินการปิดงานหรือยื่นขอขยายเวลาโครงการโดยเร็วที่สุด `
+      + `(ระบบจะแจ้งเตือนกรณีเลยกำหนดเพียงครั้งเดียว)`,
+    type: "END_DATE_OVERDUE"
+  }
+};
+
+function endDateItemHint(category, item) {
+  if (category === "NEAR") {
+    const n = item.remaining_workdays;
+    return n === 1 ? "เหลืออีก 1 วันทำการ" : `เหลืออีก ${n} วันทำการ`;
+  }
+  if (category === "TODAY") return "วันสิ้นสุดคือวันนี้";
+  return daysHint(item.planned_end) || "เลยกำหนดแล้ว";
+}
+
+function buildEndDateDigestEmail(category, { greetingName, notifyDays, items }) {
+  const cfg = END_DATE_DIGEST[category];
+  if (!cfg || !items || !items.length) return null;
+
+  const cards = items.map(item => {
+    const link = buildDeeplink(item.id, null, item.section_code);
+    const hint = endDateItemHint(category, item);
+    let rows = "";
+    rows += kvRow("ผู้ขอ", `<span style="color:${INK};font-weight:600;">${esc(item.requester_name)}</span>`);
+    rows += kvRow("ความสำคัญ", priorityChip(item.priority));
+    rows += kvRow("สถานะ", esc(STATUS_TH[item.status] || item.status));
+    rows += kvRow("วันสิ้นสุดโครงการ",
+      `<strong style="color:${category === "NEAR" ? INK : ACCENTS.red.fg};">${esc(formatThaiDate(item.planned_end))}</strong>`
+      + ` <span style="color:${FAINT};font-size:12px;">· ${esc(hint)}</span>`);
+    if (Number(item.todo_total) > 0) {
+      rows += kvRow("ความคืบหน้า To-do", esc(`${item.todo_done} / ${item.todo_total} รายการ`));
+    }
+    if (link) {
+      rows += kvRow("เปิดงาน", `<a href="${esc(link)}" target="_blank" style="color:#2f6bed;font-weight:600;">เปิดคำขอนี้ในระบบ →</a>`);
+    }
+    return detailCard(item.request_no, item.title, rows);
+  }).join("");
+
+  const sectionNames = [...new Set(items.map(i => i.section_name).filter(Boolean))];
+  const sectionName = sectionNames.length === 1 ? sectionNames[0] : "Request & Planning";
+  const base = (env.frontendOrigin || "").replace(/\/+$/, "");
+
+  const opts = {
+    sectionName,
+    requestNo: `${items.length} รายการ`,
+    accent: cfg.accent,
+    pillText: cfg.pill,
+    headline: cfg.headline(items.length),
+    greetingName,
+    paragraphs: [cfg.intro(notifyDays)],
+    extraHtml: cards,
+    primary: base ? { label: "เปิดระบบ Request & Planning →", url: `${base}/` } : null,
+    footerNote: "คุณได้รับอีเมลนี้เพราะเป็นผู้รับผิดชอบ (Incharge) ของงานตามรายการข้างต้น"
+  };
+  const plainLines = items.map(item =>
+    `- ${item.request_no} · ${item.title} · สิ้นสุด ${formatThaiDate(item.planned_end)} (${endDateItemHint(category, item)})`);
+  return {
+    subject: cfg.subject(items.length),
+    html: renderEmail(opts),
+    text: renderText({ ...opts, plainParagraphs: [cfg.headline(items.length), ...plainLines] }),
+    type: cfg.type
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Important-todo completion — sent to the requester, the assigned incharge and
+// every approver on the request's approval route when a starred todo is done.
+// ---------------------------------------------------------------------------
+async function buildImportantTodoDoneEmail(requestId, { greetingName, roleLabel, todoTitle, todoDescription, completedByName, todoDone, todoTotal } = {}) {
+  const ctx = await loadRequestContext(requestId);
+  if (!ctx) return null;
+  const progress = Number(todoTotal) > 0 ? ` (ความคืบหน้ารวม ${todoDone}/${todoTotal} รายการ)` : "";
+  const todoRows =
+    kvRow("งานย่อยที่เสร็จ", `<strong style="color:${INK};">${esc(todoTitle)}</strong>`)
+    + (todoDescription ? kvRow("รายละเอียดงานย่อย", esc(todoDescription)) : "")
+    + kvRow("ทำเสร็จโดย", esc(completedByName || ctx.incharge_name || "-"))
+    + baseDetailRows(ctx, { roleLabel, period: true });
+  const opts = {
+    sectionName: ctx.section_name,
+    requestNo: ctx.request_no,
+    accent: ACCENTS.green,
+    pillText: "งานสำคัญเสร็จแล้ว · Important to-do",
+    headline: "งานย่อยสำคัญของคำขอนี้เสร็จเรียบร้อยแล้ว",
+    greetingName,
+    paragraphs: [
+      `งานย่อย (To-do) ที่ถูกทำเครื่องหมายว่า<strong>สำคัญ</strong> ของคำขอ <strong>${esc(ctx.request_no)}</strong> `
+      + `ได้ดำเนินการเสร็จเรียบร้อยแล้ว${esc(progress)} สามารถเปิดดูรายละเอียดและติดตามความคืบหน้าที่เหลือได้จากปุ่มด้านล่าง`
+    ],
+    detailTitle: ctx.title,
+    detailRows: todoRows,
+    primary: { label: "ดูคำขอ →", url: buildDeeplink(ctx.id, null, ctx.section_code) },
+    footerNote: "คุณได้รับอีเมลนี้เพราะเกี่ยวข้องกับคำขอนี้ (ผู้ขอ / ผู้รับผิดชอบ / ผู้อนุมัติ)"
+  };
+  return {
+    subject: `⭐ งานสำคัญเสร็จแล้ว · ${todoTitle} · ${ctx.request_no}`,
+    html: renderEmail(opts),
+    text: renderText({
+      ...opts,
+      plainParagraphs: [`งานย่อยสำคัญ "${todoTitle}" ของคำขอ ${ctx.request_no} เสร็จเรียบร้อยแล้ว`],
+      plainRows: plainRowsOf(ctx)
+    }),
+    type: "TODO_IMPORTANT_DONE"
+  };
+}
+
 module.exports = {
   buildDeeplink,
   loadRequestContext,
@@ -762,5 +909,7 @@ module.exports = {
   buildStatusEmail,
   buildParticipantEmail,
   buildExtensionApproverEmail,
-  buildExtensionResultEmail
+  buildExtensionResultEmail,
+  buildEndDateDigestEmail,
+  buildImportantTodoDoneEmail
 };

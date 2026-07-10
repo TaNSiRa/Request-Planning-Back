@@ -4,6 +4,7 @@ const { sql, getPool, query } = require("../../db/pool");
 const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
 const { resolveSection, requireSectionAdmin } = require("../../services/sectionService");
+const { getUserDisplayOrder, sortUsersByDisplayOrder } = require("../../services/settingsService");
 const { getHolidayDates } = require("../../db/holidayPool");
 
 const router = express.Router();
@@ -19,6 +20,13 @@ const ACTIVE_WORKERS_SQL =
    JOIN user_section_memberships m ON m.user_id = u.id AND m.section_id = @sectionId AND m.is_active = 1 AND m.can_work = 1
    WHERE u.is_active = 1
    ORDER BY u.display_name`;
+
+// Section workers in the section's fixed display order (weekly-plan arrows);
+// users not in the saved order follow alphabetically.
+async function loadOrderedWorkers(sectionId) {
+  const users = (await query(ACTIVE_WORKERS_SQL, { sectionId })).recordset;
+  return sortUsersByDisplayOrder(users, await getUserDisplayOrder(sectionId));
+}
 
 // YYYY-MM-DD of the Monday of the server's current week (Mon=start).
 function currentMonday() {
@@ -45,7 +53,7 @@ function rowCells(row) {
 // saved values) plus the saved free-form car rows.
 router.get("/", asyncHandler(async (req, res) => {
   const weekStart = weekStartSchema.parse(req.query.weekStart);
-  const users = (await query(ACTIVE_WORKERS_SQL, { sectionId: req.section.id })).recordset;
+  const users = await loadOrderedWorkers(req.section.id);
 
   const saved = (await query(
     `SELECT * FROM weekly_plan_rows WHERE section_id = @sectionId AND week_start = @weekStart
@@ -253,7 +261,7 @@ async function loadDefaultUserValues(sectionId) {
 }
 
 router.get("/default-user-values", asyncHandler(async (req, res) => {
-  const users = (await query(ACTIVE_WORKERS_SQL, { sectionId: req.section.id })).recordset;
+  const users = await loadOrderedWorkers(req.section.id);
   const byUser = await loadDefaultUserValues(req.section.id);
   res.json({
     users: users.map(u => ({
