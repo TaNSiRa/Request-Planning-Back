@@ -132,11 +132,12 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
       return res.status(400).json({ message: "Project start must be before project end" });
     }
     // Skill-matrix gate: when the picked support types carry a required level,
-    // the incharge must be qualified — unless a qualified support covers it.
+    // every required skill must be covered by the incharge and support pooled
+    // together — one may fill the gaps the other leaves.
     const required = normalizedSupTypes.filter(s => s.itemId && s.levelId);
     if (required.length) {
       const skill = await evaluateSkillSufficiency(required, values.inchargeUserId, values.supportUserId);
-      if (!skill.inchargeOk && !skill.supportOk) {
+      if (!skill.combinedOk) {
         return res.status(400).json({ message: "INCHARGE_SKILL_INSUFFICIENT" });
       }
     }
@@ -442,20 +443,31 @@ async function evaluateSkillSufficiency(required, inchargeUserId, supportUserId)
     if (!byUser.has(row.user_id)) byUser.set(row.user_id, new Map());
     byUser.get(row.user_id).set(row.item_id, row.level_id);
   }
+  const rankOf = (userId, itemId) => {
+    if (!userId) return -1;
+    const skills = byUser.get(userId);
+    if (!skills) return -1;
+    const have = skills.get(itemId);
+    if (have == null) return -1;
+    const r = rank.get(have);
+    return r == null ? -1 : r;
+  };
   const isSufficient = userId => {
     if (!userId) return false;
-    const skills = byUser.get(userId);
-    if (!skills) return false;
     for (const req of required) {
-      const have = skills.get(req.itemId);
-      if (have == null) return false;
-      const haveRank = rank.get(have);
       const needRank = rank.get(req.levelId);
-      if (haveRank == null || needRank == null || haveRank < needRank) return false;
+      if (needRank == null || rankOf(userId, req.itemId) < needRank) return false;
     }
     return true;
   };
-  return { inchargeOk: isSufficient(inchargeUserId), supportOk: isSufficient(supportUserId) };
+  // Combined coverage: each required skill may be satisfied by the incharge OR
+  // the support — their skills are pooled, not judged one person at a time.
+  const combinedOk = required.every(req => {
+    const needRank = rank.get(req.levelId);
+    if (needRank == null) return false;
+    return Math.max(rankOf(inchargeUserId, req.itemId), rankOf(supportUserId, req.itemId)) >= needRank;
+  });
+  return { inchargeOk: isSufficient(inchargeUserId), supportOk: isSufficient(supportUserId), combinedOk };
 }
 
 async function getAttachments(requestId) {
