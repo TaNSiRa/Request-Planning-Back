@@ -203,6 +203,7 @@ function sanitizeUser(user) {
     email: user.email,
     displayName: user.display_name,
     fullName: user.full_name,
+    namePrefix: user.name_prefix,
     branch: user.branch,
     department: user.department,
     section: user.section,

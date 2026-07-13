@@ -235,7 +235,7 @@ router.get("/export.csv", asyncHandler(async (req, res) => {
 router.get("/export-mbo.xlsx", asyncHandler(async (req, res) => {
   const { from, to } = req.query;
   const me = (await query(
-    `SELECT full_name, display_name, employee_no, branch, department, section FROM users WHERE id=@userId`,
+    `SELECT full_name, display_name, name_prefix, employee_no, branch, department, section FROM users WHERE id=@userId`,
     { userId: req.user.id }
   )).recordset[0] || {};
   const requests = (await query(
@@ -256,8 +256,11 @@ router.get("/export-mbo.xlsx", asyncHandler(async (req, res) => {
       { requestId: r.id }
     )).recordset.map(t => t.title);
   }
+  // Prepend the name prefix (Mr./Mrs./…) to the person's name on the MBO form.
+  const baseName = me.full_name || me.display_name || "";
+  const prefixedName = [me.name_prefix, baseName].filter(v => v && `${v}`.trim()).join(" ").trim();
   const buffer = buildMboWorkbook({
-    fullName: me.full_name || me.display_name || "",
+    fullName: prefixedName,
     employeeNo: me.employee_no,
     branch: me.branch,
     department: me.department,

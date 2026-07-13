@@ -20,7 +20,7 @@ router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
   // manages plain requesters in their own section, so they see just those.
   const fullAdmin = isAdmin(req.user) ? 1 : 0;
   const result = await query(
-    `SELECT u.id, u.employee_no, u.email, u.display_name, u.full_name, u.branch, u.department, u.section, u.phone, u.is_active, u.role_id,
+    `SELECT u.id, u.employee_no, u.email, u.display_name, u.full_name, u.name_prefix, u.branch, u.department, u.section, u.phone, u.is_active, u.role_id,
             r.code AS role_code, r.name AS role_name,
             m.can_request, m.can_work, m.is_section_admin, m.is_active AS membership_active,
             (SELECT ms.section_id, ms.can_request, ms.can_work, ms.is_section_admin
@@ -120,6 +120,7 @@ router.post("/", requireSectionAdmin, audit("CREATE", "USER", req => req.body.em
     email: z.string().email(),
     displayName: z.string().min(2),
     fullName: z.string().optional().nullable(),
+    namePrefix: z.string().optional().nullable(),
     password: z.string().min(1),
     roleId: z.number().int(),
     branch: z.string().min(1),
@@ -142,6 +143,7 @@ router.post("/", requireSectionAdmin, audit("CREATE", "USER", req => req.body.em
     ...userInput,
     employeeNo: input.employeeNo ?? null,
     fullName: input.fullName?.trim() ? input.fullName.trim() : null,
+    namePrefix: input.namePrefix?.trim() ? input.namePrefix.trim() : null,
     branch: input.branch ?? null,
     department: input.department ?? null,
     section: input.section ?? null,
@@ -149,9 +151,9 @@ router.post("/", requireSectionAdmin, audit("CREATE", "USER", req => req.body.em
   };
   const passwordHash = await bcrypt.hash(input.password, env.bcryptRounds);
   const result = await query(
-    `INSERT INTO users (employee_no, email, display_name, full_name, password_hash, role_id, branch, department, section, phone)
+    `INSERT INTO users (employee_no, email, display_name, full_name, name_prefix, password_hash, role_id, branch, department, section, phone)
      OUTPUT INSERTED.id
-     VALUES (@employeeNo, @email, @displayName, @fullName, @passwordHash, @roleId, @branch, @department, @section, @phone)`,
+     VALUES (@employeeNo, @email, @displayName, @fullName, @namePrefix, @passwordHash, @roleId, @branch, @department, @section, @phone)`,
     { ...values, email: input.email.toLowerCase(), passwordHash }
   );
   const userId = result.recordset[0].id;
@@ -166,6 +168,7 @@ router.patch("/:id(\\d+)", requireSectionAdmin, audit("EDIT", "USER", req => req
     email: z.string().email(),
     displayName: z.string().min(2),
     fullName: z.string().optional().nullable(),
+    namePrefix: z.string().optional().nullable(),
     roleId: z.number().int(),
     branch: z.string().min(1),
     department: z.string().min(1),
@@ -189,7 +192,7 @@ router.patch("/:id(\\d+)", requireSectionAdmin, audit("EDIT", "USER", req => req
   }
   await query(
     `UPDATE users
-     SET employee_no=@employeeNo, email=@email, display_name=@displayName, full_name=@fullName, role_id=@roleId,
+     SET employee_no=@employeeNo, email=@email, display_name=@displayName, full_name=@fullName, name_prefix=@namePrefix, role_id=@roleId,
          branch=@branch, department=@department, section=@section, phone=@phone, is_active=@isActive, updated_at=SYSUTCDATETIME()
      WHERE id=@id`,
     {
@@ -198,6 +201,7 @@ router.patch("/:id(\\d+)", requireSectionAdmin, audit("EDIT", "USER", req => req
       email: input.email.toLowerCase(),
       displayName: input.displayName,
       fullName: input.fullName?.trim() ? input.fullName.trim() : null,
+      namePrefix: input.namePrefix?.trim() ? input.namePrefix.trim() : null,
       roleId: input.roleId,
       branch: input.branch ?? null,
       department: input.department ?? null,
@@ -231,6 +235,7 @@ router.patch("/me", audit("EDIT_PROFILE", "USER", req => req.user.id), asyncHand
     email: z.string().trim().email(),
     displayName: z.string().min(2),
     fullName: z.string().optional().nullable(),
+    namePrefix: z.string().optional().nullable(),
     phone: z.string().optional().nullable(),
     branch: z.string().min(1),
     department: z.string().min(1),
@@ -256,6 +261,7 @@ router.patch("/me", audit("EDIT_PROFILE", "USER", req => req.user.id), asyncHand
     ...input,
     email,
     fullName: input.fullName?.trim() ? input.fullName.trim() : null,
+    namePrefix: input.namePrefix?.trim() ? input.namePrefix.trim() : null,
     phone: input.phone ?? null,
     branch: input.branch ?? null,
     department: input.department ?? null,
@@ -263,7 +269,7 @@ router.patch("/me", audit("EDIT_PROFILE", "USER", req => req.user.id), asyncHand
     endDateNotifyDays: input.endDateNotifyDays ?? null
   };
   await query(
-    `UPDATE users SET employee_no=@employeeNo, email=@email, display_name=@displayName, full_name=@fullName, phone=@phone, branch=@branch, department=@department, section=@section,
+    `UPDATE users SET employee_no=@employeeNo, email=@email, display_name=@displayName, full_name=@fullName, name_prefix=@namePrefix, phone=@phone, branch=@branch, department=@department, section=@section,
          end_date_notify_days=COALESCE(@endDateNotifyDays, end_date_notify_days), updated_at=SYSUTCDATETIME()
      WHERE id=@id`,
     { ...values, id: req.user.id }
