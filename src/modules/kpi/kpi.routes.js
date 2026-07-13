@@ -230,10 +230,12 @@ router.get("/export.csv", asyncHandler(async (req, res) => {
 // Personal MBO appraisal form (company Excel template) filled with the
 // caller's KPI-flagged requests: goal = request title, action plan = todos,
 // start-end = the approver-set period, equal weights summing to 60%, and a
-// provisional self-assessment score of 5. Optional from/to narrows requests
-// by period overlap (same rule as /summary).
+// provisional self-assessment score of 5. from/to select a half-year window
+// (requests whose end date falls inside it); half (1|2) picks which assessment
+// block on the form the data is written into (Mid-Year vs Year-End).
 router.get("/export-mbo.xlsx", asyncHandler(async (req, res) => {
   const { from, to } = req.query;
+  const half = req.query.half === "2" ? 2 : 1;
   const me = (await query(
     `SELECT full_name, display_name, name_prefix, employee_no, branch, department, section FROM users WHERE id=@userId`,
     { userId: req.user.id }
@@ -245,9 +247,9 @@ router.get("/export-mbo.xlsx", asyncHandler(async (req, res) => {
        AND section_id=@sectionId
        AND incharge_user_id=@userId
        AND status NOT IN ('DRAFT','REJECTED','CANCELLED')
-       AND (@from IS NULL OR planned_end IS NULL OR planned_end >= @from)
-       AND (@to IS NULL OR planned_start IS NULL OR planned_start <= @to)
-     ORDER BY planned_start, created_at`,
+       AND (@from IS NULL OR (planned_end IS NOT NULL AND planned_end >= @from))
+       AND (@to IS NULL OR (planned_end IS NOT NULL AND planned_end <= @to))
+     ORDER BY planned_end, created_at`,
     { sectionId: req.section.id, userId: req.user.id, from: from || null, to: to || null }
   )).recordset;
   for (const r of requests) {
@@ -265,10 +267,11 @@ router.get("/export-mbo.xlsx", asyncHandler(async (req, res) => {
     branch: me.branch,
     department: me.department,
     section: me.section,
-    requests
+    requests,
+    half
   });
   res.header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-  res.attachment("mbo-form.xlsx").send(buffer);
+  res.attachment(`MBO ${half === 2 ? "2nd" : "1st"} Half.xlsx`).send(buffer);
 }));
 
 module.exports = router;

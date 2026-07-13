@@ -20,6 +20,14 @@ const FACTORS_SELF_CELLS = ["K24", "AC24"];
 // rows are these.
 const PART1_ROWS = [32, 38, 44, 50, 56, 62, 68];
 const PART1_TOTAL_WEIGHT = 0.6; // form rule: Part 1 weights must sum to 60%
+// Each goal row carries two side-by-side assessment blocks: the "1st-Half
+// Assessment for Mid-Year Bonus" starting at column F and the "2nd-Half
+// Assessment for Year-End Bonus" starting at column Z (+20 columns). The Goal
+// title stays in the shared column B; only these per-half fields move.
+const HALF_COLUMNS = {
+  1: { actionPlan: "F", startEnd: "I", weight: "P", selfAssess: "Q" },
+  2: { actionPlan: "Z", startEnd: "AC", weight: "AJ", selfAssess: "AK" },
+};
 
 function xmlEscape(value) {
   return String(value)
@@ -98,10 +106,13 @@ function fillIdentity(xml, { fullName, employeeCell, branch, division, nameCell,
 
 // requests: [{ title, planned_start, planned_end, todos: [title, …] }, …]
 // (KPI-flagged, already ordered; at most PART1_ROWS.length entries are used).
-function buildMboWorkbook({ fullName, employeeNo, branch, department, section, requests }) {
+// half: 1 → fill the Mid-Year (1st-half) assessment columns, 2 → the Year-End
+// (2nd-half) columns.
+function buildMboWorkbook({ fullName, employeeNo, branch, department, section, requests, half }) {
   const zip = templateZip();
   const goals = requests.slice(0, PART1_ROWS.length);
   const division = divisionLabel(department, section);
+  const cols = HALF_COLUMNS[half] || HALF_COLUMNS[1];
 
   // Equal weight per KPI goal summing to exactly 60% (last slot absorbs the
   // rounding remainder). Computed in 0.01% units to dodge float noise.
@@ -129,11 +140,11 @@ function buildMboWorkbook({ fullName, employeeNo, branch, department, section, r
     const actionPlan = req.todos.length
       ? req.todos.map((t, idx) => `${idx + 1}.${t}`).join("\n")
       : null;
-    mbo = setCell(mbo, `B${row}`, req.title); // Goal
-    mbo = setCell(mbo, `F${row}`, actionPlan); // Action Plan
-    mbo = setCell(mbo, `I${row}`, periodLabel(req.planned_start, req.planned_end)); // Start-End
-    mbo = setCell(mbo, `P${row}`, i === n - 1 ? lastWeight : baseWeight); // Weight
-    mbo = setCell(mbo, `Q${row}`, 5); // Self-Assessment score
+    mbo = setCell(mbo, `B${row}`, req.title); // Goal (shared column)
+    mbo = setCell(mbo, `${cols.actionPlan}${row}`, actionPlan); // Action Plan
+    mbo = setCell(mbo, `${cols.startEnd}${row}`, periodLabel(req.planned_start, req.planned_end)); // Start-End
+    mbo = setCell(mbo, `${cols.weight}${row}`, i === n - 1 ? lastWeight : baseWeight); // Weight
+    mbo = setCell(mbo, `${cols.selfAssess}${row}`, 5); // Self-Assessment score
   });
   zip.updateFile(MBO_SHEET, Buffer.from(mbo, "utf8"));
 
