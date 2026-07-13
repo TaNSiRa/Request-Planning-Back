@@ -8,6 +8,7 @@ const { requireAdmin, requireSectionAdmin, resolveSection, isAdmin } = require("
 const { verifyMail, isMailConfigured, sendMail } = require("../../services/mailService");
 const { normalizeMaxAttachments, getUserDisplayOrder } = require("../../services/settingsService");
 const { verifyHoliday } = require("../../db/holidayPool");
+const { emitSystem } = require("../../services/realtimeService");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -196,6 +197,7 @@ router.put("/meeting-group-order", asyncHandler(async (req, res) => {
       value: JSON.stringify(input.order)
     }
   );
+  emitSystem("settings.updated", { sectionId: req.section.id, key: "meeting.groupOrder" });
   res.json({ ok: true });
 }));
 
@@ -224,6 +226,7 @@ router.put("/user-order", asyncHandler(async (req, res) => {
       value: JSON.stringify(input.order)
     }
   );
+  emitSystem("settings.updated", { sectionId: req.section.id, key: "users.displayOrder" });
   res.json({ ok: true });
 }));
 
@@ -243,6 +246,7 @@ router.put("/:key", requireSectionAdmin, audit("EDIT", "SETTING", req => req.par
        VALUES (@sectionId, @key, @value, @valueType, @isPublic);`,
     { sectionId, key: req.params.key, value: input.value, valueType: input.valueType, isPublic: input.isPublic }
   );
+  emitSystem("settings.updated", { sectionId, key: req.params.key });
   res.json({ ok: true });
 }));
 
@@ -281,6 +285,7 @@ router.post("/approval-routes", requireSectionAdmin, audit("CREATE", "APPROVAL_R
   );
   const routeId = result.recordset[0].id;
   await replaceRouteSteps(routeId, input.steps);
+  emitSystem("settings.updated", { sectionId: req.section.id, key: "approvalRoutes" });
   res.status(201).json({ id: routeId });
 }));
 
@@ -308,6 +313,7 @@ router.put("/approval-routes/:routeId", requireSectionAdmin, audit("EDIT", "APPR
     }
   );
   await replaceRouteSteps(routeId, input.steps);
+  emitSystem("settings.updated", { sectionId: req.section.id, key: "approvalRoutes" });
   res.json({ ok: true });
 }));
 
@@ -332,6 +338,7 @@ router.delete("/approval-routes/:routeId", requireSectionAdmin, audit("DELETE", 
     routeId,
     sectionId: req.section.id
   });
+  emitSystem("settings.updated", { sectionId: req.section.id, key: "approvalRoutes" });
   res.json({ ok: true });
 }));
 
