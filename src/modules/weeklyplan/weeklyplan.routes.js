@@ -6,6 +6,7 @@ const { requireAuth } = require("../../middleware/auth");
 const { resolveSection, requireSectionAdmin } = require("../../services/sectionService");
 const { getUserDisplayOrder, sortUsersByDisplayOrder } = require("../../services/settingsService");
 const { getHolidayDates } = require("../../db/holidayPool");
+const { emitSystem } = require("../../services/realtimeService");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -172,6 +173,7 @@ router.put("/", asyncHandler(async (req, res) => {
     throw err;
   }
 
+  emitSystem("weeklyplan.updated", { sectionId: req.section.id, weekStart: input.weekStart });
   res.json({ ok: true });
 }));
 
@@ -223,6 +225,7 @@ router.put("/default-cars", requireSectionAdmin, asyncHandler(async (req, res) =
     await tx.rollback();
     throw err;
   }
+  emitSystem("weeklyplan.updated", { sectionId: req.section.id });
   res.json({ ok: true });
 }));
 
@@ -310,6 +313,7 @@ router.put("/default-user-values", requireSectionAdmin, asyncHandler(async (req,
     await tx.rollback();
     throw err;
   }
+  emitSystem("weeklyplan.updated", { sectionId: req.section.id });
   res.json({ ok: true });
 }));
 

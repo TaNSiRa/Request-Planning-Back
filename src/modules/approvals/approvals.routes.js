@@ -15,6 +15,7 @@ const {
 } = require("../../services/emailTemplates");
 const { emitSystem } = require("../../services/realtimeService");
 const { isAdmin, resolveSection, getSectionName } = require("../../services/sectionService");
+const { loadSupportsMap, applySupports, setSupports } = require("../../services/supportService");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -45,6 +46,7 @@ router.get("/pending", asyncHandler(async (req, res) => {
      ORDER BY r.created_at`,
     { userId: req.user.id, sectionId: req.section.id, isAdmin: isAdmin(req.user) ? 1 : 0 }
   );
+  const supportsMap = await loadSupportsMap(result.recordset.map(row => row.request_id));
   const rows = [];
   for (const row of result.recordset) {
     const supTypes = (await query(
@@ -56,7 +58,10 @@ router.get("/pending", asyncHandler(async (req, res) => {
       levelId: r.level_id,
       levelName: r.level_name
     }));
-    rows.push({ ...row, attachments: await getAttachments(row.request_id), supTypes });
+    rows.push(applySupports(
+      { ...row, attachments: await getAttachments(row.request_id), supTypes },
+      supportsMap.get(row.request_id) || []
+    ));
   }
   res.json({ data: rows });
 }));
@@ -86,7 +91,9 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
   const schema = z.object({
     comment: z.string().optional().nullable(),
     inchargeUserId: z.number().int().optional().nullable(),
+    // Legacy single support (older clients) — superseded by supportUserIds.
     supportUserId: z.number().int().optional().nullable(),
+    supportUserIds: z.array(z.number().int()).optional().nullable(),
     plannedStart: z.string().optional().nullable(),
     plannedEnd: z.string().optional().nullable(),
     isKpi: z.boolean().optional().nullable(),
@@ -105,10 +112,15 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
   });
   const input = schema.parse(req.body);
   const normalizedSupTypes = normalizeSupTypes(input.supTypes);
+  // Multiple supports: prefer the new array, fall back to the legacy single id.
+  // The incharge never doubles as their own support.
+  const supportUserIds = [...new Set(
+    (input.supportUserIds ?? (input.supportUserId != null ? [input.supportUserId] : []))
+      .filter(id => Number.isInteger(id) && id !== input.inchargeUserId)
+  )];
   const values = {
     comment: input.comment ?? null,
     inchargeUserId: input.inchargeUserId ?? null,
-    supportUserId: input.supportUserId ?? null,
     plannedStart: input.plannedStart ?? null,
     plannedEnd: input.plannedEnd ?? null,
     isKpi: input.isKpi ?? true
@@ -136,7 +148,7 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
     // together — one may fill the gaps the other leaves.
     const required = normalizedSupTypes.filter(s => s.itemId && s.levelId);
     if (required.length) {
-      const skill = await evaluateSkillSufficiency(required, values.inchargeUserId, values.supportUserId);
+      const skill = await evaluateSkillSufficiency(required, values.inchargeUserId, supportUserIds);
       if (!skill.combinedOk) {
         return res.status(400).json({ message: "INCHARGE_SKILL_INSUFFICIENT" });
       }
@@ -151,10 +163,12 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
 
   if (canAssign) {
     await query(
-      `UPDATE requests SET incharge_user_id=@inchargeUserId, support_user_id=@supportUserId, planned_start=@plannedStart, planned_end=@plannedEnd, is_kpi=@isKpi,
+      `UPDATE requests SET incharge_user_id=@inchargeUserId, planned_start=@plannedStart, planned_end=@plannedEnd, is_kpi=@isKpi,
        status='PENDING_APPROVAL', updated_at=SYSUTCDATETIME() WHERE id=@requestId`,
       { ...values, requestId: step.request_id }
     );
+    // Multi-support list (also mirrors the first into the legacy column).
+    await setSupports(step.request_id, supportUserIds);
     // Replace the request's support-type tags with the approver's selection.
     await query("DELETE FROM request_support_types WHERE request_id=@requestId", { requestId: step.request_id });
     for (const st of normalizedSupTypes) {
@@ -187,6 +201,9 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
     if (mail && next.email) {
       await sendMail({ to: next.email, subject: mail.subject, html: mail.html, text: mail.text, requestId: step.request_id, type: mail.type });
     }
+    // Mid-chain approval — the step moved (and assignment may have changed);
+    // let every open client refresh their inbox/list live.
+    emitSystem("request.updated", { id: step.request_id, status: "PENDING_APPROVAL" });
   } else {
     if (isCloseApproval) {
       await query("UPDATE requests SET status='COMPLETED', closed_by=@userId, closed_at=SYSUTCDATETIME(), updated_at=SYSUTCDATETIME() WHERE id=@id", {
@@ -281,6 +298,7 @@ router.post("/extension/:extensionId/approve", audit("APPROVE", "EXTENSION_REQUE
     if (mail && next.email) {
       await sendMail({ to: next.email, subject: mail.subject, html: mail.html, text: mail.text, requestId: step.request_id, type: mail.type });
     }
+    emitSystem("request.updated", { id: step.request_id, part: "extension" });
   } else {
     // The end date moved — clear the one-shot overdue stamp so the end-date
     // reminder job can warn again if the NEW end date is missed too.
@@ -327,6 +345,7 @@ router.post("/extension/:extensionId/reject", audit("REJECT", "EXTENSION_REQUEST
   // Notify (in-app + email) the incharge who requested the change AND the request
   // creator, so both know the project period stays as-is.
   await notifyExtensionParticipants(step.extension_id, step.request_id, "REJECTED");
+  emitSystem("request.updated", { id: step.request_id, part: "extension" });
   res.json({ ok: true });
 }));
 
@@ -427,10 +446,12 @@ function normalizeSupTypes(raw) {
 // A person is "sufficient" when, for every required (itemId, levelId), they hold
 // that skill at a rank (level sort_order) >= the required rank. Missing skill or
 // a lower level = insufficient. Used to gate assignment on the server.
-async function evaluateSkillSufficiency(required, inchargeUserId, supportUserId) {
+// supportUserIds is the request's full (multi-)support list.
+async function evaluateSkillSufficiency(required, inchargeUserId, supportUserIds) {
+  const supports = (supportUserIds || []).filter(Boolean);
   const levels = (await query("SELECT id, sort_order FROM skill_matrix_levels")).recordset;
   const rank = new Map(levels.map(l => [l.id, l.sort_order]));
-  const userIds = [inchargeUserId, supportUserId].filter(Boolean);
+  const userIds = [inchargeUserId, ...supports].filter(Boolean);
   const skillRows = userIds.length
     ? (await query(
       `SELECT user_id, item_id, level_id FROM user_skill_levels
@@ -461,13 +482,18 @@ async function evaluateSkillSufficiency(required, inchargeUserId, supportUserId)
     return true;
   };
   // Combined coverage: each required skill may be satisfied by the incharge OR
-  // the support — their skills are pooled, not judged one person at a time.
+  // any support — their skills are pooled, not judged one person at a time.
   const combinedOk = required.every(req => {
     const needRank = rank.get(req.levelId);
     if (needRank == null) return false;
-    return Math.max(rankOf(inchargeUserId, req.itemId), rankOf(supportUserId, req.itemId)) >= needRank;
+    const best = Math.max(rankOf(inchargeUserId, req.itemId), ...supports.map(id => rankOf(id, req.itemId)), -1);
+    return best >= needRank;
   });
-  return { inchargeOk: isSufficient(inchargeUserId), supportOk: isSufficient(supportUserId), combinedOk };
+  return {
+    inchargeOk: isSufficient(inchargeUserId),
+    supportOk: supports.some(isSufficient),
+    combinedOk
+  };
 }
 
 async function getAttachments(requestId) {

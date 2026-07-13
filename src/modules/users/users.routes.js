@@ -8,6 +8,7 @@ const { requireAuth } = require("../../middleware/auth");
 const { audit } = require("../../middleware/audit");
 const { requireSectionAdmin, resolveSection, isAdmin, canManageTargetRole } = require("../../services/sectionService");
 const { getUserDisplayOrder, sortUsersByDisplayOrder } = require("../../services/settingsService");
+const { emitSystem } = require("../../services/realtimeService");
 
 const router = express.Router();
 
@@ -155,6 +156,7 @@ router.post("/", requireSectionAdmin, audit("CREATE", "USER", req => req.body.em
   );
   const userId = result.recordset[0].id;
   await applyMembershipsForActor(req, userId, input);
+  emitSystem("users.updated", { id: userId });
   res.status(201).json({ id: userId });
 }));
 
@@ -205,6 +207,7 @@ router.patch("/:id(\\d+)", requireSectionAdmin, audit("EDIT", "USER", req => req
     }
   );
   await applyMembershipsForActor(req, Number(req.params.id), input);
+  emitSystem("users.updated", { id: Number(req.params.id) });
   res.json({ ok: true });
 }));
 
@@ -265,6 +268,7 @@ router.patch("/me", audit("EDIT_PROFILE", "USER", req => req.user.id), asyncHand
      WHERE id=@id`,
     { ...values, id: req.user.id }
   );
+  emitSystem("users.updated", { id: req.user.id });
   res.json({ ok: true });
 }));
 

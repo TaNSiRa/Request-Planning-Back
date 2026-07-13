@@ -11,6 +11,7 @@ const { emitSystem } = require("../../services/realtimeService");
 const { storeDataUrlAttachment, readAttachmentAsDataUrl, deleteStoredAttachment } = require("../../services/attachmentStorage");
 const { isAdmin, resolveSection } = require("../../services/sectionService");
 const { getMaxAttachments, MAX_ATTACHMENTS_CEILING } = require("../../services/settingsService");
+const { loadSupportsMap, getSupports, applySupports, isSupportUser } = require("../../services/supportService");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -86,6 +87,9 @@ router.get("/", asyncHandler(async (req, res) => {
     const { todos_json, ...rest } = row;
     return { ...rest, todos: todos_json ? JSON.parse(todos_json) : [] };
   });
+  // Attach every request's full support list (multi-support) in one query.
+  const supportsMap = await loadSupportsMap(rows.map(row => row.id));
+  for (const row of rows) applySupports(row, supportsMap.get(row.id) || []);
   res.json({ data: rows });
 }));
 
@@ -148,6 +152,7 @@ router.get("/:id", asyncHandler(async (req, res) => {
     levelId: r.level_id,
     levelName: r.level_name
   }));
+  applySupports(request, await getSupports(id));
   res.json({ data: { ...request, todos, approvals, attachments, extensionHistory, supTypes } });
 }));
 
@@ -166,6 +171,8 @@ router.get("/:id/export.txt", asyncHandler(async (req, res) => {
     { id, sectionId: req.section.id }
   )).recordset[0];
   if (!detail) return res.status(404).send("Request not found");
+  // Show every support (multi-support) in the exported Support line.
+  applySupports(detail, await getSupports(id));
   // View-only export: allowed for any member of the request's section.
   const todos = (await query("SELECT * FROM request_todos WHERE request_id=@id ORDER BY sort_order, id", { id })).recordset;
   const todoAttachments = await getTodoAttachments(id);
@@ -315,6 +322,7 @@ router.post("/:id/todos", audit("CREATE", "TODO"), asyncHandler(async (req, res)
   );
   const todoId = result.recordset[0].id;
   await saveTodoAttachments(Number(req.params.id), todoId, attachments, maxAttachments);
+  emitSystem("request.updated", { id: Number(req.params.id), part: "todos" });
   res.status(201).json({ id: todoId });
 }));
 
@@ -368,6 +376,7 @@ router.patch("/:id/todos/:todoId", audit("EDIT", "TODO", req => req.params.todoI
   if (before && !wasDone && input.isDone && importantNow) {
     await notifyImportantTodoDone(Number(req.params.id), Number(req.params.todoId), req.user);
   }
+  emitSystem("request.updated", { id: Number(req.params.id), part: "todos" });
   res.json({ ok: true });
 }));
 
@@ -380,6 +389,7 @@ router.delete("/:id/todos/:todoId", audit("DELETE", "TODO", req => req.params.to
     todoId: Number(req.params.todoId),
     id: Number(req.params.id)
   });
+  emitSystem("request.updated", { id: Number(req.params.id), part: "todos" });
   res.json({ ok: true });
 }));
 
@@ -463,6 +473,7 @@ router.post("/:id/extension-requests", audit("CREATE", "EXTENSION_REQUEST"), asy
   );
   await createExtensionApprovalSteps(result.recordset[0].id, req.section.id, request.request_type);
   await notifyFirstExtensionApprover(requestId, result.recordset[0].id);
+  emitSystem("request.updated", { id: requestId, part: "extension" });
   res.status(201).json({ id: result.recordset[0].id });
 }));
 
@@ -1052,7 +1063,9 @@ async function assertCanManageRequestWork(requestId, user, sectionAccess, sectio
     request.support_user_id === user.id ||
     // Meeting mode lets any section member collaborate on todos. The request is
     // already scoped to the caller's section by the query above.
-    options.allowSectionMember === true;
+    options.allowSectionMember === true ||
+    // Any of the request's (multiple) supports may manage work items too.
+    (await isSupportUser(requestId, user.id));
   if (!canManage) {
     const err = new Error("Only assigned incharge/support can update work items");
     err.status = 403;

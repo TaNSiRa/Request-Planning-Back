@@ -3,6 +3,7 @@ const { sql, getPool, query } = require("../../db/pool");
 const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
 const { requireSectionManager, resolveSection } = require("../../services/sectionService");
+const { emitSystem } = require("../../services/realtimeService");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -97,6 +98,7 @@ async function setSkillLevel(userId, body, res, sectionId) {
       { userId, itemId, levelId }
     );
   }
+  emitSystem("skillmatrix.updated", { userId, itemId });
   res.json({ ok: true });
 }
 
@@ -280,6 +282,7 @@ router.put("/", resolveSection, requireSectionManager, asyncHandler(async (req, 
     throw err;
   }
 
+  emitSystem("skillmatrix.updated", { sectionId });
   res.json(await loadMatrix(sectionId));
 }));
 

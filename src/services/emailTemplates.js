@@ -11,6 +11,7 @@
 
 const { query } = require("../db/pool");
 const { env } = require("../config/env");
+const { getSupports } = require("./supportService");
 
 // ---------------------------------------------------------------------------
 // Palette (kept in sync with the app design tokens in shared/design.dart)
@@ -134,6 +135,9 @@ async function loadRequestContext(requestId) {
   )).recordset[0];
   if (!detail) return null;
   detail.attachments = await loadAttachments(requestId);
+  // Multi-support: show every support (comma-joined) in email detail rows.
+  const supports = await getSupports(requestId);
+  if (supports.length) detail.support_name = supports.map(s => s.name).join(", ");
   return detail;
 }
 
