@@ -293,6 +293,38 @@ router.patch("/:id/cancel", audit("CANCEL", "REQUEST"), asyncHandler(async (req,
   res.json({ ok: true });
 }));
 
+// Flip the KPI flag straight from the request-detail page. Until now is_kpi
+// could only be set by the assigning approver at approve-time; this lets it be
+// corrected afterwards. Only a system admin, or an approver on this request's
+// route, may change it — and only once the request has been assigned (a planned
+// period exists), since KPI is meaningless before assignment.
+router.patch("/:id/kpi", audit("EDIT", "REQUEST", req => req.params.id), asyncHandler(async (req, res) => {
+  const id = Number(req.params.id);
+  const { isKpi } = z.object({ isKpi: z.boolean() }).parse(req.body);
+  const row = (await query(
+    "SELECT * FROM requests WHERE id=@id AND (section_id=@sectionId OR requester_section_id=@sectionId)",
+    { id, sectionId: req.section.id }
+  )).recordset[0];
+  if (!row) return res.status(404).json({ message: "Request not found" });
+  if (!row.planned_start) {
+    return res.status(400).json({ message: "Request must be assigned before KPI can be set" });
+  }
+  let allowed = isAdmin(req.user);
+  if (!allowed) {
+    const step = (await query(
+      "SELECT TOP 1 id FROM approval_steps WHERE request_id=@id AND approver_user_id=@userId",
+      { id, userId: req.user.id }
+    )).recordset[0];
+    allowed = !!step;
+  }
+  if (!allowed) {
+    return res.status(403).json({ message: "Only a system admin or an approver can change KPI" });
+  }
+  await query("UPDATE requests SET is_kpi=@isKpi, updated_at=SYSUTCDATETIME() WHERE id=@id", { id, isKpi });
+  emitSystem("request.updated", { id, isKpi });
+  res.json({ ok: true });
+}));
+
 router.post("/:id/todos", audit("CREATE", "TODO"), asyncHandler(async (req, res) => {
   const schema = z.object({
     title: z.string().trim().min(1),
