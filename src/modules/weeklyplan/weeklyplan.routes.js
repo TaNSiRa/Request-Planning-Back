@@ -72,22 +72,35 @@ router.get("/", asyncHandler(async (req, res) => {
     }
   }
 
-  // Defaults (cars + per-user values) only seed the *current* week while it is
-  // still empty (never saved). Past/future weeks stay blank until saved.
-  if (weekStart === currentMonday() && saved.length === 0) {
-    const defCars = (await query(
-      "SELECT label, plate FROM weekly_plan_default_cars WHERE section_id = @sectionId ORDER BY sort_order, id",
-      { sectionId: req.section.id }
-    )).recordset;
-    for (const d of defCars) {
-      cars.push({ id: null, label: d.label ?? "", plate: d.plate ?? "", cells: DAYS.map(() => "") });
+  // Defaults seed the *current* week only; past/future weeks stay blank until
+  // saved. Seeding MERGES at the cell level rather than all-or-nothing: any cell
+  // the user already filled is kept, and only the still-blank cells receive the
+  // per-user default. This way pre-entering part of a week ahead of time no
+  // longer forfeits the defaults — the blanks are filled once the week is current.
+  if (weekStart === currentMonday()) {
+    // Default car rows are free-form template rows, so they are only seeded when
+    // the week has no saved car rows yet (merging them would risk duplicates).
+    if (cars.length === 0) {
+      const defCars = (await query(
+        "SELECT label, plate FROM weekly_plan_default_cars WHERE section_id = @sectionId ORDER BY sort_order, id",
+        { sectionId: req.section.id }
+      )).recordset;
+      for (const d of defCars) {
+        cars.push({ id: null, label: d.label ?? "", plate: d.plate ?? "", cells: DAYS.map(() => "") });
+      }
     }
     // Company holidays override defaults: nobody visits customers on a holiday,
     // so those days stay blank ("–") instead of the seeded value. Plain Sat/Sun
     // defaults are honoured — setting one there is an explicit choice.
     const holidayIdx = await holidayDayIndexes(weekStart);
-    for (const [uid, cells] of (await loadDefaultUserValues(req.section.id))) {
-      userRowById.set(uid, cells.map((v, i) => (holidayIdx.has(i) ? "" : v)));
+    for (const [uid, defCells] of (await loadDefaultUserValues(req.section.id))) {
+      const existing = userRowById.get(uid);
+      const merged = DAYS.map((_, i) => {
+        const cur = existing ? existing[i] : "";
+        if (cur && cur.trim()) return cur; // keep what the user already entered
+        return holidayIdx.has(i) ? "" : (defCells[i] ?? ""); // fill blanks with default
+      });
+      userRowById.set(uid, merged);
     }
   }
 
