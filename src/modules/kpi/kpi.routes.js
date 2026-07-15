@@ -199,7 +199,29 @@ router.get("/skill-matrix-workload", asyncHandler(async (req, res) => {
        GROUP BY usl.item_id, usl.level_id`,
       { sectionId: req.section.id }
     )).recordset;
-    res.json({ workload, capacity });
+    // Per-cell breakdowns for the hover tooltip: which requests make up the
+    // workload count, and which people hold the skill at that level.
+    const workloadDetail = (await query(
+      `SELECT st.item_id AS itemId, st.level_id AS levelId,
+              r.request_no, r.title, r.status
+       FROM request_support_types st
+       JOIN requests r ON r.id = st.request_id
+       WHERE st.item_id IS NOT NULL AND st.level_id IS NOT NULL
+         AND r.section_id=@sectionId
+         AND ((@mine=1 AND r.incharge_user_id=@userId) OR (@mine=0 AND (@requesterOrgSection IS NULL OR r.requester_user_id IN (SELECT id FROM users WHERE section=@requesterOrgSection))))
+       ORDER BY r.created_at DESC`,
+      { mine, userId: req.user.id, requesterOrgSection, sectionId: req.section.id }
+    )).recordset;
+    const capacityDetail = (await query(
+      `SELECT usl.item_id AS itemId, usl.level_id AS levelId, u.display_name AS name
+       FROM user_skill_levels usl
+       JOIN user_section_memberships m ON m.user_id = usl.user_id
+         AND m.section_id=@sectionId AND m.is_active=1 AND m.can_work=1
+       JOIN users u ON u.id = usl.user_id
+       ORDER BY u.display_name`,
+      { sectionId: req.section.id }
+    )).recordset;
+    res.json({ workload, capacity, workloadDetail, capacityDetail });
   } catch (err) {
     const msg = `${err.message}`;
     if (msg.includes("Invalid object name") || msg.includes("Invalid column name")) {

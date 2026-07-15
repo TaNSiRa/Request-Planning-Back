@@ -12,6 +12,15 @@ const { storeDataUrlAttachment, readAttachmentAsDataUrl, deleteStoredAttachment 
 const { isAdmin, resolveSection } = require("../../services/sectionService");
 const { getMaxAttachments, MAX_ATTACHMENTS_CEILING } = require("../../services/settingsService");
 const { loadSupportsMap, getSupports, applySupports, isSupportUser } = require("../../services/supportService");
+const {
+  approvalStepUserCondition,
+  routeStepApproverIds,
+  saveStepApprovers,
+  saveExtensionStepApprovers,
+  stepCandidates,
+  extensionStepCandidates,
+  requestStepCandidateMap
+} = require("../../services/approverService");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -144,6 +153,17 @@ router.get("/:id", asyncHandler(async (req, res) => {
      WHERE a.request_id=@id ORDER BY sequence_no`,
     { id }
   )).recordset;
+  // Co-approvers: expose each step's full candidate list, and show all names on
+  // steps that are still undecided ("A or B"); decided steps keep the actor.
+  const candidateMap = await requestStepCandidateMap(id);
+  for (const step of approvals) {
+    const candidates = candidateMap.get(step.id) || [];
+    step.candidate_ids = candidates.map(c => c.id);
+    step.candidate_names = candidates.map(c => c.name);
+    if (candidates.length > 1 && (step.status === "PENDING" || step.status === "WAITING")) {
+      step.approver_name = candidates.map(c => c.name).join(" / ");
+    }
+  }
   const supTypes = (await query(
     "SELECT sup_type, item_id, level_id, level_name FROM request_support_types WHERE request_id=@id ORDER BY sup_type", { id }
   )).recordset.map(r => ({
@@ -311,8 +331,10 @@ router.patch("/:id/kpi", audit("EDIT", "REQUEST", req => req.params.id), asyncHa
   }
   let allowed = isAdmin(req.user);
   if (!allowed) {
+    // Primary approver or any co-approver on the request's route may flip KPI.
+    const cond = await approvalStepUserCondition("a", "@userId");
     const step = (await query(
-      "SELECT TOP 1 id FROM approval_steps WHERE request_id=@id AND approver_user_id=@userId",
+      `SELECT TOP 1 a.id FROM approval_steps a WHERE a.request_id=@id AND ${cond}`,
       { id, userId: req.user.id }
     )).recordset[0];
     allowed = !!step;
@@ -526,11 +548,22 @@ async function resolveRequesterSection(userSectionText, handlingSectionId) {
 }
 
 async function getRouteSteps(routeId) {
-  return (await query(
-    `SELECT sequence_no, step_name, default_approver_user_id, can_assign_work
+  const steps = (await query(
+    `SELECT id, sequence_no, step_name, default_approver_user_id, can_assign_work
      FROM approval_route_steps WHERE route_id=@routeId ORDER BY sequence_no`,
     { routeId }
   )).recordset;
+  // Attach each step's full candidate list (primary + co-approvers) so the
+  // per-request steps can snapshot it. Falls back to [primary] pre-patch.
+  const approverMap = await routeStepApproverIds(routeId);
+  for (const step of steps) {
+    const list = approverMap.get(step.id) || [];
+    if (step.default_approver_user_id && !list.includes(step.default_approver_user_id)) {
+      list.unshift(step.default_approver_user_id);
+    }
+    step.approver_ids = list;
+  }
+  return steps;
 }
 
 // Stage-1 cross-section route: requests from requesterSectionId executed by targetSectionId.
@@ -571,8 +604,9 @@ async function createApprovalSteps(requestId, targetSectionId, requesterSectionI
 
   let seq = 1;
   for (const { routeId, step } of combined) {
-    await query(
+    const inserted = await query(
       `INSERT INTO approval_steps (request_id, route_id, sequence_no, approver_user_id, step_name, can_assign_work, status)
+       OUTPUT INSERTED.id
        VALUES (@requestId, @routeId, @seq, @approver, @stepName, @canAssign, @status)`,
       {
         requestId,
@@ -584,6 +618,8 @@ async function createApprovalSteps(requestId, targetSectionId, requesterSectionI
         status: seq === 1 ? "PENDING" : "WAITING"
       }
     );
+    // Snapshot the step's co-approver candidates (any of them may act).
+    await saveStepApprovers(inserted.recordset[0].id, step.approver_ids || []);
     seq++;
   }
 }
@@ -600,17 +636,23 @@ async function createCloseApprovalSteps(requestId, sectionId) {
     err.status = 400;
     throw err;
   }
-  await query(
-    `INSERT INTO approval_steps (request_id, route_id, sequence_no, approver_user_id, step_name, can_assign_work, status)
-     SELECT @requestId, ar.id, ars.sequence_no + 100, ars.default_approver_user_id, CONCAT('Close - ', ars.step_name),
-            ars.can_assign_work,
-            CASE WHEN ars.sequence_no = 1 THEN 'PENDING' ELSE 'WAITING' END
-     FROM approval_routes ar
-     JOIN approval_route_steps ars ON ars.route_id = ar.id
-     WHERE ar.id = @routeId
-     ORDER BY ars.sequence_no`,
-    { requestId, routeId: route.id }
-  );
+  for (const step of await getRouteSteps(route.id)) {
+    const inserted = await query(
+      `INSERT INTO approval_steps (request_id, route_id, sequence_no, approver_user_id, step_name, can_assign_work, status)
+       OUTPUT INSERTED.id
+       VALUES (@requestId, @routeId, @seq, @approver, @stepName, @canAssign, @status)`,
+      {
+        requestId,
+        routeId: route.id,
+        seq: step.sequence_no + 100,
+        approver: step.default_approver_user_id,
+        stepName: `Close - ${step.step_name}`,
+        canAssign: step.can_assign_work ? 1 : 0,
+        status: step.sequence_no === 1 ? "PENDING" : "WAITING"
+      }
+    );
+    await saveStepApprovers(inserted.recordset[0].id, step.approver_ids || []);
+  }
 }
 
 // Internal/target routes only (cross-section stage-1 routes are excluded here).
@@ -638,54 +680,64 @@ async function createExtensionApprovalSteps(extensionId, sectionId, requestType)
     err.status = 400;
     throw err;
   }
-  await query(
-    `INSERT INTO schedule_extension_approval_steps (extension_id, route_id, sequence_no, approver_user_id, step_name, status)
-     SELECT @extensionId, ar.id, ars.sequence_no, ars.default_approver_user_id, CONCAT('Extension - ', ars.step_name),
-            CASE WHEN ars.sequence_no = 1 THEN 'PENDING' ELSE 'WAITING' END
-     FROM approval_routes ar
-     JOIN approval_route_steps ars ON ars.route_id = ar.id
-     WHERE ar.id=@routeId
-     ORDER BY ars.sequence_no`,
-    { extensionId, routeId: route.id }
-  );
+  for (const step of await getRouteSteps(route.id)) {
+    const inserted = await query(
+      `INSERT INTO schedule_extension_approval_steps (extension_id, route_id, sequence_no, approver_user_id, step_name, status)
+       OUTPUT INSERTED.id
+       VALUES (@extensionId, @routeId, @seq, @approver, @stepName, @status)`,
+      {
+        extensionId,
+        routeId: route.id,
+        seq: step.sequence_no,
+        approver: step.default_approver_user_id,
+        stepName: `Extension - ${step.step_name}`,
+        status: step.sequence_no === 1 ? "PENDING" : "WAITING"
+      }
+    );
+    await saveExtensionStepApprovers(inserted.recordset[0].id, step.approver_ids || []);
+  }
 }
 
 async function notifyFirstApprover(requestId, requestNo) {
-  const approver = (await query(
-    `SELECT TOP 1 u.id, u.email, u.display_name FROM approval_steps a
-     JOIN users u ON u.id = a.approver_user_id WHERE a.request_id=@requestId AND a.sequence_no=1`,
+  const step = (await query(
+    "SELECT TOP 1 id FROM approval_steps WHERE request_id=@requestId AND sequence_no=1",
     { requestId }
   )).recordset[0];
-  if (!approver) return;
-  await notify({ userId: approver.id, requestId, type: "APPROVAL", title: "New request needs approval", body: requestNo });
-  const mail = await buildApproverEmail(requestId, { greetingName: approver.display_name, kind: "REQUEST" });
-  if (mail && approver.email) {
-    await sendMail({ to: approver.email, subject: mail.subject, html: mail.html, text: mail.text, requestId, type: mail.type });
+  if (!step) return;
+  // Every candidate on the step (primary + co-approvers) gets notified —
+  // whoever acts first decides for the step.
+  for (const approver of await stepCandidates(step.id)) {
+    await notify({ userId: approver.id, requestId, type: "APPROVAL", title: "New request needs approval", body: requestNo });
+    const mail = await buildApproverEmail(requestId, { greetingName: approver.display_name, kind: "REQUEST" });
+    if (mail && approver.email) {
+      await sendMail({ to: approver.email, subject: mail.subject, html: mail.html, text: mail.text, requestId, type: mail.type });
+    }
   }
 }
 
 async function notifyFirstExtensionApprover(requestId, extensionId) {
   const row = (await query(
-    `SELECT TOP 1 u.id, u.email, u.display_name, r.request_no
+    `SELECT TOP 1 a.id AS step_id, r.request_no
      FROM schedule_extension_approval_steps a
      JOIN schedule_extension_requests e ON e.id = a.extension_id
      JOIN requests r ON r.id = e.request_id
-     JOIN users u ON u.id = a.approver_user_id
      WHERE e.id=@extensionId AND e.request_id=@requestId AND a.status='PENDING'
      ORDER BY a.sequence_no`,
     { requestId, extensionId }
   )).recordset[0];
   if (!row) return;
-  await notify({
-    userId: row.id,
-    requestId,
-    type: "EXTENSION",
-    title: "Schedule extension needs approval",
-    body: `${row.request_no} extension #${extensionId}`
-  });
-  const mail = await buildExtensionApproverEmail(extensionId, { greetingName: row.display_name });
-  if (mail && row.email) {
-    await sendMail({ to: row.email, subject: mail.subject, html: mail.html, text: mail.text, requestId, type: mail.type });
+  for (const approver of await extensionStepCandidates(row.step_id)) {
+    await notify({
+      userId: approver.id,
+      requestId,
+      type: "EXTENSION",
+      title: "Schedule extension needs approval",
+      body: `${row.request_no} extension #${extensionId}`
+    });
+    const mail = await buildExtensionApproverEmail(extensionId, { greetingName: approver.display_name });
+    if (mail && approver.email) {
+      await sendMail({ to: approver.email, subject: mail.subject, html: mail.html, text: mail.text, requestId, type: mail.type });
+    }
   }
 }
 
@@ -945,25 +997,26 @@ async function generateRequestNumber(sectionId, requestPrefix = "AR") {
 
 async function notifyFirstCloseApprover(requestId) {
   const row = (await query(
-    `SELECT TOP 1 u.id, u.email, u.display_name, r.request_no
+    `SELECT TOP 1 a.id AS step_id, r.request_no
      FROM approval_steps a
-     JOIN users u ON u.id = a.approver_user_id
      JOIN requests r ON r.id = a.request_id
      WHERE a.request_id=@requestId AND a.sequence_no >= 100 AND a.status='PENDING'
      ORDER BY a.sequence_no`,
     { requestId }
   )).recordset[0];
   if (!row) return;
-  await notify({
-    userId: row.id,
-    requestId,
-    type: "CLOSE",
-    title: "Work complete needs close approval",
-    body: row.request_no
-  });
-  const mail = await buildApproverEmail(requestId, { greetingName: row.display_name, kind: "CLOSE" });
-  if (mail && row.email) {
-    await sendMail({ to: row.email, subject: mail.subject, html: mail.html, text: mail.text, requestId, type: mail.type });
+  for (const approver of await stepCandidates(row.step_id)) {
+    await notify({
+      userId: approver.id,
+      requestId,
+      type: "CLOSE",
+      title: "Work complete needs close approval",
+      body: row.request_no
+    });
+    const mail = await buildApproverEmail(requestId, { greetingName: approver.display_name, kind: "CLOSE" });
+    if (mail && approver.email) {
+      await sendMail({ to: approver.email, subject: mail.subject, html: mail.html, text: mail.text, requestId, type: mail.type });
+    }
   }
 }
 
@@ -988,6 +1041,10 @@ async function notifyImportantTodoDone(requestId, todoId, completedBy) {
     "SELECT DISTINCT approver_user_id FROM approval_steps WHERE request_id=@requestId AND approver_user_id IS NOT NULL",
     { requestId }
   )).recordset.map(r => r.approver_user_id);
+  // Include co-approvers on every step (any of them may act on the route).
+  for (const list of (await requestStepCandidateMap(requestId)).values()) {
+    for (const c of list) if (!approverIds.includes(c.id)) approverIds.push(c.id);
+  }
   const ids = [...new Set([request.requester_user_id, request.incharge_user_id, ...approverIds].filter(Boolean))];
   for (const userId of ids) {
     const user = (await query(

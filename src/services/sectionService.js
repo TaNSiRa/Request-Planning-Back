@@ -1,4 +1,5 @@
 const { query } = require("../db/pool");
+const { routeStepUserCondition } = require("./approverService");
 
 function normalizeSectionCode(value) {
   return `${value || ""}`.trim().toUpperCase();
@@ -25,6 +26,8 @@ function canManageTargetRole(actor, targetRoleCode) {
 
 async function getUserSections(user) {
   if (!user?.id) return [];
+  // "Is approver" counts both a step's primary approver and any co-approver.
+  const approverCond = await routeStepUserCondition("ars", "@userId");
   const result = await query(
     `SELECT s.id, s.code, s.name, s.description, s.request_prefix,
             CAST(CASE WHEN @isAdmin = 1 THEN 1 ELSE COALESCE(m.can_request, 0) END AS BIT) AS can_request,
@@ -39,7 +42,7 @@ async function getUserSections(user) {
               JOIN approval_route_steps ars ON ars.route_id = ar.id
               WHERE ar.section_id = s.id
                 AND ar.is_active = 1
-                AND ars.default_approver_user_id = @userId
+                AND ${approverCond}
             ) THEN 1 ELSE 0 END AS BIT) AS is_approver,
             CAST(CASE WHEN EXISTS (
               SELECT 1
@@ -48,7 +51,7 @@ async function getUserSections(user) {
               WHERE ar.section_id = s.id
                 AND ar.is_active = 1
                 AND ar.requester_section_id IS NULL
-                AND ars.default_approver_user_id = @userId
+                AND ${approverCond}
             ) THEN 1 ELSE 0 END AS BIT) AS is_internal_approver
      FROM request_sections s
      LEFT JOIN user_section_memberships m
@@ -81,6 +84,7 @@ async function resolveSection(req, res, next) {
     const code = normalizeSectionCode(req.headers["x-section-code"] || req.query.sectionCode);
     if (!code) return res.status(400).json({ message: "Section is required" });
 
+    const approverCond = await routeStepUserCondition("ars", "@userId");
     const result = await query(
       `SELECT TOP 1 s.id, s.code, s.name, s.description, s.request_prefix,
               m.can_request, m.can_work, m.is_section_admin,
@@ -90,7 +94,7 @@ async function resolveSection(req, res, next) {
                 JOIN approval_route_steps ars ON ars.route_id = ar.id
                 WHERE ar.section_id = s.id
                   AND ar.is_active = 1
-                  AND ars.default_approver_user_id = @userId
+                  AND ${approverCond}
               ) THEN 1 ELSE 0 END AS BIT) AS is_approver,
               CAST(CASE WHEN EXISTS (
                 SELECT 1
@@ -99,7 +103,7 @@ async function resolveSection(req, res, next) {
                 WHERE ar.section_id = s.id
                   AND ar.is_active = 1
                   AND ar.requester_section_id IS NULL
-                  AND ars.default_approver_user_id = @userId
+                  AND ${approverCond}
               ) THEN 1 ELSE 0 END AS BIT) AS is_internal_approver
        FROM request_sections s
        LEFT JOIN user_section_memberships m
