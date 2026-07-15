@@ -281,6 +281,47 @@ router.patch("/me", audit("EDIT_PROFILE", "USER", req => req.user.id), asyncHand
   res.json({ ok: true });
 }));
 
+// Own profile picture — a small square image data URL produced by the Profile
+// page's crop editor. null clears the picture (avatar falls back to initials).
+router.put("/me/avatar", audit("EDIT_AVATAR", "USER", req => req.user.id), asyncHandler(async (req, res) => {
+  const schema = z.object({
+    avatar: z.string()
+      .regex(/^data:image\/(png|jpeg|webp);base64,/, "Avatar must be an image data URL")
+      .max(1_500_000, "Avatar image is too large")
+      .nullable()
+  });
+  const input = schema.parse(req.body);
+  try {
+    await query("UPDATE users SET avatar=@avatar, updated_at=SYSUTCDATETIME() WHERE id=@id", {
+      id: req.user.id,
+      avatar: input.avatar
+    });
+  } catch (err) {
+    if (`${err.message}`.includes("Invalid column name")) {
+      return res.status(400).json({ message: "Profile pictures are not installed yet — run database/patch_user_avatar.sql" });
+    }
+    throw err;
+  }
+  emitSystem("users.updated", { id: req.user.id });
+  res.json({ ok: true });
+}));
+
+// Display-name → picture map for every active user that has one. Feeds the
+// frontend AvatarStore so DsAvatar swaps initials for photos everywhere
+// (same name-keyed pattern as presence). Returns empty until the avatar
+// column exists (patch_user_avatar.sql).
+router.get("/avatars", asyncHandler(async (req, res) => {
+  try {
+    const result = await query(
+      "SELECT display_name, avatar FROM users WHERE is_active=1 AND avatar IS NOT NULL"
+    );
+    res.json({ data: result.recordset.map(r => ({ displayName: r.display_name, avatar: r.avatar })) });
+  } catch (err) {
+    if (`${err.message}`.includes("Invalid column name")) return res.json({ data: [] });
+    throw err;
+  }
+}));
+
 router.patch("/me/password", audit("CHANGE_PASSWORD", "USER", req => req.user.id), asyncHandler(async (req, res) => {
   const schema = z.object({ currentPassword: z.string(), newPassword: z.string().min(1) });
   const input = schema.parse(req.body);

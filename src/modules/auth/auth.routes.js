@@ -204,6 +204,7 @@ function sanitizeUser(user) {
     displayName: user.display_name,
     fullName: user.full_name,
     namePrefix: user.name_prefix,
+    avatar: user.avatar ?? null,
     branch: user.branch,
     department: user.department,
     section: user.section,
