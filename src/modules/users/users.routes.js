@@ -7,6 +7,7 @@ const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
 const { audit } = require("../../middleware/audit");
 const { requireSectionAdmin, resolveSection, isAdmin, canManageTargetRole } = require("../../services/sectionService");
+const { routeStepUserCondition } = require("../../services/approverService");
 const { getUserDisplayOrder, sortUsersByDisplayOrder } = require("../../services/settingsService");
 const { emitSystem } = require("../../services/realtimeService");
 
@@ -19,6 +20,8 @@ router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
   // Global admins see every admin + this section's members. A section admin only
   // manages plain requesters in their own section, so they see just those.
   const fullAdmin = isAdmin(req.user) ? 1 : 0;
+  // "Approver of" badge counts primary approvers AND co-approvers.
+  const approverCond = await routeStepUserCondition("ars", "u.id");
   const result = await query(
     `SELECT u.id, u.employee_no, u.email, u.display_name, u.full_name, u.name_prefix, u.branch, u.department, u.section, u.phone, u.is_active, u.role_id,
             r.code AS role_code, r.name AS role_name,
@@ -31,7 +34,7 @@ router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
                FROM approval_route_steps ars
                JOIN approval_routes ar ON ar.id = ars.route_id AND ar.is_active = 1
                JOIN request_sections s2 ON s2.id = ar.section_id
-               WHERE ars.default_approver_user_id = u.id
+               WHERE ${approverCond}
                FOR JSON PATH) AS approver_sections_json
      FROM users u
      JOIN roles r ON r.id = u.role_id

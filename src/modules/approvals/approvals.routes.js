@@ -16,12 +16,20 @@ const {
 const { emitSystem } = require("../../services/realtimeService");
 const { isAdmin, resolveSection, getSectionName } = require("../../services/sectionService");
 const { loadSupportsMap, applySupports, setSupports } = require("../../services/supportService");
+const {
+  approvalStepUserCondition,
+  extensionStepUserCondition,
+  stepCandidates,
+  extensionStepCandidates
+} = require("../../services/approverService");
 
 const router = express.Router();
 router.use(requireAuth);
 router.use(resolveSection);
 
 router.get("/pending", asyncHandler(async (req, res) => {
+  // A step is "yours" when you're its primary approver OR any co-approver.
+  const userCond = await approvalStepUserCondition("a", "@userId");
   const result = await query(
     `SELECT a.*, r.request_no, r.title, r.priority, r.due_date, r.request_type, r.system_area,
             r.description, r.business_impact, r.is_kpi, r.incharge_user_id, r.support_user_id, r.planned_start, r.planned_end,
@@ -40,7 +48,7 @@ router.get("/pending", asyncHandler(async (req, res) => {
      LEFT JOIN users inc ON inc.id = r.incharge_user_id
      LEFT JOIN users sup ON sup.id = r.support_user_id
      WHERE r.section_id=@sectionId
-       AND (@isAdmin = 1 OR a.approver_user_id=@userId)
+       AND (@isAdmin = 1 OR ${userCond})
        AND a.status='PENDING'
        AND r.status NOT IN ('CANCELLED','REJECTED')
      ORDER BY r.created_at`,
@@ -67,6 +75,7 @@ router.get("/pending", asyncHandler(async (req, res) => {
 }));
 
 router.get("/extensions/pending", asyncHandler(async (req, res) => {
+  const userCond = await extensionStepUserCondition("a", "@userId");
   const result = await query(
     `SELECT a.id AS step_id, a.sequence_no, a.step_name,
             e.*, r.request_no, r.title, requester.display_name AS requester_name, requested_by.display_name AS requested_by_name,
@@ -80,7 +89,7 @@ router.get("/extensions/pending", asyncHandler(async (req, res) => {
      WHERE r.section_id=@sectionId
        AND e.status='PENDING_APPROVAL'
        AND a.status='PENDING'
-       AND (@isAdmin = 1 OR a.approver_user_id=@userId)
+       AND (@isAdmin = 1 OR ${userCond})
      ORDER BY e.created_at`,
     { userId: req.user.id, sectionId: req.section.id, isAdmin: isAdmin(req.user) ? 1 : 0 }
   );
@@ -155,10 +164,12 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
     }
   }
 
+  // Stamp the user who actually decided — with co-approvers any candidate may
+  // act, so the step's approver becomes whoever approved it.
   await query(
-    `UPDATE approval_steps SET status='APPROVED', decision_comment=@comment, decided_at=SYSUTCDATETIME(), updated_at=SYSUTCDATETIME()
+    `UPDATE approval_steps SET status='APPROVED', approver_user_id=@actorId, decision_comment=@comment, decided_at=SYSUTCDATETIME(), updated_at=SYSUTCDATETIME()
      WHERE id=@stepId`,
-    { stepId: Number(req.params.stepId), comment: values.comment }
+    { stepId: Number(req.params.stepId), comment: values.comment, actorId: req.user.id }
   );
 
   if (canAssign) {
@@ -185,8 +196,7 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
   }
 
   const next = (await query(
-    `SELECT TOP 1 a.*, u.email, u.display_name FROM approval_steps a
-     JOIN users u ON u.id = a.approver_user_id
+    `SELECT TOP 1 a.* FROM approval_steps a
      WHERE a.request_id=@requestId AND a.status='WAITING'
        AND ((@isCloseApproval = 1 AND a.sequence_no >= 100) OR (@isCloseApproval = 0 AND a.sequence_no < 100))
      ORDER BY a.sequence_no`,
@@ -196,10 +206,13 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
   if (next) {
     await query("UPDATE approval_steps SET status='PENDING', updated_at=SYSUTCDATETIME() WHERE id=@id", { id: next.id });
     const title = isCloseApproval ? "Close request needs approval" : "Request needs approval";
-    await notify({ userId: next.approver_user_id, requestId: step.request_id, type: "APPROVAL", title, body: step.request_no });
-    const mail = await buildApproverEmail(step.request_id, { greetingName: next.display_name, kind: isCloseApproval ? "CLOSE" : "REQUEST" });
-    if (mail && next.email) {
-      await sendMail({ to: next.email, subject: mail.subject, html: mail.html, text: mail.text, requestId: step.request_id, type: mail.type });
+    // Every candidate on the next step gets pinged; any one of them may act.
+    for (const approver of await stepCandidates(next.id)) {
+      await notify({ userId: approver.id, requestId: step.request_id, type: "APPROVAL", title, body: step.request_no });
+      const mail = await buildApproverEmail(step.request_id, { greetingName: approver.display_name, kind: isCloseApproval ? "CLOSE" : "REQUEST" });
+      if (mail && approver.email) {
+        await sendMail({ to: approver.email, subject: mail.subject, html: mail.html, text: mail.text, requestId: step.request_id, type: mail.type });
+      }
     }
     // Mid-chain approval — the step moved (and assignment may have changed);
     // let every open client refresh their inbox/list live.
@@ -238,9 +251,9 @@ router.post("/:stepId/reject", audit("REJECT", "APPROVAL_STEP", req => req.param
   if (!step) return res.status(404).json({ message: "Approval step not found" });
 
   await query(
-    `UPDATE approval_steps SET status='REJECTED', decision_comment=@comment, decided_at=SYSUTCDATETIME(), updated_at=SYSUTCDATETIME()
+    `UPDATE approval_steps SET status='REJECTED', approver_user_id=@actorId, decision_comment=@comment, decided_at=SYSUTCDATETIME(), updated_at=SYSUTCDATETIME()
      WHERE id=@stepId`,
-    { stepId: Number(req.params.stepId), comment: input.comment }
+    { stepId: Number(req.params.stepId), comment: input.comment, actorId: req.user.id }
   );
   if (step.sequence_no >= 100) {
     await query("UPDATE requests SET status='IN_PROGRESS', reject_reason=@comment, updated_at=SYSUTCDATETIME() WHERE id=@id", {
@@ -273,30 +286,31 @@ router.post("/extension/:extensionId/approve", audit("APPROVE", "EXTENSION_REQUE
   if (!step) return res.status(404).json({ message: "Extension approval step not found" });
   await query(
     `UPDATE schedule_extension_approval_steps
-     SET status='APPROVED', decided_at=SYSUTCDATETIME(), updated_at=SYSUTCDATETIME()
+     SET status='APPROVED', approver_user_id=@actorId, decided_at=SYSUTCDATETIME(), updated_at=SYSUTCDATETIME()
      WHERE id=@stepId`,
-    { stepId: step.id }
+    { stepId: step.id, actorId: req.user.id }
   );
   const next = (await query(
-    `SELECT TOP 1 a.*, u.email, u.display_name
+    `SELECT TOP 1 a.*
      FROM schedule_extension_approval_steps a
-     JOIN users u ON u.id = a.approver_user_id
      WHERE a.extension_id=@extensionId AND a.status='WAITING'
      ORDER BY a.sequence_no`,
     { extensionId: step.extension_id }
   )).recordset[0];
   if (next) {
     await query("UPDATE schedule_extension_approval_steps SET status='PENDING', updated_at=SYSUTCDATETIME() WHERE id=@id", { id: next.id });
-    await notify({
-      userId: next.approver_user_id,
-      requestId: step.request_id,
-      type: "EXTENSION",
-      title: "Schedule extension needs approval",
-      body: `${step.request_no} extension #${step.extension_id}`
-    });
-    const mail = await buildExtensionApproverEmail(step.extension_id, { greetingName: next.display_name });
-    if (mail && next.email) {
-      await sendMail({ to: next.email, subject: mail.subject, html: mail.html, text: mail.text, requestId: step.request_id, type: mail.type });
+    for (const approver of await extensionStepCandidates(next.id)) {
+      await notify({
+        userId: approver.id,
+        requestId: step.request_id,
+        type: "EXTENSION",
+        title: "Schedule extension needs approval",
+        body: `${step.request_no} extension #${step.extension_id}`
+      });
+      const mail = await buildExtensionApproverEmail(step.extension_id, { greetingName: approver.display_name });
+      if (mail && approver.email) {
+        await sendMail({ to: approver.email, subject: mail.subject, html: mail.html, text: mail.text, requestId: step.request_id, type: mail.type });
+      }
     }
     emitSystem("request.updated", { id: step.request_id, part: "extension" });
   } else {
@@ -326,9 +340,9 @@ router.post("/extension/:extensionId/reject", audit("REJECT", "EXTENSION_REQUEST
   if (!step) return res.status(404).json({ message: "Extension approval step not found" });
   await query(
     `UPDATE schedule_extension_approval_steps
-     SET status='REJECTED', decided_at=SYSUTCDATETIME(), updated_at=SYSUTCDATETIME()
+     SET status='REJECTED', approver_user_id=@actorId, decided_at=SYSUTCDATETIME(), updated_at=SYSUTCDATETIME()
      WHERE id=@stepId`,
-    { stepId: step.id }
+    { stepId: step.id, actorId: req.user.id }
   );
   await query(
     `UPDATE schedule_extension_requests
@@ -350,6 +364,7 @@ router.post("/extension/:extensionId/reject", audit("REJECT", "EXTENSION_REQUEST
 }));
 
 async function getStep(stepId, user, sectionId) {
+  const userCond = await approvalStepUserCondition("a", "@userId");
   return (await query(
     `SELECT a.*,
             r.request_no, r.status AS request_status, r.incharge_user_id, r.support_user_id,
@@ -358,7 +373,7 @@ async function getStep(stepId, user, sectionId) {
      JOIN requests r ON r.id=a.request_id
      WHERE a.id=@stepId
        AND (r.section_id=@sectionId OR r.requester_section_id=@sectionId)
-       AND (@isAdmin=1 OR a.approver_user_id=@userId)
+       AND (@isAdmin=1 OR ${userCond})
        AND a.status='PENDING'`,
     {
       stepId: Number(stepId),
@@ -370,6 +385,7 @@ async function getStep(stepId, user, sectionId) {
 }
 
 async function getExtensionStep(extensionId, user, sectionId) {
+  const userCond = await extensionStepUserCondition("a", "@userId");
   // a.* already includes extension_id (the FK), so don't alias e.id to it again
   // — a duplicate column name makes the mssql driver return an array.
   return (await query(
@@ -382,7 +398,7 @@ async function getExtensionStep(extensionId, user, sectionId) {
        AND r.section_id=@sectionId
        AND e.status='PENDING_APPROVAL'
        AND a.status='PENDING'
-       AND (@isAdmin=1 OR a.approver_user_id=@userId)`,
+       AND (@isAdmin=1 OR ${userCond})`,
     {
       extensionId: Number(extensionId),
       sectionId,

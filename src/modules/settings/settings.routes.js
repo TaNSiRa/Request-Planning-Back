@@ -9,6 +9,7 @@ const { verifyMail, isMailConfigured, sendMail } = require("../../services/mailS
 const { normalizeMaxAttachments, getUserDisplayOrder } = require("../../services/settingsService");
 const { verifyHoliday } = require("../../db/holidayPool");
 const { emitSystem } = require("../../services/realtimeService");
+const { hasCoApproverTables, saveRouteStepApprovers } = require("../../services/approverService");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -265,7 +266,51 @@ router.get("/approval-routes", requireSectionAdmin, asyncHandler(async (req, res
      ORDER BY ar.is_default DESC, ar.name, ars.sequence_no`,
     { sectionId: req.section.id }
   );
-  res.json({ data: nestRoutes(result.recordset) });
+  const routes = nestRoutes(result.recordset);
+  // Attach every step's full candidate list (co-approvers) when available.
+  if (await hasCoApproverTables()) {
+    const candidates = (await query(
+      `SELECT x.step_id, x.user_id, cu.display_name,
+              cu.branch, cu.department, cu.section
+       FROM approval_route_step_approvers x
+       JOIN approval_route_steps ars ON ars.id = x.step_id
+       JOIN approval_routes ar ON ar.id = ars.route_id
+       JOIN users cu ON cu.id = x.user_id
+       WHERE ar.section_id=@sectionId
+       ORDER BY x.id`,
+      { sectionId: req.section.id }
+    )).recordset;
+    const byStep = new Map();
+    for (const row of candidates) {
+      if (!byStep.has(row.step_id)) byStep.set(row.step_id, []);
+      byStep.get(row.step_id).push({
+        userId: row.user_id,
+        name: row.display_name,
+        branch: row.branch,
+        department: row.department,
+        section: row.section
+      });
+    }
+    for (const route of routes) {
+      for (const step of route.steps) {
+        const list = byStep.get(step.id) || [];
+        // Guarantee the primary approver is present (pre-backfill rows).
+        if (step.approverUserId && !list.some(a => a.userId === step.approverUserId)) {
+          list.unshift({ userId: step.approverUserId, name: step.approverName });
+        }
+        step.approvers = list;
+      }
+    }
+  } else {
+    for (const route of routes) {
+      for (const step of route.steps) {
+        step.approvers = step.approverUserId
+          ? [{ userId: step.approverUserId, name: step.approverName }]
+          : [];
+      }
+    }
+  }
+  res.json({ data: routes });
 }));
 
 router.post("/approval-routes", requireSectionAdmin, audit("CREATE", "APPROVAL_ROUTE", req => req.body.name), asyncHandler(async (req, res) => {
@@ -358,8 +403,14 @@ const routeSchema = z.object({
     id: z.number().int().optional().nullable(),
     sequenceNo: z.number().int().positive(),
     stepName: z.string().min(2),
-    approverUserId: z.number().int().positive(),
+    // Legacy single approver — still accepted; the first of approverUserIds
+    // becomes the primary when the list is provided.
+    approverUserId: z.number().int().positive().optional().nullable(),
+    // Full candidate list (co-approvers): any one of them can act on the step.
+    approverUserIds: z.array(z.number().int().positive()).optional().default([]),
     canAssignWork: z.boolean().optional().default(false)
+  }).refine(step => step.approverUserId || step.approverUserIds.length > 0, {
+    message: "Every step needs at least one approver"
   })).min(1)
 });
 
@@ -396,19 +447,34 @@ function nestRoutes(rows) {
 }
 
 async function replaceRouteSteps(routeId, steps) {
+  // Co-approver rows go first (FK) — then the steps themselves.
+  if (await hasCoApproverTables()) {
+    await query(
+      `DELETE x FROM approval_route_step_approvers x
+       JOIN approval_route_steps s ON s.id = x.step_id
+       WHERE s.route_id=@routeId`,
+      { routeId }
+    );
+  }
   await query("DELETE FROM approval_route_steps WHERE route_id=@routeId", { routeId });
   for (const step of steps.sort((a, b) => a.sequenceNo - b.sequenceNo)) {
-    await query(
+    // Deduplicated candidate list; the first entry is the primary approver.
+    const approverIds = [...new Set(
+      step.approverUserIds.length ? step.approverUserIds : [step.approverUserId]
+    )].filter(Boolean);
+    const inserted = await query(
       `INSERT INTO approval_route_steps (route_id, sequence_no, step_name, default_approver_user_id, can_assign_work)
+       OUTPUT INSERTED.id
        VALUES (@routeId, @sequenceNo, @stepName, @approverUserId, @canAssignWork)`,
       {
         routeId,
         sequenceNo: step.sequenceNo,
         stepName: step.stepName,
-        approverUserId: step.approverUserId,
+        approverUserId: approverIds[0],
         canAssignWork: step.canAssignWork
       }
     );
+    await saveRouteStepApprovers(inserted.recordset[0].id, approverIds);
   }
 }
 
