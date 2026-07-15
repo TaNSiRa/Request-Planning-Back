@@ -293,7 +293,14 @@ router.get("/export-mbo.xlsx", asyncHandler(async (req, res) => {
     half
   });
   res.header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-  res.attachment(`MBO ${half === 2 ? "2nd" : "1st"} Half.xlsx`).send(buffer);
+  // Filename e.g. "MBO 1st Half of 2025 1680663 Arsa Chumnandechakul.xlsx" —
+  // year comes from the selected window, followed by employee no + full name.
+  const windowDate = to || from;
+  const year = windowDate && !isNaN(new Date(windowDate)) ? new Date(windowDate).getFullYear() : new Date().getFullYear();
+  const nameParts = [
+    "MBO", half === 2 ? "2nd" : "1st", "Half", "of", year, me.employee_no, baseName,
+  ].filter(v => v != null && `${v}`.trim() !== "");
+  res.attachment(`${nameParts.join(" ")}.xlsx`).send(buffer);
 }));
 
 module.exports = router;
