@@ -6,17 +6,22 @@ const { query } = require("../db/pool");
 // single-approver behaviour (primary approver column only).
 
 let _hasTables = null;
+let _lastProbeAt = 0;
 
 async function hasCoApproverTables() {
-  if (_hasTables === null) {
-    try {
-      await query("SELECT TOP 0 1 FROM approval_route_step_approvers");
-      await query("SELECT TOP 0 1 FROM approval_step_approvers");
-      await query("SELECT TOP 0 1 FROM schedule_extension_step_approvers");
-      _hasTables = true;
-    } catch (err) {
-      _hasTables = false;
-    }
+  // "true" is permanent for the process lifetime; "false" re-probes at most
+  // every 30s, so applying database/patch_multi_approvers.sql is picked up
+  // WITHOUT a backend restart (probe order no longer matters).
+  if (_hasTables === true) return true;
+  if (_hasTables === false && Date.now() - _lastProbeAt < 30000) return false;
+  _lastProbeAt = Date.now();
+  try {
+    await query("SELECT TOP 0 1 FROM approval_route_step_approvers");
+    await query("SELECT TOP 0 1 FROM approval_step_approvers");
+    await query("SELECT TOP 0 1 FROM schedule_extension_step_approvers");
+    _hasTables = true;
+  } catch (err) {
+    _hasTables = false;
   }
   return _hasTables;
 }
