@@ -313,8 +313,21 @@ router.get("/approval-routes", requireSectionAdmin, asyncHandler(async (req, res
   res.json({ data: routes });
 }));
 
+// A route step with 2+ approvers needs the co-approver tables. Refuse loudly
+// instead of silently saving only the primary — a "saved" toast that drops
+// people is worse than an error telling the admin to run the patch.
+async function assertCoApproverTablesFor(steps, res) {
+  const wantsCoApprovers = steps.some(step => (step.approverUserIds?.length || 0) > 1);
+  if (wantsCoApprovers && !(await hasCoApproverTables())) {
+    res.status(400).json({ message: "MULTI_APPROVER_PATCH_REQUIRED" });
+    return false;
+  }
+  return true;
+}
+
 router.post("/approval-routes", requireSectionAdmin, audit("CREATE", "APPROVAL_ROUTE", req => req.body.name), asyncHandler(async (req, res) => {
   const input = routeSchema.parse(req.body);
+  if (!(await assertCoApproverTablesFor(input.steps, res))) return;
   const result = await query(
     `INSERT INTO approval_routes (section_id, requester_section_id, name, request_type, is_default, is_active)
      OUTPUT INSERTED.id
@@ -337,6 +350,7 @@ router.post("/approval-routes", requireSectionAdmin, audit("CREATE", "APPROVAL_R
 router.put("/approval-routes/:routeId", requireSectionAdmin, audit("EDIT", "APPROVAL_ROUTE", req => req.params.routeId), asyncHandler(async (req, res) => {
   const routeId = Number(req.params.routeId);
   const input = routeSchema.parse(req.body);
+  if (!(await assertCoApproverTablesFor(input.steps, res))) return;
   const existing = (await query("SELECT id FROM approval_routes WHERE id=@routeId AND section_id=@sectionId", {
     routeId,
     sectionId: req.section.id
