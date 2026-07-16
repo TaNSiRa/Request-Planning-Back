@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "nodemon src/request-planning-back.js",
     "start": "node src/request-planning-back.js",
-    "lint": "node --check src/request-planning-back.js"
+    "lint": "node --check src/request-planning-back.js",
+    "test": "node --test test/"
   },
   "dependencies": {
     "adm-zip": "^0.5.18",
@@ -25,6 +26,7 @@
     "zod": "^3.24.1"
   },
   "devDependencies": {
-    "nodemon": "^3.1.9"
+    "nodemon": "^3.1.9",
+    "supertest": "^7.2.2"
   }
 }
