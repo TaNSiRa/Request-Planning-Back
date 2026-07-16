@@ -4,7 +4,7 @@
   "description": "Request & Planning backend API",
   "main": "src/request-planning-back.js",
   "scripts": {
-    "dev": "nodemon src/request-planning-back.js",
+    "dev": "nodemon -L src/request-planning-back.js",
     "start": "node src/request-planning-back.js",
     "lint": "node --check src/request-planning-back.js",
     "test": "node --test test/"
