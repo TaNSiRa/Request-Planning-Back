@@ -204,6 +204,8 @@ function sanitizeUser(user) {
     displayName: user.display_name,
     fullName: user.full_name,
     namePrefix: user.name_prefix,
+    // May be undefined until patch_positions_org_chart.sql is applied.
+    positionId: user.position_id ?? null,
     avatar: user.avatar ?? null,
     branch: user.branch,
     department: user.department,
