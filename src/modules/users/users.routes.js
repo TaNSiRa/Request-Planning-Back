@@ -24,6 +24,7 @@ router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
   const approverCond = await routeStepUserCondition("ars", "u.id");
   const result = await query(
     `SELECT u.id, u.employee_no, u.email, u.display_name, u.full_name, u.name_prefix, u.branch, u.department, u.section, u.phone, u.is_active, u.role_id,
+            u.position_id, p.name AS position_name, p.abbreviation AS position_abbr,
             r.code AS role_code, r.name AS role_name,
             m.can_request, m.can_work, m.is_section_admin, m.is_active AS membership_active,
             (SELECT ms.section_id, ms.can_request, ms.can_work, ms.is_section_admin
@@ -38,6 +39,7 @@ router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
                FOR JSON PATH) AS approver_sections_json
      FROM users u
      JOIN roles r ON r.id = u.role_id
+     LEFT JOIN positions p ON p.id = u.position_id
      LEFT JOIN user_section_memberships m ON m.user_id = u.id AND m.section_id = @sectionId
      WHERE (@fullAdmin = 1 AND (r.code = 'ADMIN' OR m.id IS NOT NULL))
         OR (@fullAdmin = 0 AND m.id IS NOT NULL AND m.is_active = 1 AND r.code = 'REQUESTER')
@@ -124,6 +126,7 @@ router.post("/", requireSectionAdmin, audit("CREATE", "USER", req => req.body.em
     displayName: z.string().min(2),
     fullName: z.string().optional().nullable(),
     namePrefix: z.string().optional().nullable(),
+    positionId: z.number().int().positive().optional().nullable(),
     password: z.string().min(1),
     roleId: z.number().int(),
     branch: z.string().min(1),
@@ -147,6 +150,7 @@ router.post("/", requireSectionAdmin, audit("CREATE", "USER", req => req.body.em
     employeeNo: input.employeeNo ?? null,
     fullName: input.fullName?.trim() ? input.fullName.trim() : null,
     namePrefix: input.namePrefix?.trim() ? input.namePrefix.trim() : null,
+    positionId: input.positionId ?? null,
     branch: input.branch ?? null,
     department: input.department ?? null,
     section: input.section ?? null,
@@ -154,9 +158,9 @@ router.post("/", requireSectionAdmin, audit("CREATE", "USER", req => req.body.em
   };
   const passwordHash = await bcrypt.hash(input.password, env.bcryptRounds);
   const result = await query(
-    `INSERT INTO users (employee_no, email, display_name, full_name, name_prefix, password_hash, role_id, branch, department, section, phone)
+    `INSERT INTO users (employee_no, email, display_name, full_name, name_prefix, position_id, password_hash, role_id, branch, department, section, phone)
      OUTPUT INSERTED.id
-     VALUES (@employeeNo, @email, @displayName, @fullName, @namePrefix, @passwordHash, @roleId, @branch, @department, @section, @phone)`,
+     VALUES (@employeeNo, @email, @displayName, @fullName, @namePrefix, @positionId, @passwordHash, @roleId, @branch, @department, @section, @phone)`,
     { ...values, email: input.email.toLowerCase(), passwordHash }
   );
   const userId = result.recordset[0].id;
@@ -172,6 +176,7 @@ router.patch("/:id(\\d+)", requireSectionAdmin, audit("EDIT", "USER", req => req
     displayName: z.string().min(2),
     fullName: z.string().optional().nullable(),
     namePrefix: z.string().optional().nullable(),
+    positionId: z.number().int().positive().optional().nullable(),
     roleId: z.number().int(),
     branch: z.string().min(1),
     department: z.string().min(1),
@@ -195,7 +200,7 @@ router.patch("/:id(\\d+)", requireSectionAdmin, audit("EDIT", "USER", req => req
   }
   await query(
     `UPDATE users
-     SET employee_no=@employeeNo, email=@email, display_name=@displayName, full_name=@fullName, name_prefix=@namePrefix, role_id=@roleId,
+     SET employee_no=@employeeNo, email=@email, display_name=@displayName, full_name=@fullName, name_prefix=@namePrefix, position_id=@positionId, role_id=@roleId,
          branch=@branch, department=@department, section=@section, phone=@phone, is_active=@isActive, updated_at=SYSUTCDATETIME()
      WHERE id=@id`,
     {
@@ -205,6 +210,7 @@ router.patch("/:id(\\d+)", requireSectionAdmin, audit("EDIT", "USER", req => req
       displayName: input.displayName,
       fullName: input.fullName?.trim() ? input.fullName.trim() : null,
       namePrefix: input.namePrefix?.trim() ? input.namePrefix.trim() : null,
+      positionId: input.positionId ?? null,
       roleId: input.roleId,
       branch: input.branch ?? null,
       department: input.department ?? null,
@@ -239,6 +245,7 @@ router.patch("/me", audit("EDIT_PROFILE", "USER", req => req.user.id), asyncHand
     displayName: z.string().min(2),
     fullName: z.string().optional().nullable(),
     namePrefix: z.string().optional().nullable(),
+    positionId: z.number().int().positive().optional().nullable(),
     phone: z.string().optional().nullable(),
     branch: z.string().min(1),
     department: z.string().min(1),
@@ -265,6 +272,7 @@ router.patch("/me", audit("EDIT_PROFILE", "USER", req => req.user.id), asyncHand
     email,
     fullName: input.fullName?.trim() ? input.fullName.trim() : null,
     namePrefix: input.namePrefix?.trim() ? input.namePrefix.trim() : null,
+    positionId: input.positionId ?? null,
     phone: input.phone ?? null,
     branch: input.branch ?? null,
     department: input.department ?? null,
@@ -272,7 +280,7 @@ router.patch("/me", audit("EDIT_PROFILE", "USER", req => req.user.id), asyncHand
     endDateNotifyDays: input.endDateNotifyDays ?? null
   };
   await query(
-    `UPDATE users SET employee_no=@employeeNo, email=@email, display_name=@displayName, full_name=@fullName, name_prefix=@namePrefix, phone=@phone, branch=@branch, department=@department, section=@section,
+    `UPDATE users SET employee_no=@employeeNo, email=@email, display_name=@displayName, full_name=@fullName, name_prefix=@namePrefix, position_id=@positionId, phone=@phone, branch=@branch, department=@department, section=@section,
          end_date_notify_days=COALESCE(@endDateNotifyDays, end_date_notify_days), updated_at=SYSUTCDATETIME()
      WHERE id=@id`,
     { ...values, id: req.user.id }

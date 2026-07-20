@@ -19,6 +19,7 @@ const branchMapRoutes = require("./modules/branchmap/branchmap.routes");
 const kpiRoutes = require("./modules/kpi/kpi.routes");
 const notificationRoutes = require("./modules/notifications/notifications.routes");
 const skillMatrixRoutes = require("./modules/skillmatrix/skillmatrix.routes");
+const orgChartRoutes = require("./modules/orgchart/orgchart.routes");
 const weeklyPlanRoutes = require("./modules/weeklyplan/weeklyplan.routes");
 const healthRoutes = require("./modules/health/health.routes");
 
@@ -67,6 +68,7 @@ function createApp() {
   app.use("/api/kpi", kpiRoutes);
   app.use("/api/notifications", notificationRoutes);
   app.use("/api/skill-matrix", skillMatrixRoutes);
+  app.use("/api/org-chart", orgChartRoutes);
   app.use("/api/weekly-plan", weeklyPlanRoutes);
 
   app.use(notFound);
