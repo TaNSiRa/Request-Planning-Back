@@ -6,7 +6,9 @@ const { query } = require("../../db/pool");
 const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
 const { audit } = require("../../middleware/audit");
-const { requireSectionAdmin, resolveSection, isAdmin, canManageTargetRole } = require("../../services/sectionService");
+const { requireSectionAdmin, resolveSection, isAdmin, isViewer, canManageTargetRole } = require("../../services/sectionService");
+const { blockViewerWrites } = require("../../middleware/viewerGuard");
+const { VIEWER_PAGE_KEYS, getViewerOverrides, setViewerOverrides } = require("../../services/viewerService");
 const { routeStepUserCondition } = require("../../services/approverService");
 const { getUserDisplayOrder, sortUsersByDisplayOrder } = require("../../services/settingsService");
 const { emitSystem } = require("../../services/realtimeService");
@@ -15,6 +17,7 @@ const router = express.Router();
 
 router.use(requireAuth);
 router.use(resolveSection);
+router.use(blockViewerWrites("users"));
 
 router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
   // Global admins see every admin + this section's members. A section admin only
@@ -356,6 +359,93 @@ router.get("/manage-sections", requireSectionAdmin, asyncHandler(async (req, res
   );
   res.json({ data: result.recordset });
 }));
+
+// Managing a VIEWER's page/section access is an administrative action, so it must
+// never be reachable through a viewer's own edit grant — require a REAL admin or
+// section admin (viewerPassesAdminGuard is deliberately not honoured here).
+function realSectionAdminOnly(req, res, next) {
+  if (isAdmin(req.user) || req.sectionAccess?.isSectionAdmin) return next();
+  return res.status(403).json({ message: "Forbidden" });
+}
+
+// Which sections the actor administers (global admin → every section). Scopes a
+// section admin so they can only toggle a viewer's access to their own sections.
+async function actorAdminSectionIds(req) {
+  if (isAdmin(req.user)) return null; // null = all sections
+  const rows = (await query(
+    `SELECT ms.section_id FROM user_section_memberships ms
+     WHERE ms.user_id=@userId AND ms.is_active=1 AND ms.is_section_admin=1`,
+    { userId: req.user.id }
+  )).recordset;
+  return rows.map(r => r.section_id);
+}
+
+// The full page/section access matrix for a viewer — every page and every active
+// section, each with the effective can_view / can_edit (defaults filled in). The
+// Manage Users viewer editor renders straight from this.
+router.get("/:id(\\d+)/viewer-permissions", realSectionAdminOnly, asyncHandler(async (req, res) => {
+  const userId = Number(req.params.id);
+  if (await targetRoleCode(userId) !== "VIEWER") {
+    return res.status(400).json({ message: "This user is not a viewer" });
+  }
+  const overrides = await getViewerOverrides(userId);
+  const sectionRows = (await query(
+    "SELECT id, code, name FROM request_sections WHERE is_active=1 ORDER BY name"
+  )).recordset;
+  const adminSectionIds = await actorAdminSectionIds(req);
+  const adminSet = adminSectionIds == null ? null : new Set(adminSectionIds);
+  res.json({
+    // Global admins may retune page-level (cross-section) access; a section admin
+    // may only toggle their own sections, so the UI hides the pages column.
+    canEditPages: isAdmin(req.user),
+    pages: VIEWER_PAGE_KEYS.map(pageKey => ({
+      pageKey,
+      canView: overrides.pages[pageKey] ? overrides.pages[pageKey].view : true,
+      canEdit: overrides.pages[pageKey] ? overrides.pages[pageKey].edit : false
+    })),
+    sections: sectionRows.map(s => ({
+      sectionId: s.id,
+      code: s.code,
+      name: s.name,
+      // A section admin can only change the sections they administer.
+      manageable: adminSet == null || adminSet.has(s.id),
+      canView: overrides.sections[s.id] ? overrides.sections[s.id].view : true,
+      canEdit: overrides.sections[s.id] ? overrides.sections[s.id].edit : false
+    }))
+  });
+}));
+
+router.put("/:id(\\d+)/viewer-permissions",
+  realSectionAdminOnly,
+  audit("EDIT", "VIEWER_PERMISSIONS", req => req.params.id),
+  asyncHandler(async (req, res) => {
+    const userId = Number(req.params.id);
+    if (await targetRoleCode(userId) !== "VIEWER") {
+      return res.status(400).json({ message: "This user is not a viewer" });
+    }
+    const schema = z.object({
+      pages: z.array(z.object({
+        pageKey: z.string(),
+        canView: z.boolean().optional().default(true),
+        canEdit: z.boolean().optional().default(false)
+      })).optional(),
+      sections: z.array(z.object({
+        sectionId: z.number().int().positive(),
+        canView: z.boolean().optional().default(true),
+        canEdit: z.boolean().optional().default(false)
+      })).optional()
+    });
+    const input = schema.parse(req.body);
+    // Global admin controls the page matrix and every section; a section admin
+    // may only touch their own sections and never the cross-section page matrix.
+    const allowedSectionIds = await actorAdminSectionIds(req);
+    await setViewerOverrides(userId, input, {
+      allowPages: isAdmin(req.user),
+      allowedSectionIds
+    });
+    emitSystem("users.updated", { id: userId });
+    res.json({ ok: true });
+  }));
 
 async function upsertMembership(userId, sectionId, canRequest = true, canWork = true, isSectionAdmin = false) {
   await query(

@@ -15,6 +15,7 @@ const {
 } = require("../../services/emailTemplates");
 const { emitSystem } = require("../../services/realtimeService");
 const { isAdmin, resolveSection, getSectionName } = require("../../services/sectionService");
+const { blockViewerWrites } = require("../../middleware/viewerGuard");
 const { loadSupportsMap, applySupports, setSupports } = require("../../services/supportService");
 const {
   approvalStepUserCondition,
@@ -26,6 +27,7 @@ const {
 const router = express.Router();
 router.use(requireAuth);
 router.use(resolveSection);
+router.use(blockViewerWrites("approvals"));
 
 router.get("/pending", asyncHandler(async (req, res) => {
   // A step is "yours" when you're its primary approver OR any co-approver.
