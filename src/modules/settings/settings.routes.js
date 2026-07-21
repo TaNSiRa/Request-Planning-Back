@@ -5,6 +5,7 @@ const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
 const { audit } = require("../../middleware/audit");
 const { requireAdmin, requireSectionAdmin, resolveSection, isAdmin } = require("../../services/sectionService");
+const { blockViewerWrites } = require("../../middleware/viewerGuard");
 const { verifyMail, isMailConfigured, sendMail } = require("../../services/mailService");
 const { normalizeMaxAttachments, getUserDisplayOrder } = require("../../services/settingsService");
 const { verifyHoliday } = require("../../db/holidayPool");
@@ -14,6 +15,7 @@ const { hasCoApproverTables, saveRouteStepApprovers } = require("../../services/
 const router = express.Router();
 router.use(requireAuth);
 router.use(resolveSection);
+router.use(blockViewerWrites("settings"));
 
 // System-level settings only a global admin may see or edit — a section admin
 // manages section-level settings only. Kept in sync with the frontend list in

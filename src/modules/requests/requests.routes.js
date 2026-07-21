@@ -10,6 +10,7 @@ const { notify } = require("../../services/notificationService");
 const { emitSystem } = require("../../services/realtimeService");
 const { storeDataUrlAttachment, readAttachmentAsDataUrl, deleteStoredAttachment } = require("../../services/attachmentStorage");
 const { isAdmin, resolveSection } = require("../../services/sectionService");
+const { blockViewerWrites } = require("../../middleware/viewerGuard");
 const { getMaxAttachments, MAX_ATTACHMENTS_CEILING } = require("../../services/settingsService");
 const { loadSupportsMap, getSupports, applySupports, isSupportUser } = require("../../services/supportService");
 const {
@@ -44,6 +45,9 @@ router.get("/:id/section", asyncHandler(async (req, res) => {
 }));
 
 router.use(resolveSection);
+// Raising a NEW request belongs to the Create Request page; every other write
+// here (cancel, todos, complete, hold, extension) belongs to the Request List.
+router.use(blockViewerWrites(req => (req.method === "POST" && req.path === "/" ? "create" : "list")));
 
 router.get("/", asyncHandler(async (req, res) => {
   const { status, q, type, from, to } = req.query;

@@ -3,11 +3,13 @@ const { query } = require("../../db/pool");
 const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
 const { resolveSection, isAdmin } = require("../../services/sectionService");
+const { blockViewerWrites } = require("../../middleware/viewerGuard");
 const { buildMboWorkbook } = require("../../services/mboExport");
 
 const router = express.Router();
 router.use(requireAuth);
 router.use(resolveSection);
+router.use(blockViewerWrites("kpi"));
 
 function analyticsScope(req) {
   // A real member works in this section (can_work); a cross-section approver

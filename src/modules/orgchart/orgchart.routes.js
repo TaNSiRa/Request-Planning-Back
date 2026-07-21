@@ -5,6 +5,7 @@ const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
 const { audit } = require("../../middleware/audit");
 const { requireAdmin, requireSectionAdmin, resolveSection } = require("../../services/sectionService");
+const { blockViewerWrites } = require("../../middleware/viewerGuard");
 const { routeStepUserCondition } = require("../../services/approverService");
 const { emitSystem } = require("../../services/realtimeService");
 
@@ -211,7 +212,7 @@ function countNodes(nodes) {
   return total;
 }
 
-router.put("/", resolveSection, requireSectionAdmin, audit("EDIT", "ORG_CHART", req => req.section && req.section.id), asyncHandler(async (req, res) => {
+router.put("/", resolveSection, blockViewerWrites("orgChart"), requireSectionAdmin, audit("EDIT", "ORG_CHART", req => req.section && req.section.id), asyncHandler(async (req, res) => {
   const input = chartSchema.parse(req.body);
   if (countNodes(input.chart.roots) > 1000) {
     return res.status(400).json({ message: "Chart is too large (max 1000 nodes)" });

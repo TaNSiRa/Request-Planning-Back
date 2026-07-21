@@ -6,7 +6,8 @@ const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth, signToken } = require("../../middleware/auth");
 const { writeAudit } = require("../../middleware/audit");
 const { clearSession, setLoggedInSession } = require("../../services/securityService");
-const { getUserSections } = require("../../services/sectionService");
+const { getUserSections, isViewer } = require("../../services/sectionService");
+const { getViewerOverrides } = require("../../services/viewerService");
 const { verifyMicrosoftIdToken } = require("../../services/microsoftTokenService");
 const { getGlobalBool } = require("../../services/settingsService");
 const { env } = require("../../config/env");
@@ -41,8 +42,7 @@ router.post("/logout", requireAuth, asyncHandler(async (req, res) => {
 router.get("/me", requireAuth, asyncHandler(async (req, res) => {
   const userRow = await findActiveUserById(req.user.id);
   if (!userRow) return res.status(401).json({ message: "Unauthorized" });
-  const user = sanitizeUser(userRow);
-  user.sections = await getUserSections(user);
+  const user = await attachUserContext(sanitizeUser(userRow));
   res.json({ user });
 }));
 
@@ -53,8 +53,7 @@ router.get("/sections", requireAuth, asyncHandler(async (req, res) => {
 router.get("/session", requireAuth, asyncHandler(async (req, res) => {
   const userRow = await findActiveUserById(req.user.id);
   if (!userRow) return res.status(401).json({ message: "Unauthorized" });
-  const user = sanitizeUser(userRow);
-  user.sections = await getUserSections(user);
+  const user = await attachUserContext(sanitizeUser(userRow));
   res.json({ token: signToken(userRow), user, csrfToken: req.session?.csrfToken || null });
 }));
 
@@ -144,10 +143,18 @@ router.post("/pdpa-consent", requireAuth, asyncHandler(async (req, res) => {
     ip: req.ip,
     userAgent: req.headers["user-agent"]
   });
-  const user = sanitizeUser(userRow);
-  user.sections = await getUserSections(user);
+  const user = await attachUserContext(sanitizeUser(userRow));
   res.json({ token: signToken(userRow), csrfToken, user });
 }));
+
+// Attach the per-request context every login/session response carries: the
+// user's accessible sections and, for a viewer, its page-level overrides (the
+// section-level ones already ride along on each section's viewerCanEdit flag).
+async function attachUserContext(user) {
+  user.sections = await getUserSections(user);
+  if (isViewer(user)) user.viewerPages = (await getViewerOverrides(user.id)).pages;
+  return user;
+}
 
 async function findActiveUserByEmail(email) {
   const result = await query(
@@ -188,8 +195,7 @@ async function findActiveUserByIdentifier(identifier) {
 async function completeLogin(req, user) {
   await query("UPDATE users SET last_login_at = SYSUTCDATETIME() WHERE id = @id", { id: user.id });
   const csrfToken = setLoggedInSession(req, user);
-  const sanitized = sanitizeUser(user);
-  sanitized.sections = await getUserSections(sanitized);
+  const sanitized = await attachUserContext(sanitizeUser(user));
   return { token: signToken(user), csrfToken, user: sanitized };
 }
 

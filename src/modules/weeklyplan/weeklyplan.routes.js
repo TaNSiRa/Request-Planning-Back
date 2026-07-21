@@ -4,6 +4,7 @@ const { sql, getPool, query } = require("../../db/pool");
 const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
 const { resolveSection, requireSectionAdmin } = require("../../services/sectionService");
+const { blockViewerWrites } = require("../../middleware/viewerGuard");
 const { getUserDisplayOrder, sortUsersByDisplayOrder } = require("../../services/settingsService");
 const { getHolidayDates } = require("../../db/holidayPool");
 const { emitSystem } = require("../../services/realtimeService");
@@ -11,6 +12,7 @@ const { emitSystem } = require("../../services/realtimeService");
 const router = express.Router();
 router.use(requireAuth);
 router.use(resolveSection);
+router.use(blockViewerWrites("meeting"));
 
 const DAYS = ["d0", "d1", "d2", "d3", "d4", "d5", "d6"];
 const weekStartSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "weekStart must be YYYY-MM-DD");
