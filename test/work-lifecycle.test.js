@@ -66,6 +66,30 @@ describe("work lifecycle: todos, hold, close, KPI", () => {
     assert.equal(detail.todos.length, 2);
   });
 
+  it("drag-and-drop reorder renumbers the todo list, and only for the assigned incharge", async () => {
+    const id = await inProgressRequest();
+    const first = await incharge.post(`/api/requests/${id}/todos`).send(todoPayload({ title: "first" }));
+    const second = await incharge.post(`/api/requests/${id}/todos`).send(todoPayload({ title: "second" }));
+    const third = await incharge.post(`/api/requests/${id}/todos`).send(todoPayload({ title: "third" }));
+
+    // New todos land at the end of the manual order.
+    const created = await getRequest(requester, id);
+    assert.deepEqual(created.todos.map(t => t.title), ["first", "second", "third"]);
+
+    const denied = await requester
+      .patch(`/api/requests/${id}/todos/reorder`)
+      .send({ ids: [third.body.id, first.body.id, second.body.id] });
+    assert.equal(denied.status, 403);
+
+    const moved = await incharge
+      .patch(`/api/requests/${id}/todos/reorder`)
+      .send({ ids: [third.body.id, first.body.id, second.body.id] });
+    assert.equal(moved.status, 200, JSON.stringify(moved.body));
+
+    const detail = await getRequest(requester, id);
+    assert.deepEqual(detail.todos.map(t => t.title), ["third", "first", "second"]);
+  });
+
   it("keeps todo dates inside the assigned project period", async () => {
     const id = await inProgressRequest();
     const res = await incharge.post(`/api/requests/${id}/todos`).send(
