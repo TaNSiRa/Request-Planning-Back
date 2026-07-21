@@ -1,7 +1,7 @@
 const express = require("express");
 const { getPool } = require("../../db/pool");
 const { isMailConfigured } = require("../../services/mailService");
-const { getOnlineCount } = require("../../services/realtimeService");
+const { getOnlineCount, getOnlineUsers } = require("../../services/realtimeService");
 
 const router = express.Router();
 
@@ -22,6 +22,8 @@ router.get("/", async (req, res) => {
     // Distinct users with an open realtime connection right now — the login
     // page shows this next to the API/SQL pills.
     onlineUsers: getOnlineCount(),
+    // Same people, by name, so the login page can show their avatars.
+    onlineUserList: getOnlineUsers(),
     timeUtc: new Date().toISOString()
   });
 });

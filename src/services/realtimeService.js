@@ -11,11 +11,29 @@ const online = new Map();
 // Everything a client needs to render presence: who is online (for the count
 // and the avatar dots) and who is looking at the Meeting page per section
 // (for the per-section viewer strip).
+// Which section each online user is working in right now (userId -> code).
+// Clients report it on every section change, so this is the live pick — not
+// the sections they merely belong to.
+function sectionByUser() {
+  const map = new Map();
+  const sockets = ioRef?.of("/")?.sockets;
+  if (!sockets) return map;
+  for (const socket of sockets.values()) {
+    const { userId, section } = socket.data || {};
+    const code = `${section || ""}`.trim().toUpperCase();
+    if (!userId || !code || map.has(userId)) continue;
+    map.set(userId, code);
+  }
+  return map;
+}
+
 function presenceSnapshot() {
+  const sections = sectionByUser();
   const users = [...online.entries()].map(([id, u]) => ({
     id,
     name: u.name,
-    fullName: u.fullName
+    fullName: u.fullName,
+    section: sections.get(id) || ""
   }));
   const meeting = {};
   const sockets = ioRef?.of("/")?.sockets;
@@ -115,4 +133,15 @@ function getOnlineCount() {
   return online.size;
 }
 
-module.exports = { registerRealtime, emitToUser, emitSystem, getOnlineCount };
+// Who is online right now (name only, no ids) — the login page shows these
+// avatars before there is a socket to receive `presence.updated` on.
+function getOnlineUsers() {
+  const sections = sectionByUser();
+  return [...online.entries()].map(([id, u]) => ({
+    name: u.name,
+    fullName: u.fullName || "",
+    section: sections.get(id) || ""
+  }));
+}
+
+module.exports = { registerRealtime, emitToUser, emitSystem, getOnlineCount, getOnlineUsers };
