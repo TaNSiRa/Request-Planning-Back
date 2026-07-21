@@ -1,4 +1,6 @@
+const jwt = require("jsonwebtoken");
 const { query } = require("../db/pool");
+const { env } = require("../config/env");
 
 let ioRef;
 
@@ -80,10 +82,26 @@ async function lookupUser(userId) {
 
 function registerRealtime(io) {
   ioRef = io;
+  // Authenticate the handshake: the client must present a valid JWT (the same
+  // token the REST API uses). The identity comes from the VERIFIED token — never
+  // from a client-supplied userId — so a client can't join another user's room
+  // and siphon their realtime notifications.
+  io.use((socket, next) => {
+    const token = socket.handshake.auth?.token;
+    if (!token) return next(new Error("unauthorized"));
+    try {
+      const payload = jwt.verify(token, env.jwtSecret);
+      const id = Number(payload?.id);
+      if (!Number.isInteger(id) || id <= 0) return next(new Error("unauthorized"));
+      socket.data.userId = id;
+      next();
+    } catch {
+      next(new Error("unauthorized"));
+    }
+  });
   io.on("connection", async socket => {
-    const rawId = Number(socket.handshake.auth?.userId);
-    const userId = Number.isInteger(rawId) && rawId > 0 ? rawId : null;
-    socket.data.userId = userId;
+    // Set by the auth middleware above from the verified JWT.
+    const userId = socket.data.userId;
     if (userId) socket.join(`user:${userId}`);
     socket.join("system");
     socket.emit("system.connected", { ok: true, timeUtc: new Date().toISOString() });

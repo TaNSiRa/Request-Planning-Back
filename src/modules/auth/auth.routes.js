@@ -1,18 +1,61 @@
 const bcrypt = require("bcryptjs");
 const express = require("express");
+const rateLimit = require("express-rate-limit");
 const { z } = require("zod");
 const { query } = require("../../db/pool");
 const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth, signToken } = require("../../middleware/auth");
 const { writeAudit } = require("../../middleware/audit");
 const { clearSession, setLoggedInSession } = require("../../services/securityService");
-const { getUserSections, isViewer } = require("../../services/sectionService");
+const { getUserSections, isViewer, isAdmin } = require("../../services/sectionService");
 const { getViewerOverrides } = require("../../services/viewerService");
 const { verifyMicrosoftIdToken } = require("../../services/microsoftTokenService");
 const { getGlobalBool } = require("../../services/settingsService");
 const { env } = require("../../config/env");
 
 const router = express.Router();
+
+// IPs currently throttled by the login limiter, so an admin can see and clear
+// them. ip -> { blockedAt, resetTime, hits }. In-memory (per process), same as
+// the limiter's own store — an entry is pruned once its window has elapsed.
+const blockedLogins = new Map();
+
+function pruneBlockedLogins() {
+  const now = Date.now();
+  for (const [ip, info] of blockedLogins) {
+    if (!info.resetTime || new Date(info.resetTime).getTime() <= now) blockedLogins.delete(ip);
+  }
+}
+
+// Brute-force guard for credential logins. Only FAILED attempts count
+// (skipSuccessfulRequests), so an active legitimate user is never locked out,
+// while password guessing against an account/IP is throttled hard.
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipSuccessfulRequests: true,
+  message: { message: "Too many login attempts. Please wait a few minutes and try again." },
+  // Runs every time a request is over the limit — record the IP so an admin can
+  // find and release it from the Settings page.
+  handler: (req, res, next, options) => {
+    const existing = blockedLogins.get(req.ip);
+    blockedLogins.set(req.ip, {
+      blockedAt: existing?.blockedAt || new Date().toISOString(),
+      resetTime: req.rateLimit?.resetTime ? new Date(req.rateLimit.resetTime).toISOString() : null,
+      hits: req.rateLimit?.used ?? existing?.hits ?? null
+    });
+    res.status(options.statusCode).json(options.message);
+  }
+});
+
+// System-wide admin gate (global ADMIN only) — deliberately does NOT honour a
+// viewer's read/edit grants, so releasing a login block is real-admin only.
+function requireGlobalAdmin(req, res, next) {
+  if (isAdmin(req.user)) return next();
+  return res.status(403).json({ message: "Forbidden" });
+}
 
 const loginSchema = z.object({
   email: z.string().min(1),
@@ -23,7 +66,7 @@ const microsoftLoginSchema = z.object({
   idToken: z.string().min(20)
 });
 
-router.post("/login", asyncHandler(async (req, res) => {
+router.post("/login", loginLimiter, asyncHandler(async (req, res) => {
   const input = loginSchema.parse(req.body);
   const user = await findActiveUserByIdentifier(input.email);
   if (!user || !(await bcrypt.compare(input.password, user.password_hash || ""))) {
@@ -32,6 +75,50 @@ router.post("/login", asyncHandler(async (req, res) => {
 
   await writeAudit({ actorId: user.id, action: "LOGIN", entityType: "AUTH", ip: req.ip, userAgent: req.headers["user-agent"] });
   res.json(await completeLogin(req, user));
+}));
+
+// --- Login brute-force block management (global admin) ---------------------
+
+// IPs currently throttled at the login endpoint.
+router.get("/login-blocks", requireAuth, requireGlobalAdmin, asyncHandler(async (req, res) => {
+  pruneBlockedLogins();
+  const data = [...blockedLogins.entries()]
+    .map(([ip, info]) => ({ ip, ...info }))
+    .sort((a, b) => `${b.blockedAt}`.localeCompare(`${a.blockedAt}`));
+  res.json({ data });
+}));
+
+// Release one IP.
+router.delete("/login-blocks/:ip", requireAuth, requireGlobalAdmin, asyncHandler(async (req, res) => {
+  const ip = `${req.params.ip || ""}`.trim();
+  if (!ip) return res.status(400).json({ message: "IP is required" });
+  await loginLimiter.resetKey(ip);
+  blockedLogins.delete(ip);
+  await writeAudit({
+    actorId: req.user.id,
+    action: "UNBLOCK_LOGIN",
+    entityType: "AUTH",
+    entityId: ip,
+    ip: req.ip,
+    userAgent: req.headers["user-agent"]
+  });
+  res.json({ ok: true });
+}));
+
+// Release every currently-blocked IP.
+router.delete("/login-blocks", requireAuth, requireGlobalAdmin, asyncHandler(async (req, res) => {
+  const ips = [...blockedLogins.keys()];
+  for (const ip of ips) await loginLimiter.resetKey(ip);
+  blockedLogins.clear();
+  await writeAudit({
+    actorId: req.user.id,
+    action: "UNBLOCK_LOGIN_ALL",
+    entityType: "AUTH",
+    entityId: `${ips.length} ip(s)`,
+    ip: req.ip,
+    userAgent: req.headers["user-agent"]
+  });
+  res.json({ ok: true, cleared: ips.length });
 }));
 
 router.post("/logout", requireAuth, asyncHandler(async (req, res) => {
