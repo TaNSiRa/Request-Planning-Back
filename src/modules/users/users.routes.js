@@ -51,20 +51,24 @@ router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
   );
   // Same fixed user order as the assignee dropdowns / weekly plan (set with the
   // weekly-plan arrows); users not in the saved order stay alphabetical.
-  // System administrators always come first, keeping that order among themselves.
+  // Roles are grouped first — System Admin, Section Admin, Viewer, Requester —
+  // keeping the order above among users of the same role.
   const ordered = sortUsersByDisplayOrder(result.recordset, await getUserDisplayOrder(req.section.id));
-  const admins = ordered.filter(row => row.role_code === "ADMIN");
-  const rest = ordered.filter(row => row.role_code !== "ADMIN");
-  const rows = [...admins, ...rest].map(row => {
-    const { memberships_json, approver_sections_json, ...rest } = row;
-    return {
-      ...rest,
-      memberships: memberships_json ? JSON.parse(memberships_json) : [],
-      approver_sections: approver_sections_json
-        ? JSON.parse(approver_sections_json).map(s => s.name)
-        : []
-    };
-  });
+  const roleRank = { ADMIN: 0, SECTION_ADMIN: 1, VIEWER: 2, REQUESTER: 3 };
+  const rankOf = row => roleRank[`${row.role_code}`.toUpperCase()] ?? 4;
+  const rows = ordered
+    .map((row, index) => ({ row, index }))
+    .sort((a, b) => rankOf(a.row) - rankOf(b.row) || a.index - b.index)
+    .map(({ row }) => {
+      const { memberships_json, approver_sections_json, ...rest } = row;
+      return {
+        ...rest,
+        memberships: memberships_json ? JSON.parse(memberships_json) : [],
+        approver_sections: approver_sections_json
+          ? JSON.parse(approver_sections_json).map(s => s.name)
+          : []
+      };
+    });
   res.json({ data: rows });
 }));
 
