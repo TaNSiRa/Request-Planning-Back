@@ -193,6 +193,98 @@ router.put("/", asyncHandler(async (req, res) => {
 }));
 
 // ---------------------------------------------------------------------------
+// Realtime autosave (no Save button): one user's day cell, or one car row, is
+// written the moment the editor commits it (Enter / focus leaves the field).
+// Both are upserts so concurrent editors never clobber each other's rows the
+// way the whole-week PUT above would.
+// ---------------------------------------------------------------------------
+router.put("/cell", asyncHandler(async (req, res) => {
+  const schema = z.object({
+    weekStart: weekStartSchema,
+    userId: z.number().int().positive(),
+    dayIndex: z.number().int().min(0).max(6),
+    value: z.string().max(300).optional().default("")
+  });
+  const input = schema.parse(req.body);
+  const col = DAYS[input.dayIndex]; // validated 0..6 — never raw user text
+  const updated = await query(
+    `UPDATE weekly_plan_rows SET ${col} = @value
+     WHERE section_id = @sectionId AND week_start = @weekStart AND row_type = 'USER' AND user_id = @userId`,
+    { sectionId: req.section.id, weekStart: input.weekStart, userId: input.userId, value: input.value }
+  );
+  if (!updated.rowsAffected[0]) {
+    await query(
+      `INSERT INTO weekly_plan_rows (section_id, week_start, row_type, user_id, sort_order, ${col})
+       VALUES (@sectionId, @weekStart, 'USER', @userId, 0, @value)`,
+      { sectionId: req.section.id, weekStart: input.weekStart, userId: input.userId, value: input.value }
+    );
+  }
+  emitSystem("weeklyplan.updated", {
+    sectionId: req.section.id,
+    weekStart: input.weekStart,
+    cell: { userId: input.userId, dayIndex: input.dayIndex }
+  });
+  res.json({ ok: true });
+}));
+
+// Upsert one car row (label/plate/cells). Created rows return their id so the
+// client can address them from then on.
+router.put("/car", asyncHandler(async (req, res) => {
+  const schema = z.object({
+    weekStart: weekStartSchema,
+    carId: z.number().int().positive().optional().nullable(),
+    label: z.string().optional().nullable(),
+    plate: z.string().optional().nullable(),
+    cells: z.array(z.string()).optional().nullable()
+  });
+  const input = schema.parse(req.body);
+  const cells = normalizeCells(input.cells);
+  const label = `${input.label ?? ""}`.slice(0, 200).trim();
+  const plate = `${input.plate ?? ""}`.slice(0, 100).trim();
+  const params = {
+    sectionId: req.section.id,
+    weekStart: input.weekStart,
+    label: label || null,
+    plate: plate || null,
+    ...Object.fromEntries(DAYS.map((d, i) => [d, cells[i]]))
+  };
+  let carId = input.carId ?? null;
+  if (carId != null) {
+    const updated = await query(
+      `UPDATE weekly_plan_rows SET label=@label, plate=@plate, ${DAYS.map(d => `${d}=@${d}`).join(", ")}
+       WHERE id = @carId AND section_id = @sectionId AND week_start = @weekStart AND row_type = 'CAR'`,
+      { ...params, carId }
+    );
+    if (!updated.rowsAffected[0]) return res.status(404).json({ message: "Car row not found" });
+  } else {
+    const inserted = await query(
+      `INSERT INTO weekly_plan_rows
+         (section_id, week_start, row_type, user_id, label, plate, sort_order, ${DAYS.join(", ")})
+       OUTPUT INSERTED.id
+       VALUES (@sectionId, @weekStart, 'CAR', NULL, @label, @plate,
+               (SELECT COALESCE(MAX(sort_order), 0) + 1 FROM weekly_plan_rows
+                WHERE section_id = @sectionId AND week_start = @weekStart),
+               ${DAYS.map(d => `@${d}`).join(", ")})`,
+      params
+    );
+    carId = inserted.recordset[0].id;
+  }
+  emitSystem("weeklyplan.updated", { sectionId: req.section.id, weekStart: input.weekStart });
+  res.json({ ok: true, id: carId });
+}));
+
+router.delete("/car/:id", asyncHandler(async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ message: "Invalid car row id" });
+  await query(
+    "DELETE FROM weekly_plan_rows WHERE id = @id AND section_id = @sectionId AND row_type = 'CAR'",
+    { id, sectionId: req.section.id }
+  );
+  emitSystem("weeklyplan.updated", { sectionId: req.section.id });
+  res.json({ ok: true });
+}));
+
+// ---------------------------------------------------------------------------
 // Per-section default car rows (edited in Settings). Used to seed a new week.
 // ---------------------------------------------------------------------------
 router.get("/default-cars", asyncHandler(async (req, res) => {

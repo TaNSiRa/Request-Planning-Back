@@ -38,19 +38,38 @@ function presenceSnapshot() {
     section: sections.get(id) || ""
   }));
   const meeting = {};
+  // Live focus maps (who is where right now, SharePoint-style):
+  //   requests: requestId -> [user]     (request-detail dialog open)
+  //   todos:    todoId    -> [user]     (todo editor open)
+  //   plan:     section -> cellKey -> [user]  (weekly-plan cell focused;
+  //             cellKey is client-defined, e.g. "2026-07-20|u12|3")
+  const requests = {};
+  const todos = {};
+  const plan = {};
   const sockets = ioRef?.of("/")?.sockets;
   if (sockets) {
-    for (const socket of sockets.values()) {
-      const { userId, page, section } = socket.data || {};
-      if (page !== "meeting" || !userId) continue;
-      const key = `${section || ""}`.toUpperCase();
-      if (!meeting[key]) meeting[key] = [];
-      if (meeting[key].some(v => v.id === userId)) continue;
+    const pushUser = (bucket, key, userId) => {
+      if (!bucket[key]) bucket[key] = [];
+      if (bucket[key].some(v => v.id === userId)) return;
       const u = online.get(userId);
-      meeting[key].push({ id: userId, name: u?.name || `User #${userId}`, fullName: u?.fullName || "" });
+      bucket[key].push({ id: userId, name: u?.name || `User #${userId}`, fullName: u?.fullName || "" });
+    };
+    for (const socket of sockets.values()) {
+      const { userId, page, section, focus } = socket.data || {};
+      if (!userId) continue;
+      const sectionKey = `${section || ""}`.toUpperCase();
+      if (page === "meeting") pushUser(meeting, sectionKey, userId);
+      if (focus) {
+        if (focus.requestId) pushUser(requests, `${focus.requestId}`, userId);
+        if (focus.todoId) pushUser(todos, `${focus.todoId}`, userId);
+        if (focus.planCell && sectionKey) {
+          if (!plan[sectionKey]) plan[sectionKey] = {};
+          pushUser(plan[sectionKey], focus.planCell, userId);
+        }
+      }
     }
   }
-  return { users, meeting };
+  return { users, meeting, requests, todos, plan };
 }
 
 // Debounced fan-out so a burst of connects/disconnects costs one broadcast.
@@ -111,6 +130,21 @@ function registerRealtime(io) {
     socket.on("presence.page", data => {
       socket.data.page = data && typeof data.page === "string" ? data.page : null;
       socket.data.section = data && typeof data.section === "string" ? data.section : null;
+      broadcastPresence();
+    });
+
+    // The client reports what it is focused on right now (open request-detail
+    // dialog, todo editor, weekly-plan cell) — cleared by sending nulls, and
+    // implicitly gone when the socket disconnects.
+    socket.on("presence.focus", data => {
+      const requestId = Number(data?.requestId);
+      const todoId = Number(data?.todoId);
+      const planCell = typeof data?.planCell === "string" ? data.planCell.slice(0, 120) : null;
+      socket.data.focus = {
+        requestId: Number.isInteger(requestId) && requestId > 0 ? requestId : null,
+        todoId: Number.isInteger(todoId) && todoId > 0 ? todoId : null,
+        planCell: planCell || null
+      };
       broadcastPresence();
     });
 
