@@ -59,10 +59,12 @@ router.post("/mail/test", requireAdmin, audit("TEST", "MAIL"), asyncHandler(asyn
 //    stamps the date it last ran so a restart never re-sends that day's mails)
 //  - meeting.groupOrder.* / users.displayOrder — saved UI arrangements, edited
 //    with the arrows on the Meeting page / weekly plan, not as raw JSON here
+//  - weeklyPlan.leaveTypes — edited in the "Weekly plan · leave types" card
 function isInternalSetting(key) {
   return `${key}`.startsWith("endDateReminder.") ||
     `${key}`.startsWith("meeting.groupOrder.") ||
-    key === "users.displayOrder";
+    key === "users.displayOrder" ||
+    key === "weeklyPlan.leaveTypes";
 }
 
 // Section-level settings that must always be visible in the Settings UI even

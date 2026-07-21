@@ -5,7 +5,7 @@ const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
 const { resolveSection, requireSectionAdmin } = require("../../services/sectionService");
 const { blockViewerWrites } = require("../../middleware/viewerGuard");
-const { getUserDisplayOrder, sortUsersByDisplayOrder } = require("../../services/settingsService");
+const { getUserDisplayOrder, sortUsersByDisplayOrder, getSectionSetting } = require("../../services/settingsService");
 const { getHolidayDates } = require("../../db/holidayPool");
 const { emitSystem } = require("../../services/realtimeService");
 
@@ -330,6 +330,69 @@ router.put("/default-user-values", requireSectionAdmin, asyncHandler(async (req,
   }
   emitSystem("weeklyplan.updated", { sectionId: req.section.id });
   res.json({ ok: true });
+}));
+
+// ---------------------------------------------------------------------------
+// Leave types — the words offered by the small button on a weekly-plan day cell
+// ("what kind of leave"). Stored per section as the 'weeklyPlan.leaveTypes' app
+// setting (a JSON array of words) so no extra table/DB patch is needed; the
+// whole list is edited in Settings by a system/section admin. A section that
+// never edited it gets the company defaults below; saving an empty list is an
+// explicit "no leave types" and is honoured.
+// ---------------------------------------------------------------------------
+const LEAVE_TYPES_KEY = "weeklyPlan.leaveTypes";
+const DEFAULT_LEAVE_TYPES = [
+  "Sick leave",
+  "Personal leave",
+  "Annual leave",
+  "Maternity leave",
+  "Bereavement leave",
+  "Ordination leave"
+];
+
+async function loadLeaveTypes(sectionId) {
+  const raw = await getSectionSetting(LEAVE_TYPES_KEY, sectionId);
+  if (raw == null) return DEFAULT_LEAVE_TYPES;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return DEFAULT_LEAVE_TYPES;
+    return parsed.map(v => `${v}`.trim()).filter(Boolean);
+  } catch {
+    return DEFAULT_LEAVE_TYPES;
+  }
+}
+
+// Read by every section member — the grid needs the list to build its picker.
+router.get("/leave-types", asyncHandler(async (req, res) => {
+  res.json({ leaveTypes: await loadLeaveTypes(req.section.id) });
+}));
+
+router.put("/leave-types", requireSectionAdmin, asyncHandler(async (req, res) => {
+  const schema = z.object({
+    leaveTypes: z.array(z.string().max(100)).max(100).optional().default([])
+  });
+  const input = schema.parse(req.body);
+  // Trim, drop blanks, and de-duplicate case-insensitively so the picker never
+  // shows the same word twice.
+  const seen = new Set();
+  const list = [];
+  for (const raw of input.leaveTypes) {
+    const word = `${raw}`.trim();
+    if (!word || seen.has(word.toLowerCase())) continue;
+    seen.add(word.toLowerCase());
+    list.push(word);
+  }
+  await query(
+    `MERGE app_settings AS target
+     USING (SELECT @key AS setting_key, @sectionId AS section_id) AS source
+     ON target.setting_key = source.setting_key AND COALESCE(target.section_id, 0) = COALESCE(source.section_id, 0)
+     WHEN MATCHED THEN UPDATE SET setting_value=@value, updated_at=SYSUTCDATETIME()
+     WHEN NOT MATCHED THEN INSERT (section_id, setting_key, setting_value, value_type, is_public, description)
+       VALUES (@sectionId, @key, @value, 'json', 1, 'Weekly plan leave types (day-cell picker)');`,
+    { sectionId: req.section.id, key: LEAVE_TYPES_KEY, value: JSON.stringify(list) }
+  );
+  emitSystem("weeklyplan.updated", { sectionId: req.section.id });
+  res.json({ ok: true, leaveTypes: list });
 }));
 
 // Company holidays (from the external SAR DB) within the given week, so the
