@@ -373,15 +373,51 @@ router.post("/:id/todos", audit("CREATE", "TODO"), asyncHandler(async (req, res)
   await assertTodoWindow(Number(req.params.id), req.section.id, input.plannedStart, input.plannedEnd);
   const maxAttachments = await getMaxAttachments(req.section.id, "todo");
   assertAttachmentLimit(attachments, maxAttachments);
+  // A new todo always joins at the end of the manual (drag) order — callers
+  // that don't set sortOrder get MAX(sort_order)+1 instead of a flat 0, which
+  // would otherwise drop it above every reordered row.
+  const sortOrder = input.sortOrder || (await query(
+    "SELECT COALESCE(MAX(sort_order), 0) + 1 AS next FROM request_todos WHERE request_id=@id",
+    { id: Number(req.params.id) }
+  )).recordset[0].next;
   const result = await query(
     `INSERT INTO request_todos (request_id, title, description, planned_start, planned_end, sort_order, is_important, created_by)
      OUTPUT INSERTED.id VALUES (@id, @title, @description, @plannedStart, @plannedEnd, @sortOrder, @isImportant, @userId)`,
-    { ...values, id: Number(req.params.id), userId: req.user.id }
+    { ...values, sortOrder, id: Number(req.params.id), userId: req.user.id }
   );
   const todoId = result.recordset[0].id;
   await saveTodoAttachments(Number(req.params.id), todoId, attachments, maxAttachments);
   emitSystem("request.updated", { id: Number(req.params.id), part: "todos" });
   res.status(201).json({ id: todoId });
+}));
+
+// Drag-and-drop ordering. The client posts the todo ids in their new visual
+// order and we renumber sort_order 1..n. Registered BEFORE /:id/todos/:todoId
+// so "reorder" is not matched as a todo id.
+router.patch("/:id/todos/reorder", audit("REORDER", "TODO", req => req.params.id), asyncHandler(async (req, res) => {
+  const schema = z.object({ ids: z.array(z.number().int().positive()).min(1) });
+  const { ids } = schema.parse(req.body);
+  const id = Number(req.params.id);
+  await assertCanManageRequestWork(id, req.user, req.sectionAccess, req.section.id, {
+    allowSectionMember: req.query.meeting === "1"
+  });
+  // Only ids that really belong to this request are renumbered; anything the
+  // client didn't send keeps its old sort_order and trails behind.
+  const owned = new Set(
+    (await query("SELECT id FROM request_todos WHERE request_id=@id", { id })).recordset.map(row => row.id)
+  );
+  let position = 0;
+  for (const todoId of ids) {
+    if (!owned.has(todoId)) continue;
+    position += 1;
+    await query("UPDATE request_todos SET sort_order=@sortOrder WHERE id=@todoId AND request_id=@id", {
+      sortOrder: position,
+      todoId,
+      id
+    });
+  }
+  emitSystem("request.updated", { id, part: "todos" });
+  res.json({ ok: true });
 }));
 
 router.patch("/:id/todos/:todoId", audit("EDIT", "TODO", req => req.params.todoId), asyncHandler(async (req, res) => {
