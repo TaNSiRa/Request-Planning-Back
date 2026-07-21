@@ -118,6 +118,9 @@ function fixtureContext(tag) {
         `DELETE FROM approval_routes WHERE section_id=@sid OR requester_section_id=@sid`,
         `DELETE FROM user_section_memberships WHERE section_id=@sid`,
         `DELETE FROM app_settings WHERE section_id=@sid`,
+        `DELETE FROM weekly_plan_rows WHERE section_id=@sid`,
+        `DELETE FROM weekly_plan_default_cars WHERE section_id=@sid`,
+        `DELETE FROM weekly_plan_default_user_values WHERE section_id=@sid`,
         `DELETE FROM request_sections WHERE id=@sid`
       ];
       for (const sqlText of steps) {
