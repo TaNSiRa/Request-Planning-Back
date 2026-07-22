@@ -1,7 +1,7 @@
 const nodemailer = require("nodemailer");
 const { env } = require("../config/env");
 const { query } = require("../db/pool");
-const { getGlobalBool } = require("./settingsService");
+const { isMailEnabledForSection } = require("./settingsService");
 
 function isMailConfigured() {
   return Boolean(env.smtp.host && env.smtp.from);
@@ -47,11 +47,12 @@ async function resolveSectionId(requestId, sectionId) {
 
 async function sendMail({ to, subject, html, text, requestId, type, sectionId, ignoreEnabledFlag = false }) {
   const resolvedSectionId = await resolveSectionId(requestId, sectionId);
-  // The mail.enabled setting is the master on/off switch. When off, we still
+  // 'mail.enabled' is the on/off switch OF THE OWNING SECTION — each section
+  // decides for itself whether the system emails its people. When off, we still
   // record the message in the outbox (audit trail) but never deliver it. The
   // "test email" path passes ignoreEnabledFlag so admins can verify SMTP before
-  // flipping the switch on.
-  const mailEnabled = ignoreEnabledFlag || (await getGlobalBool("mail.enabled", false));
+  // any section flips its switch on.
+  const mailEnabled = ignoreEnabledFlag || (await isMailEnabledForSection(resolvedSectionId));
   const configured = isMailConfigured();
   const status = !mailEnabled ? "disabled" : configured ? "queued" : "pending_config";
   // Always record the message in the outbox first (audit trail), then try to
@@ -72,7 +73,7 @@ async function sendMail({ to, subject, html, text, requestId, type, sectionId, i
   );
   const outboxId = insert.recordset[0].id;
 
-  if (!mailEnabled) return { sent: false, reason: "Mail is disabled in settings (mail.enabled=false)" };
+  if (!mailEnabled) return { sent: false, reason: "Email is switched off for this section (mail.enabled=false)" };
 
   const tx = getTransporter();
   if (!tx) return { sent: false, reason: "SMTP config is blank" };
