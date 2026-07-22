@@ -43,6 +43,58 @@ async function getMaxAttachments(sectionId, kind) {
   return normalizeMaxAttachments(await getSectionSetting(key, sectionId));
 }
 
+// Email delivery is switched on/off PER SECTION ('mail.enabled'). Every real
+// notification is sent about a request, so sendMail can always resolve the
+// owning section; the section-less fallback below only guards odd callers.
+// A section with no row yet is OFF — a brand-new section never surprises anyone
+// with email until its admin turns it on. (patch_section_mail_and_reminders.sql
+// seeds every existing section from the old global switch so nothing goes dark.)
+async function isMailEnabledForSection(sectionId) {
+  const value = sectionId == null
+    ? await getGlobalSetting("mail.enabled")
+    : await getSectionSetting("mail.enabled", sectionId);
+  return `${value ?? ""}`.trim().toLowerCase() === "true";
+}
+
+function isTrue(value) {
+  return `${value ?? ""}`.trim().toLowerCase() === "true";
+}
+
+// Due-date reminder emails: the SECTION owns only the on/off switches —
+//   projectReminder.enabled — the request's project period (planned_end).
+//                             Defaults ON: it is the original behaviour, and a
+//                             section that never opens Settings keeps it.
+//   todoReminder.enabled    — each to-do item's own period. Defaults OFF.
+// How many working days ahead to warn is a PERSONAL preference edited on the
+// Profile page (users.end_date_notify_days / users.todo_notify_days), so two
+// people in the same section can want different lead times.
+function defaultReminderConfig() {
+  return { project: true, todo: false };
+}
+
+// Every section's reminder config in one round trip, for the daily job:
+// Map<sectionId, { project, todo }>. Use reminderConfigFor() to read it so
+// sections with no rows at all get the defaults.
+async function getReminderSections() {
+  const rows = (await query(
+    `SELECT section_id, setting_key, setting_value FROM app_settings
+     WHERE section_id IS NOT NULL
+       AND setting_key IN ('projectReminder.enabled', 'todoReminder.enabled')`
+  )).recordset;
+  const configs = new Map();
+  for (const row of rows) {
+    if (!configs.has(row.section_id)) configs.set(row.section_id, defaultReminderConfig());
+    const config = configs.get(row.section_id);
+    if (row.setting_key === "projectReminder.enabled") config.project = isTrue(row.setting_value);
+    else config.todo = isTrue(row.setting_value);
+  }
+  return configs;
+}
+
+function reminderConfigFor(configs, sectionId) {
+  return configs.get(sectionId) || defaultReminderConfig();
+}
+
 // Per-section fixed user display order — a JSON array of user ids stored as
 // the 'users.displayOrder' setting. Edited with the arrows on the Meeting
 // weekly plan; applied to every user list/dropdown (weekly plan rows,
@@ -79,6 +131,9 @@ module.exports = {
   getMaxAttachments,
   normalizeMaxAttachments,
   MAX_ATTACHMENTS_CEILING,
+  isMailEnabledForSection,
+  getReminderSections,
+  reminderConfigFor,
   getUserDisplayOrder,
   sortUsersByDisplayOrder
 };

@@ -21,8 +21,9 @@ router.use(blockViewerWrites("settings"));
 // manages section-level settings only. Kept in sync with the frontend list in
 // settings_page.dart (SettingsPage.isSystemSetting).
 function isSystemSetting(key) {
-  return key === "mail.enabled" ||
-    key === "microsoft365.enabled" ||
+  // NOTE: mail.enabled is deliberately NOT here — email delivery is switched
+  // on/off per section, so a section admin owns their own section's switch.
+  return key === "microsoft365.enabled" ||
     key === "security.idleTimeoutMinutes" ||
     `${key}`.startsWith("org.") ||
     `${key}`.startsWith("holiday.");
@@ -72,7 +73,14 @@ function isInternalSetting(key) {
 // (PUT /settings/:key inserts the row on first save).
 const SECTION_SETTING_DEFAULTS = [
   { key: "request.maxAttachments", value: "5", type: "number", description: "Max files attached to a request" },
-  { key: "todo.maxAttachments", value: "5", type: "number", description: "Max files attached to a todo item" }
+  { key: "todo.maxAttachments", value: "5", type: "number", description: "Max files attached to a todo item" },
+  // Email delivery for this section. A section that has never saved it is off,
+  // so a brand-new section never emails anyone until its admin opts in.
+  { key: "mail.enabled", value: "false", type: "bool", description: "Send notification emails for this section" },
+  // Daily 08:30 reminder passes, both per section. The project-period pass is
+  // the original behaviour, so it defaults ON; the to-do pass is opt-in.
+  { key: "projectReminder.enabled", value: "true", type: "bool", description: "Email reminders for the request's project end date" },
+  { key: "todoReminder.enabled", value: "false", type: "bool", description: "Email reminders for each to-do item's own due date" }
 ];
 
 router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
@@ -433,6 +441,9 @@ const routeSchema = z.object({
 });
 
 function isGlobalSetting(key) {
+  // mail.enabled is per section (each section runs its own email on/off switch);
+  // any other mail.* key stays app-wide alongside the SMTP config in .env.
+  if (key === "mail.enabled") return false;
   return key.startsWith("frontend.") || key.startsWith("mail.") || key.startsWith("microsoft365.")
     || key.startsWith("org.") || key.startsWith("holiday.");
 }

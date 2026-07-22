@@ -864,6 +864,95 @@ function buildEndDateDigestEmail(category, { greetingName, notifyDays, items }) 
 }
 
 // ---------------------------------------------------------------------------
+// To-do due digest — the same near/today/overdue split as the request-level
+// digest above, but driven by each to-do item's OWN period
+// (request_todos.planned_end) instead of the request's project period. Only
+// sent for sections that switched 'todoReminder.enabled' on in Settings.
+// Each item: { todo_id, todo_title, planned_end, remaining_workdays (NEAR only),
+//              request_id, request_no, request_title, priority,
+//              section_name, section_code }
+// ---------------------------------------------------------------------------
+const TODO_DUE_DIGEST = {
+  NEAR: {
+    accent: ACCENTS.blue,
+    pill: "แจ้งเตือนล่วงหน้า · งานย่อยใกล้ถึงกำหนด",
+    headline: count => `มีงานย่อย (To-do) ${count} รายการใกล้ถึงกำหนด`,
+    subject: count => `⏳ แจ้งเตือน · งานย่อย ${count} รายการใกล้ถึงกำหนดส่ง`,
+    intro: notifyDays =>
+      `งานย่อย (To-do) ในงานที่คุณรับผิดชอบตามรายการด้านล่างจะถึงวันสิ้นสุดของงานย่อยเองภายใน `
+      + `<strong>${notifyDays} วันทำการ</strong> (ไม่นับวันหยุด) กรุณาตรวจสอบและดำเนินการให้ทันกำหนด`,
+    type: "TODO_DUE_NEAR"
+  },
+  TODAY: {
+    accent: ACCENTS.amber,
+    pill: "ต้องดำเนินการ · งานย่อยถึงกำหนดวันนี้",
+    headline: count => `มีงานย่อย (To-do) ${count} รายการถึงกำหนดวันนี้`,
+    subject: count => `📌 วันนี้เป็นกำหนดส่งของงานย่อย ${count} รายการ`,
+    intro: () =>
+      `วันนี้เป็น<strong>วันสิ้นสุดของงานย่อย</strong>ตามรายการด้านล่างซึ่งยังไม่ถูกทำเครื่องหมายว่าเสร็จ `
+      + `กรุณาเร่งดำเนินการและติ๊กปิดงานย่อยเมื่อเสร็จแล้ว`,
+    type: "TODO_DUE_TODAY"
+  },
+  OVERDUE: {
+    accent: ACCENTS.red,
+    pill: "เลยกำหนด · งานย่อยเกินกำหนดแล้ว",
+    headline: count => `มีงานย่อย (To-do) ${count} รายการเลยกำหนดแล้ว`,
+    subject: count => `⚠️ งานย่อย ${count} รายการเลยกำหนดส่งแล้ว`,
+    intro: () =>
+      `งานย่อย (To-do) ตามรายการด้านล่าง<strong>เลยวันสิ้นสุดของงานย่อยมาแล้ว</strong>และยังไม่เสร็จ `
+      + `กรุณาเร่งดำเนินการหรือปรับช่วงเวลาของงานย่อยให้ตรงกับความเป็นจริง `
+      + `(ระบบจะแจ้งเตือนกรณีเลยกำหนดเพียงครั้งเดียวต่อหนึ่งกำหนด)`,
+    type: "TODO_DUE_OVERDUE"
+  }
+};
+
+function buildTodoDueDigestEmail(category, { greetingName, notifyDays, items }) {
+  const cfg = TODO_DUE_DIGEST[category];
+  if (!cfg || !items || !items.length) return null;
+
+  const cards = items.map(item => {
+    const link = buildDeeplink(item.request_id, null, item.section_code);
+    const hint = endDateItemHint(category, { ...item, planned_end: item.planned_end });
+    let rows = "";
+    rows += kvRow("อยู่ในคำขอ",
+      `<span style="color:${INK};font-weight:600;">${esc(item.request_no)}</span> · ${esc(item.request_title)}`);
+    rows += kvRow("ความสำคัญของคำขอ", priorityChip(item.priority));
+    rows += kvRow("วันสิ้นสุดงานย่อย",
+      `<strong style="color:${category === "NEAR" ? INK : ACCENTS.red.fg};">${esc(formatThaiDate(item.planned_end))}</strong>`
+      + ` <span style="color:${FAINT};font-size:12px;">· ${esc(hint)}</span>`);
+    if (link) {
+      rows += kvRow("เปิดงาน", `<a href="${esc(link)}" target="_blank" style="color:#2f6bed;font-weight:600;">เปิดคำขอนี้ในระบบ →</a>`);
+    }
+    return detailCard("งานย่อย (TO-DO)", item.todo_title, rows);
+  }).join("");
+
+  const sectionNames = [...new Set(items.map(i => i.section_name).filter(Boolean))];
+  const sectionName = sectionNames.length === 1 ? sectionNames[0] : "Request & Planning";
+  const base = (env.frontendOrigin || "").replace(/\/+$/, "");
+
+  const opts = {
+    sectionName,
+    requestNo: `${items.length} งานย่อย`,
+    accent: cfg.accent,
+    pillText: cfg.pill,
+    headline: cfg.headline(items.length),
+    greetingName,
+    paragraphs: [cfg.intro(notifyDays)],
+    extraHtml: cards,
+    primary: base ? { label: "เปิดระบบ Request & Planning →", url: `${base}/` } : null,
+    footerNote: "คุณได้รับอีเมลนี้เพราะเป็นผู้รับผิดชอบ (Incharge) ของคำขอที่มีงานย่อยตามรายการข้างต้น"
+  };
+  const plainLines = items.map(item =>
+    `- ${item.todo_title} (${item.request_no}) · สิ้นสุด ${formatThaiDate(item.planned_end)} (${endDateItemHint(category, item)})`);
+  return {
+    subject: cfg.subject(items.length),
+    html: renderEmail(opts),
+    text: renderText({ ...opts, plainParagraphs: [cfg.headline(items.length), ...plainLines] }),
+    type: cfg.type
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Important-todo completion — sent to the requester, the assigned incharge and
 // every approver on the request's approval route when a starred todo is done.
 // ---------------------------------------------------------------------------
@@ -915,5 +1004,6 @@ module.exports = {
   buildExtensionApproverEmail,
   buildExtensionResultEmail,
   buildEndDateDigestEmail,
+  buildTodoDueDigestEmail,
   buildImportantTodoDoneEmail
 };

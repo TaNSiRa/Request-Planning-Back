@@ -259,7 +259,9 @@ router.patch("/me", audit("EDIT_PROFILE", "USER", req => req.user.id), asyncHand
     section: z.string().min(1),
     // Working days before a request end date to email a reminder (0 disables
     // the "near end date" digest; today/overdue reminders still send).
-    endDateNotifyDays: z.number().int().min(0).max(365).optional()
+    endDateNotifyDays: z.number().int().min(0).max(365).optional(),
+    // The same lead time for a to-do item's own end date.
+    todoNotifyDays: z.number().int().min(0).max(365).optional()
   });
   const input = schema.parse(req.body);
   const email = input.email.toLowerCase();
@@ -284,11 +286,13 @@ router.patch("/me", audit("EDIT_PROFILE", "USER", req => req.user.id), asyncHand
     branch: input.branch ?? null,
     department: input.department ?? null,
     section: input.section ?? null,
-    endDateNotifyDays: input.endDateNotifyDays ?? null
+    endDateNotifyDays: input.endDateNotifyDays ?? null,
+    todoNotifyDays: input.todoNotifyDays ?? null
   };
   await query(
     `UPDATE users SET employee_no=@employeeNo, email=@email, display_name=@displayName, full_name=@fullName, name_prefix=@namePrefix, position_id=@positionId, phone=@phone, branch=@branch, department=@department, section=@section,
-         end_date_notify_days=COALESCE(@endDateNotifyDays, end_date_notify_days), updated_at=SYSUTCDATETIME()
+         end_date_notify_days=COALESCE(@endDateNotifyDays, end_date_notify_days),
+         todo_notify_days=COALESCE(@todoNotifyDays, todo_notify_days), updated_at=SYSUTCDATETIME()
      WHERE id=@id`,
     { ...values, id: req.user.id }
   );

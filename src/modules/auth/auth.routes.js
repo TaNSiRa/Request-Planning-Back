@@ -305,6 +305,8 @@ function sanitizeUser(user) {
     section: user.section,
     phone: user.phone,
     endDateNotifyDays: user.end_date_notify_days ?? 5,
+    // May be undefined until patch_todo_notify_days.sql is applied.
+    todoNotifyDays: user.todo_notify_days ?? 1,
     roleCode: user.role_code,
     pdpaConsentAccepted,
     pdpaConsentAt: user.pdpa_consent_at,

@@ -173,6 +173,7 @@ function fixtureContext(tag) {
       user: res.body.user,
       get: url => withHeaders(agent.get(url)),
       post: url => withHeaders(agent.post(url)),
+      put: url => withHeaders(agent.put(url)),
       patch: url => withHeaders(agent.patch(url)),
       del: url => withHeaders(agent.delete(url))
     };
