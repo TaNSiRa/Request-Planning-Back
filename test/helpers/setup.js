@@ -143,6 +143,9 @@ function fixtureContext(tag) {
         `DELETE FROM notifications WHERE user_id IN ${inUsers}`,
         `DELETE FROM audit_logs WHERE actor_user_id IN ${inUsers}`,
         `DELETE FROM user_skill_levels WHERE user_id IN ${inUsers}`,
+        // Personal to-do board (items reference columns → items first).
+        `DELETE FROM personal_todo_items WHERE user_id IN ${inUsers}`,
+        `DELETE FROM personal_todo_columns WHERE user_id IN ${inUsers}`,
         `DELETE FROM user_section_memberships WHERE user_id IN ${inUsers}`,
         `DELETE FROM users WHERE id IN ${inUsers}`
       ]) {
