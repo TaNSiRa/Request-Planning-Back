@@ -21,6 +21,7 @@ const notificationRoutes = require("./modules/notifications/notifications.routes
 const skillMatrixRoutes = require("./modules/skillmatrix/skillmatrix.routes");
 const orgChartRoutes = require("./modules/orgchart/orgchart.routes");
 const weeklyPlanRoutes = require("./modules/weeklyplan/weeklyplan.routes");
+const personalTodoRoutes = require("./modules/personaltodo/personaltodo.routes");
 const healthRoutes = require("./modules/health/health.routes");
 
 function createApp() {
@@ -70,6 +71,7 @@ function createApp() {
   app.use("/api/skill-matrix", skillMatrixRoutes);
   app.use("/api/org-chart", orgChartRoutes);
   app.use("/api/weekly-plan", weeklyPlanRoutes);
+  app.use("/api/personal-todo", personalTodoRoutes);
 
   app.use(notFound);
   app.use(errorHandler);
