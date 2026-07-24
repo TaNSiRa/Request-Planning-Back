@@ -135,13 +135,30 @@ router.get("/request-options", asyncHandler(async (req, res) => {
 // decide whether the Skill Matrix page shows in the sidebar). Defaults to on
 // when the section has no explicit setting.
 router.get("/features", asyncHandler(async (req, res) => {
+  // The email gates ride along because every user — not just a section admin —
+  // needs them: the Profile › Reminders tab flags which of its switches an
+  // administrator has turned off. The full /settings list is admin-only, so a
+  // plain member could never read them there.
   const result = await query(
-    "SELECT setting_value FROM app_settings WHERE setting_key='skillMatrix.enabled' AND section_id=@sectionId",
+    `SELECT setting_key, setting_value FROM app_settings
+     WHERE setting_key IN ('skillMatrix.enabled', 'mail.enabled',
+                           'projectReminder.enabled', 'todoReminder.enabled')
+       AND section_id=@sectionId`,
     { sectionId: req.section.id }
   );
-  const raw = result.recordset[0]?.setting_value;
-  const skillMatrixEnabled = raw == null ? true : `${raw}`.trim().toLowerCase() === "true";
-  res.json({ skillMatrixEnabled });
+  const map = new Map(result.recordset.map(row => [row.setting_key, row.setting_value]));
+  // Each default must match the backend's own (settingsService.defaultReminderConfig
+  // and the mail gate), or the UI would warn about switches that are really on.
+  const flag = (key, fallback) => {
+    const raw = map.get(key);
+    return raw == null ? fallback : `${raw}`.trim().toLowerCase() === "true";
+  };
+  res.json({
+    skillMatrixEnabled: flag("skillMatrix.enabled", true),
+    mailEnabled: flag("mail.enabled", false),
+    projectReminderEnabled: flag("projectReminder.enabled", true),
+    todoReminderEnabled: flag("todoReminder.enabled", false)
+  });
 }));
 
 // Global org lookup lists (Branch/Department/Section) used to populate the
