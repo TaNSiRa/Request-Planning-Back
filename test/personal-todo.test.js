@@ -81,6 +81,41 @@ describe("personal to-do board", () => {
     assert.deepEqual(res.body.columns[1].items.map(i => i.content), ["Shipped", "Task A"]);
   });
 
+  it("remembers column widths, the board default, and the left-to-right order", async () => {
+    const session = await ctx.login(app, "requester");
+    const saved = await session.put("/api/personal-todo").send({
+      defaultWidth: 340,
+      columns: [
+        { title: "Wide", color: "#2f6bed", width: 420, items: [] },
+        // No width → follows the board default.
+        { title: "Default", color: "#23a35a", items: [] },
+        // Out of range → clamped into the allowed band, never rejected.
+        { title: "Tiny", color: "#e0982a", width: 40, items: [] }
+      ]
+    });
+    assert.equal(saved.status, 200);
+    assert.equal(saved.body.defaultWidth, 340);
+    assert.equal(saved.body.columns[0].width, 420);
+    assert.equal(saved.body.columns[1].width, null);
+    assert.equal(saved.body.columns[2].width, 200);
+
+    // Reordering is just a different column order on the next save.
+    const moved = await session.put("/api/personal-todo").send({
+      defaultWidth: 340,
+      columns: [
+        { title: "Default", color: "#23a35a", items: [] },
+        { title: "Wide", color: "#2f6bed", width: 420, items: [] },
+        { title: "Tiny", color: "#e0982a", width: 200, items: [] }
+      ]
+    });
+    assert.deepEqual(moved.body.columns.map(c => c.title), ["Default", "Wide", "Tiny"]);
+
+    const reread = await session.get("/api/personal-todo");
+    assert.deepEqual(reread.body.columns.map(c => c.title), ["Default", "Wide", "Tiny"]);
+    assert.deepEqual(reread.body.columns.map(c => c.width), [null, 420, 200]);
+    assert.equal(reread.body.defaultWidth, 340);
+  });
+
   it("keeps each user's board private", async () => {
     // member's board (set above) must not leak into approver2's freshly seeded one.
     const session = await ctx.login(app, "approver2");
