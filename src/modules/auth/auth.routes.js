@@ -11,6 +11,7 @@ const { getUserSections, isViewer, isAdmin } = require("../../services/sectionSe
 const { getViewerOverrides } = require("../../services/viewerService");
 const { verifyMicrosoftIdToken } = require("../../services/microsoftTokenService");
 const { getGlobalBool } = require("../../services/settingsService");
+const { planFromUserRow } = require("../../services/reminderPlan");
 const { env } = require("../../config/env");
 
 const router = express.Router();
@@ -243,11 +244,17 @@ async function attachUserContext(user) {
   return user;
 }
 
-async function findActiveUserByEmail(email) {
-  const result = await query(
-    `SELECT TOP 1 u.*, r.code AS role_code
+// Every logged-in user carries their job-position abbreviation so the top bar
+// can show "Name (ABBR)" without waiting for the positions master list to load.
+// LEFT JOIN so a user with no position (or the pre-patch state) still returns.
+const USER_SELECT = `SELECT TOP 1 u.*, r.code AS role_code, p.abbreviation AS position_abbr
      FROM users u
      JOIN roles r ON r.id = u.role_id
+     LEFT JOIN positions p ON p.id = u.position_id`;
+
+async function findActiveUserByEmail(email) {
+  const result = await query(
+    `${USER_SELECT}
      WHERE LOWER(u.email) = LOWER(@email) AND u.is_active = 1`,
     { email: `${email || ""}`.trim() }
   );
@@ -256,9 +263,7 @@ async function findActiveUserByEmail(email) {
 
 async function findActiveUserById(id) {
   const result = await query(
-    `SELECT TOP 1 u.*, r.code AS role_code
-     FROM users u
-     JOIN roles r ON r.id = u.role_id
+    `${USER_SELECT}
      WHERE u.id = @id AND u.is_active = 1`,
     { id }
   );
@@ -268,9 +273,7 @@ async function findActiveUserById(id) {
 async function findActiveUserByIdentifier(identifier) {
   const value = `${identifier || ""}`.trim();
   const result = await query(
-    `SELECT TOP 1 u.*, r.code AS role_code
-     FROM users u
-     JOIN roles r ON r.id = u.role_id
+    `${USER_SELECT}
      WHERE (LOWER(u.email) = LOWER(@identifier) OR u.employee_no = @identifier)
        AND u.is_active = 1
      ORDER BY CASE WHEN LOWER(u.email) = LOWER(@identifier) THEN 0 ELSE 1 END, u.id`,
@@ -299,14 +302,30 @@ function sanitizeUser(user) {
     namePrefix: user.name_prefix,
     // May be undefined until patch_positions_org_chart.sql is applied.
     positionId: user.position_id ?? null,
+    // Position abbreviation joined server-side (USER_SELECT) so the top bar can
+    // render "Name (ABBR)" without the positions master list.
+    positionAbbr: user.position_abbr ?? null,
     avatar: user.avatar ?? null,
     branch: user.branch,
     department: user.department,
     section: user.section,
     phone: user.phone,
+    // Legacy single lead times, superseded by reminderPlan below. Kept so an
+    // old cached client keeps rendering.
     endDateNotifyDays: user.end_date_notify_days ?? 5,
-    // May be undefined until patch_todo_notify_days.sql is applied.
     todoNotifyDays: user.todo_notify_days ?? 1,
+    // Due-date reminder schedule (Profile › การแจ้งเตือน). Resolved through
+    // planFromUserRow so a never-configured account reports the shipped
+    // defaults rather than nulls the UI would have to guess about.
+    reminderPlan: {
+      project: planFromUserRow(user, "project"),
+      todo: planFromUserRow(user, "todo"),
+      // NULL means "not configured" and pausing is the kinder default.
+      pauseOnHold: user.reminder_pause_on_hold === null || user.reminder_pause_on_hold === undefined
+        ? true
+        : user.reminder_pause_on_hold === true || user.reminder_pause_on_hold === 1,
+      preset: user.reminder_preset || "CUSTOM"
+    },
     roleCode: user.role_code,
     pdpaConsentAccepted,
     pdpaConsentAt: user.pdpa_consent_at,
