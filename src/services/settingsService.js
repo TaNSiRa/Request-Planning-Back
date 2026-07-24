@@ -65,9 +65,10 @@ function isTrue(value) {
 //                             Defaults ON: it is the original behaviour, and a
 //                             section that never opens Settings keeps it.
 //   todoReminder.enabled    — each to-do item's own period. Defaults OFF.
-// How many working days ahead to warn is a PERSONAL preference edited on the
-// Profile page (users.end_date_notify_days / users.todo_notify_days), so two
-// people in the same section can want different lead times.
+// WHEN each person is warned is a PERSONAL schedule edited on Profile ›
+// การแจ้งเตือน (users.project_notify_* / users.todo_notify_*, see
+// reminderPlan.js), so two people in the same section can be warned on
+// completely different days.
 function defaultReminderConfig() {
   return { project: true, todo: false };
 }

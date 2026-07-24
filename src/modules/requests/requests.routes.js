@@ -453,9 +453,8 @@ router.patch("/:id/todos/:todoId", audit("EDIT", "TODO", req => req.params.todoI
     `UPDATE request_todos SET title=@title, description=@description, planned_start=@plannedStart, planned_end=@plannedEnd,
       is_done=@isDone, is_important=COALESCE(@isImportant, is_important),
       completed_at=CASE WHEN @isDone=1 THEN SYSUTCDATETIME() ELSE NULL END,
-      -- Moving the end date is a new deadline, so the one-shot "this to-do is
-      -- overdue" reminder becomes eligible again.
-      overdue_notified_at=CASE WHEN planned_end = @plannedEnd THEN overdue_notified_at ELSE NULL END,
+      -- Moving planned_end needs no reminder bookkeeping: due_reminder_log is
+      -- keyed by due date, so a new deadline re-arms the whole schedule.
       updated_at=SYSUTCDATETIME()
      WHERE id=@todoId AND request_id=@id`,
     { ...values, todoId: Number(req.params.todoId), id: Number(req.params.id) }

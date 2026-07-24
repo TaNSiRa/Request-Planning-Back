@@ -316,10 +316,11 @@ router.post("/extension/:extensionId/approve", audit("APPROVE", "EXTENSION_REQUE
     }
     emitSystem("request.updated", { id: step.request_id, part: "extension" });
   } else {
-    // The end date moved — clear the one-shot overdue stamp so the end-date
-    // reminder job can warn again if the NEW end date is missed too.
+    // The end date moves; nothing to reset for the reminder job — its log is
+    // keyed by due date, so the new deadline is a fresh schedule by itself.
     await query(
-      "UPDATE requests SET planned_start=@start, planned_end=@end, overdue_notified_at=NULL, updated_at=SYSUTCDATETIME() WHERE id=@requestId",
+      `UPDATE requests SET planned_start=@start, planned_end=@end, updated_at=SYSUTCDATETIME()
+       WHERE id=@requestId`,
       {
         requestId: step.request_id,
         start: step.requested_start,

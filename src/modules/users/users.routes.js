@@ -12,6 +12,12 @@ const { VIEWER_PAGE_KEYS, getViewerOverrides, setViewerOverrides } = require("..
 const { routeStepUserCondition } = require("../../services/approverService");
 const { getUserDisplayOrder, sortUsersByDisplayOrder } = require("../../services/settingsService");
 const { emitSystem } = require("../../services/realtimeService");
+const {
+  PRESETS,
+  MAX_OFFSET_DAYS,
+  MAX_OFFSETS_PER_SIDE,
+  formatOffsetList
+} = require("../../services/reminderPlan");
 
 const router = express.Router();
 
@@ -298,6 +304,59 @@ router.patch("/me", audit("EDIT_PROFILE", "USER", req => req.user.id), asyncHand
   );
   emitSystem("users.updated", { id: req.user.id });
   res.json({ ok: true });
+}));
+
+// ── Due-date reminder schedule (Profile › การแจ้งเตือน) ────────────────────
+//
+// Lists of WORKING days before / on / after an end date at which the reminder
+// job emails this person. Saved on its own so editing the schedule never
+// re-validates (or re-saves) the identity fields above.
+
+const planSchema = z.object({
+  before: z.array(z.number().int().min(1).max(MAX_OFFSET_DAYS)).max(MAX_OFFSETS_PER_SIDE),
+  onDue: z.boolean(),
+  after: z.array(z.number().int().min(1).max(MAX_OFFSET_DAYS)).max(MAX_OFFSETS_PER_SIDE)
+});
+
+const reminderSchema = z.object({
+  // Which Profile preset produced these lists; drawing on the timeline sends
+  // CUSTOM. Stored for the UI only — the job reads the lists themselves.
+  preset: z.enum(["LOW", "NORMAL", "HIGH", "OFF", "CUSTOM"]).optional(),
+  project: planSchema,
+  todo: planSchema,
+  pauseOnHold: z.boolean().optional()
+});
+
+router.patch("/me/reminders", audit("EDIT_REMINDERS", "USER", req => req.user.id), asyncHandler(async (req, res) => {
+  const input = reminderSchema.parse(req.body);
+  await query(
+    `UPDATE users SET
+       project_notify_before=@projectBefore, project_notify_on_due=@projectOnDue, project_notify_after=@projectAfter,
+       todo_notify_before=@todoBefore, todo_notify_on_due=@todoOnDue, todo_notify_after=@todoAfter,
+       reminder_pause_on_hold=@pauseOnHold, reminder_preset=@preset, updated_at=SYSUTCDATETIME()
+     WHERE id=@id`,
+    {
+      // formatOffsetList de-duplicates, sorts and drops out-of-range values, so
+      // what lands in the column is exactly what the job will read back.
+      projectBefore: formatOffsetList(input.project.before),
+      projectOnDue: input.project.onDue,
+      projectAfter: formatOffsetList(input.project.after),
+      todoBefore: formatOffsetList(input.todo.before),
+      todoOnDue: input.todo.onDue,
+      todoAfter: formatOffsetList(input.todo.after),
+      pauseOnHold: input.pauseOnHold ?? true,
+      preset: input.preset ?? "CUSTOM",
+      id: req.user.id
+    }
+  );
+  emitSystem("users.updated", { id: req.user.id });
+  res.json({ ok: true });
+}));
+
+// The shipped presets, so the Profile page shows exactly what the job would do
+// rather than hardcoding a second copy of the numbers.
+router.get("/me/reminders/presets", asyncHandler(async (req, res) => {
+  res.json(PRESETS);
 }));
 
 // Own profile picture — a small square image data URL produced by the Profile

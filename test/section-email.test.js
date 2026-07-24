@@ -2,7 +2,7 @@
 //   mail.enabled            — whether the system delivers ANY email for a section
 //   projectReminder.enabled — daily warning on the request's project end date
 //   todoReminder.enabled    — daily warning on each to-do item's own end date
-// plus the one-shot overdue behaviour of the to-do pass.
+// plus the one-shot near-due / overdue behaviour of the to-do pass.
 //
 // SMTP is blank in tests (helpers/setup blanks SMTP_HOST), so nothing is ever
 // delivered — but sendMail always records the message in email_outbox first,
@@ -55,11 +55,25 @@ async function putSetting(key, value, valueType = "bool") {
   assert.equal(res.status, 200, JSON.stringify(res.body));
 }
 
-// The "warn me N working days ahead" lead time is a PERSONAL preference edited
-// on the Profile page, not a section setting.
-async function setTodoNotifyDays(days) {
-  await query("UPDATE users SET todo_notify_days=@days WHERE id=@userId",
-    { days, userId: fixture.users.member });
+// The reminder SCHEDULE is a PERSONAL preference edited on Profile › การแจ้งเตือน,
+// not a section setting: lists of working days before / on / after the due date.
+async function setTodoPlan({ before = "1", onDue = true, after = "1" } = {}) {
+  await query(
+    `UPDATE users SET todo_notify_before=@before, todo_notify_on_due=@onDue, todo_notify_after=@after
+     WHERE id=@userId`,
+    { before, onDue, after, userId: fixture.users.member }
+  );
+}
+
+// Pretend a reminder for this offset already went out, the way a successful
+// delivery would. `due` must be the to-do's CURRENT planned_end — the log is
+// keyed by due date, which is what makes a moved deadline warn again.
+async function stampTodoReminder(todoId, due, offset) {
+  await query(
+    `INSERT INTO due_reminder_log (target_type, target_id, user_id, due_date, offset_days, status)
+     VALUES ('TODO', @todoId, @userId, @due, @offset, 'SENT')`,
+    { todoId, userId: fixture.users.member, due, offset }
+  );
 }
 
 // Outbox rows for this fixture's section. A reminder digest bundles every
@@ -230,7 +244,7 @@ describe("per-section email switches", () => {
     assert.equal(done.status, 200, JSON.stringify(done.body));
 
     await putSetting("todoReminder.enabled", true);
-    await setTodoNotifyDays(2); // NEAR_END is 2 working days from TODAY
+    await setTodoPlan({ before: "2" }); // NEAR_END is 2 working days from TODAY
     await clearOutbox();
     await sendTodoDueReminders(TODAY, new Set());
 
@@ -246,20 +260,20 @@ describe("per-section email switches", () => {
     assert.doesNotMatch(allHtml, /a finished todo/, "a completed to-do is never warned about");
   });
 
-  it("uses each person's own to-do lead time from their Profile", async () => {
+  it("uses each person's own to-do schedule from their Profile", async () => {
     const id = await newRequest();
     await addTodo(id, "a lead time todo", NEAR_END); // 2 working days from TODAY
     await putSetting("todoReminder.enabled", true);
 
-    // The shipped default is one day ahead, so a to-do 2 days out is not "near".
-    assert.equal(incharge.user.todoNotifyDays, 1, "profile default is 1 day ahead");
-    await setTodoNotifyDays(1);
+    // The shipped default warns one working day ahead, so a to-do 2 days out is
+    // not due a warning yet.
+    await setTodoPlan({ before: "1" });
     await clearOutbox();
     await sendTodoDueReminders(TODAY, new Set());
     assert.deepEqual(await outbox("TODO_DUE_NEAR"), []);
 
-    // Widen this one person's window and the same to-do now warns.
-    await setTodoNotifyDays(2);
+    // Add a 2-days-ahead point to this one person's schedule and it warns.
+    await setTodoPlan({ before: "2,1" });
     await clearOutbox();
     await sendTodoDueReminders(TODAY, new Set());
     const near = await outbox("TODO_DUE_NEAR");
@@ -267,38 +281,84 @@ describe("per-section email switches", () => {
     assert.match(near[0].body_html, /a lead time todo/);
   });
 
-  it("skips a to-do already warned about, until its end date is moved", async () => {
+  it("fires each point of the schedule once, then moves to the next", async () => {
     const id = await newRequest();
-    const todoId = await addTodo(id, "the one-shot todo", OVERDUE_END);
+    const todoId = await addTodo(id, "the countdown todo", NEAR_END); // 2 days out
     await putSetting("todoReminder.enabled", true);
-    await setTodoNotifyDays(0); // NEAR off for this person, isolating OVERDUE
+    // Warn at 2 AND at 1 day left. The old behaviour mailed on both days because
+    // both were "inside the window"; now each point fires on its own day only.
+    await setTodoPlan({ before: "2,1" });
 
-    // Stamp every overdue to-do in the section the way a successful delivery
-    // would, so only this test's to-do can produce a new OVERDUE digest.
-    await query(
-      `UPDATE t SET t.overdue_notified_at=SYSUTCDATETIME()
-       FROM request_todos t JOIN requests r ON r.id = t.request_id
-       WHERE r.section_id=@sectionId`,
-      { sectionId: fixture.sectionId }
-    );
     await clearOutbox();
     await sendTodoDueReminders(TODAY, new Set());
-    assert.deepEqual(await outbox("TODO_DUE_OVERDUE"), [],
-      "an already-warned to-do is never nagged again");
+    const first = await outbox("TODO_DUE_NEAR");
+    assert.equal(first.length, 1);
+    assert.match(first[0].body_html, /the countdown todo/);
 
-    // Moving the end date is a new deadline, so the warning becomes eligible again.
+    // Record that delivery, then run the same day again: this to-do is quiet
+    // (other near-due to-dos of the section may still fill a digest).
+    await stampTodoReminder(todoId, NEAR_END, -2);
+    await clearOutbox();
+    await sendTodoDueReminders(TODAY, new Set());
+    assert.deepEqual(
+      (await outbox("TODO_DUE_NEAR")).filter(row => /the countdown todo/.test(row.body_html)), [],
+      "a point that already went out is never re-sent");
+
+    // A day on, one day is left — the schedule's next point, so it fires.
+    await clearOutbox();
+    await sendTodoDueReminders("2026-08-11", new Set());
+    const second = await outbox("TODO_DUE_NEAR");
+    assert.equal(second.length, 1, "the next point down the countdown still fires");
+    assert.match(second[0].body_html, /the countdown todo/);
+  });
+
+  it("catches up with one email, not a backlog, after a gap", async () => {
+    const id = await newRequest();
+    const todoId = await addTodo(id, "the catch-up todo", "2026-08-11"); // 1 working day out
+    await putSetting("todoReminder.enabled", true);
+    // Points at 5, 3 and 1 days left: on TODAY only 1 day is left, so the first
+    // two are already in the past — as if the job had been down all week.
+    await setTodoPlan({ before: "5,3,1" });
+
+    await clearOutbox();
+    await sendTodoDueReminders(TODAY, new Set());
+    assert.equal((await outbox("TODO_DUE_NEAR")).length, 1,
+      "a week of missed points collapses into one email");
+
+    // The missed points are consumed, so they can never fire late.
+    const skipped = (await query(
+      `SELECT offset_days FROM due_reminder_log
+       WHERE target_type='TODO' AND target_id=@todoId AND status='SKIPPED'
+       ORDER BY offset_days`,
+      { todoId }
+    )).recordset;
+    assert.deepEqual(skipped.map(row => row.offset_days), [-5, -3]);
+  });
+
+  it("warns again about a to-do whose end date was moved", async () => {
+    const id = await newRequest();
+    const todoId = await addTodo(id, "the moved todo", OVERDUE_END);
+    await putSetting("todoReminder.enabled", true);
+    await setTodoPlan({ before: "", onDue: false, after: "1" }); // isolate OVERDUE
+
+    // Every overdue point of this deadline has already been delivered.
+    await stampTodoReminder(todoId, OVERDUE_END, 1);
+    await clearOutbox();
+    await sendTodoDueReminders(TODAY, new Set());
+    assert.deepEqual(
+      (await outbox("TODO_DUE_OVERDUE")).filter(row => /the moved todo/.test(row.body_html)), [],
+      "an already-warned to-do is never nagged again for the same deadline");
+
+    // Moving the end date is a NEW deadline. Nothing is cleared anywhere — the
+    // log is keyed by due date, so the whole schedule is eligible again.
     const moved = await incharge.patch(`/api/requests/${id}/todos/${todoId}`)
-      .send(todoPayload("the one-shot todo", "2026-08-07"));
+      .send(todoPayload("the moved todo", "2026-08-07"));
     assert.equal(moved.status, 200, JSON.stringify(moved.body));
-    const stamp = (await query(
-      "SELECT overdue_notified_at FROM request_todos WHERE id=@todoId", { todoId }
-    )).recordset[0].overdue_notified_at;
-    assert.equal(stamp, null, "editing planned_end clears the one-shot stamp");
 
     await clearOutbox();
     await sendTodoDueReminders(TODAY, new Set());
     const overdue = await outbox("TODO_DUE_OVERDUE");
     assert.equal(overdue.length, 1);
-    assert.match(overdue[0].body_html, /the one-shot todo/);
+    assert.match(overdue[0].body_html, /the moved todo/);
   });
 });
