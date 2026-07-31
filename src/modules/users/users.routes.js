@@ -33,7 +33,7 @@ router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
   const approverCond = await routeStepUserCondition("ars", "u.id");
   const result = await query(
     `SELECT u.id, u.employee_no, u.email, u.display_name, u.full_name, u.name_prefix, u.branch, u.department, u.section, u.phone, u.is_active, u.role_id,
-            u.position_id, p.name AS position_name, p.abbreviation AS position_abbr,
+            u.position_id, p.name AS position_name, p.abbreviation AS position_abbr, p.sort_order AS position_sort,
             r.code AS role_code, r.name AS role_name,
             m.can_request, m.can_work, m.is_section_admin, m.is_active AS membership_active,
             (SELECT ms.section_id, ms.can_request, ms.can_work, ms.is_section_admin
@@ -58,15 +58,26 @@ router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
   // Same fixed user order as the assignee dropdowns / weekly plan (set with the
   // weekly-plan arrows); users not in the saved order stay alphabetical.
   // Roles are grouped first — System Admin, Section Admin, Viewer, Requester —
-  // keeping the order above among users of the same role.
+  // and inside a role people are ranked by their job position exactly as the org
+  // chart does it (positions.sort_order ascending, lowest = most senior; users
+  // with no position last). The order above only breaks remaining ties.
   const ordered = sortUsersByDisplayOrder(result.recordset, await getUserDisplayOrder(req.section.id));
   const roleRank = { ADMIN: 0, SECTION_ADMIN: 1, VIEWER: 2, REQUESTER: 3 };
   const rankOf = row => roleRank[`${row.role_code}`.toUpperCase()] ?? 4;
+  const positionRankOf = row =>
+    row.position_sort === null || row.position_sort === undefined
+      ? Number.MAX_SAFE_INTEGER
+      : Number(row.position_sort);
   const rows = ordered
     .map((row, index) => ({ row, index }))
-    .sort((a, b) => rankOf(a.row) - rankOf(b.row) || a.index - b.index)
+    .sort(
+      (a, b) =>
+        rankOf(a.row) - rankOf(b.row) ||
+        positionRankOf(a.row) - positionRankOf(b.row) ||
+        a.index - b.index
+    )
     .map(({ row }) => {
-      const { memberships_json, approver_sections_json, ...rest } = row;
+      const { memberships_json, approver_sections_json, position_sort, ...rest } = row;
       return {
         ...rest,
         memberships: memberships_json ? JSON.parse(memberships_json) : [],

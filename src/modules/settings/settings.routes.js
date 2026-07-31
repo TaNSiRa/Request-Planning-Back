@@ -178,7 +178,12 @@ router.get("/org-options", asyncHandler(async (req, res) => {
   )).recordset;
   res.json({
     branches: splitCsv(map["org.branches"], []),
-    departments: splitCsv(map["org.departments"], []),
+    // Departments are a flat lookup list with no meaningful stored order, so
+    // hand them out A-Z (case-insensitive) — the Settings editor keeps the CSV
+    // sorted too, this just guarantees it for values saved before that.
+    departments: splitCsv(map["org.departments"], []).sort((a, b) =>
+      a.localeCompare(b, undefined, { sensitivity: "base" })
+    ),
     sections: sectionRows.map(row => row.name).filter(Boolean)
   });
 }));
