@@ -7,6 +7,7 @@ const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth, signToken } = require("../../middleware/auth");
 const { writeAudit } = require("../../middleware/audit");
 const { clearSession, setLoggedInSession } = require("../../services/securityService");
+const { bumpTokenVersion } = require("../../services/accountState");
 const { getUserSections, isViewer, isAdmin } = require("../../services/sectionService");
 const { getViewerOverrides } = require("../../services/viewerService");
 const { verifyMicrosoftIdToken } = require("../../services/microsoftTokenService");
@@ -124,6 +125,9 @@ router.delete("/login-blocks", requireAuth, requireGlobalAdmin, asyncHandler(asy
 
 router.post("/logout", requireAuth, asyncHandler(async (req, res) => {
   await writeAudit({ actorId: req.user.id, action: "LOGOUT", entityType: "AUTH", ip: req.ip, userAgent: req.headers["user-agent"] });
+  // Destroying the session only sheds the cookie; bumping the counter also kills
+  // the bearer token, which would otherwise stay valid for its full lifetime.
+  await bumpTokenVersion(req.user.id);
   clearSession(req, res, () => res.json({ ok: true }));
 }));
 
@@ -176,7 +180,16 @@ router.post("/microsoft/login", asyncHandler(async (req, res) => {
     return res.status(403).json({ message: "Microsoft 365 login is disabled" });
   }
   const input = microsoftLoginSchema.parse(req.body);
-  const claims = await verifyMicrosoftIdToken(input.idToken);
+  // Any verification failure (bad signature, wrong audience, expired) is a 401
+  // with one generic message — the specific reason stays in the server log so a
+  // caller can't probe which check it tripped.
+  let claims;
+  try {
+    claims = await verifyMicrosoftIdToken(input.idToken);
+  } catch (err) {
+    console.error("Microsoft id_token verification failed:", err.message);
+    return res.status(401).json({ message: "Microsoft sign-in could not be verified" });
+  }
   const email = claims.preferred_username || claims.email || claims.upn || "";
   if (!email) return res.status(401).json({ message: "Microsoft account email was not found" });
 

@@ -6,6 +6,55 @@ const { env } = require("../config/env");
 const attachmentRoot = path.resolve(env.attachmentRoot);
 const legacyAttachmentRoot = path.resolve(__dirname, "../../assets/attachments");
 
+// Accepted attachment kinds: extension -> the MIME types a browser reports for
+// it. An upload must match on BOTH sides (extension AND content type) so a
+// renamed executable can't ride in as ".pdf". Browsers sometimes send an empty
+// or generic type for office documents, so "application/octet-stream" and "" are
+// tolerated when the extension itself is on the list.
+//
+// To allow another kind, add one entry here and mirror it in the frontend's
+// pickFileAttachments() accept list (create_request_page.dart).
+const ALLOWED_ATTACHMENTS = {
+  ".pdf": ["application/pdf"],
+  ".png": ["image/png"],
+  ".jpg": ["image/jpeg"],
+  ".jpeg": ["image/jpeg"],
+  ".webp": ["image/webp"],
+  ".doc": ["application/msword"],
+  ".docx": ["application/vnd.openxmlformats-officedocument.wordprocessingml.document"],
+  ".xls": ["application/vnd.ms-excel"],
+  ".xlsx": ["application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"]
+};
+
+const GENERIC_CONTENT_TYPES = new Set(["", "application/octet-stream", "binary/octet-stream"]);
+
+const ALLOWED_EXTENSION_LIST = Object.keys(ALLOWED_ATTACHMENTS).join(", ");
+
+function badRequest(message) {
+  const err = new Error(message);
+  err.status = 400;
+  return err;
+}
+
+// Throws a 400 unless the (fileName, contentType) pair is on the whitelist.
+// Only the extension actually present on the uploaded name counts — the
+// safeExtension() fallbacks below must not be able to invent an allowed one.
+function assertAllowedAttachment(fileName, contentType) {
+  const ext = path.extname(`${fileName || ""}`).toLowerCase();
+  const allowedTypes = ALLOWED_ATTACHMENTS[ext];
+  if (!allowedTypes) {
+    throw badRequest(
+      `File type "${ext || path.basename(`${fileName || "unnamed"}`)}" is not allowed. ` +
+      `Allowed types: ${ALLOWED_EXTENSION_LIST}`
+    );
+  }
+  const type = `${contentType || ""}`.split(";")[0].trim().toLowerCase();
+  if (GENERIC_CONTENT_TYPES.has(type)) return;
+  if (!allowedTypes.includes(type)) {
+    throw badRequest(`File "${fileName}" does not match its type (${type}) and was rejected`);
+  }
+}
+
 function splitDataUrl(dataUrl) {
   const match = /^data:([^;,]*)(;base64)?,(.*)$/s.exec(dataUrl || "");
   if (!match) throw new Error("Invalid attachment data URL");
@@ -73,6 +122,8 @@ async function fileExists(filePath) {
 async function storeDataUrlAttachment({ dataUrl, fileName, contentType }, context = {}) {
   const parsed = splitDataUrl(dataUrl);
   const finalContentType = contentType || parsed.contentType;
+  // Single choke point — every upload path in the app goes through here.
+  assertAllowedAttachment(fileName, finalContentType);
   const dir = path.join(attachmentRoot, ...storageFolderParts(context));
   await fs.mkdir(dir, { recursive: true });
   const storedName = `${crypto.randomUUID()}${safeExtension(fileName, finalContentType)}`;
@@ -123,6 +174,8 @@ async function removeEmptyParents(dir, root) {
 }
 
 module.exports = {
+  ALLOWED_ATTACHMENTS,
+  assertAllowedAttachment,
   attachmentRoot,
   legacyAttachmentRoot,
   storeDataUrlAttachment,

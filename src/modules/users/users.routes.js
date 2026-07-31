@@ -4,10 +4,13 @@ const { z } = require("zod");
 const { env } = require("../../config/env");
 const { query } = require("../../db/pool");
 const { asyncHandler } = require("../../middleware/asyncHandler");
-const { requireAuth } = require("../../middleware/auth");
+const { requireAuth, signToken } = require("../../middleware/auth");
+const { setLoggedInSession } = require("../../services/securityService");
 const { audit } = require("../../middleware/audit");
 const { requireSectionAdmin, resolveSection, isAdmin, isViewer, canManageTargetRole } = require("../../services/sectionService");
 const { blockViewerWrites } = require("../../middleware/viewerGuard");
+const { rejectWeakPassword } = require("../../services/passwordPolicy");
+const { bumpTokenVersion, forgetAccount } = require("../../services/accountState");
 const { VIEWER_PAGE_KEYS, getViewerOverrides, setViewerOverrides } = require("../../services/viewerService");
 const { routeStepUserCondition } = require("../../services/approverService");
 const { getUserDisplayOrder, sortUsersByDisplayOrder } = require("../../services/settingsService");
@@ -162,6 +165,7 @@ router.post("/", requireSectionAdmin, audit("CREATE", "USER", req => req.body.em
     memberships: membershipsSchema
   });
   const input = schema.parse(req.body);
+  if (rejectWeakPassword(res, input.password)) return;
   // Privilege guard: a section admin (non-global) may only create plain requesters.
   if (!canManageTargetRole(req.user, await roleCodeById(input.roleId))) {
     return res.status(403).json({ message: "You can only assign the Requester role" });
@@ -243,6 +247,14 @@ router.patch("/:id(\\d+)", requireSectionAdmin, audit("EDIT", "USER", req => req
       isActive: input.isActive
     }
   );
+  // Deactivating an account must also cut off whatever token/session it already
+  // holds, not just block the next login. Otherwise the cached account state is
+  // simply dropped so the change is picked up on the next request.
+  if (input.isActive === false) {
+    await bumpTokenVersion(Number(req.params.id));
+  } else {
+    forgetAccount(Number(req.params.id));
+  }
   await applyMembershipsForActor(req, Number(req.params.id), input);
   emitSystem("users.updated", { id: Number(req.params.id) });
   res.json({ ok: true });
@@ -251,6 +263,7 @@ router.patch("/:id(\\d+)", requireSectionAdmin, audit("EDIT", "USER", req => req
 router.post("/:id(\\d+)/reset-password", requireSectionAdmin, audit("RESET_PASSWORD", "USER", req => req.params.id), asyncHandler(async (req, res) => {
   const schema = z.object({ password: z.string().min(1) });
   const input = schema.parse(req.body);
+  if (rejectWeakPassword(res, input.password)) return;
   if (!canManageTargetRole(req.user, await targetRoleCode(Number(req.params.id)))) {
     return res.status(403).json({ message: "You cannot manage this user" });
   }
@@ -259,6 +272,9 @@ router.post("/:id(\\d+)/reset-password", requireSectionAdmin, audit("RESET_PASSW
     id: Number(req.params.id),
     passwordHash
   });
+  // An admin resetting a password is usually responding to a lost or leaked
+  // credential — sign the account out everywhere it is currently signed in.
+  await bumpTokenVersion(Number(req.params.id));
   res.json({ ok: true });
 }));
 
@@ -418,9 +434,24 @@ router.patch("/me/password", audit("CHANGE_PASSWORD", "USER", req => req.user.id
   if (!user || !(await bcrypt.compare(input.currentPassword, user.password_hash))) {
     return res.status(400).json({ message: "Current password is incorrect" });
   }
+  // Checked after the current-password proof so the policy text is never a
+  // probing oracle for someone who doesn't already hold the account.
+  if (rejectWeakPassword(res, input.newPassword)) return;
+  if (input.newPassword === input.currentPassword) {
+    return res.status(400).json({ message: "New password must be different from the current one" });
+  }
   const passwordHash = await bcrypt.hash(input.newPassword, env.bcryptRounds);
   await query("UPDATE users SET password_hash=@passwordHash, updated_at=SYSUTCDATETIME() WHERE id=@id", { id: req.user.id, passwordHash });
-  res.json({ ok: true });
+  // Changing your own password signs out every OTHER device holding a token for
+  // this account — then re-issues a token and session for the caller, so the tab
+  // that just did it stays logged in.
+  await bumpTokenVersion(req.user.id);
+  const refreshed = (await query(
+    `SELECT u.*, r.code AS role_code FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = @id`,
+    { id: req.user.id }
+  )).recordset[0];
+  const csrfToken = refreshed ? setLoggedInSession(req, refreshed) : null;
+  res.json({ ok: true, token: refreshed ? signToken(refreshed) : null, csrfToken });
 }));
 
 router.get("/roles", asyncHandler(async (req, res) => {

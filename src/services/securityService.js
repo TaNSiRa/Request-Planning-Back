@@ -1,6 +1,7 @@
 const crypto = require("crypto");
 const session = require("express-session");
 const { env } = require("../config/env");
+const { tokenVersionOf } = require("./accountState");
 
 function createCsrfToken() {
   return crypto.randomBytes(32).toString("base64url");
@@ -39,6 +40,9 @@ function buildSessionUser(user) {
     department: user.department,
     section: user.section,
     roleCode: user.role_code || user.roleCode,
+    // Same revocation counter the JWT carries, so a session cookie is cut off by
+    // a password reset or deactivation exactly like a bearer token.
+    tv: tokenVersionOf(user),
     pdpaConsentAccepted: user.pdpa_consent_accepted === true ||
       user.pdpa_consent_accepted === 1 ||
       user.pdpaConsentAccepted === true
@@ -62,24 +66,38 @@ function clearSession(req, res, callback) {
   });
 }
 
+// CSRF is only exploitable against credentials the BROWSER attaches on its own —
+// i.e. the session cookie. A Bearer token has to be set by same-origin JS, which
+// an attacker's page cannot do, so a caller presenting only `Authorization` and
+// no session cookie needs no CSRF token (and could never have obtained one).
+// Gate strictly on "is there a logged-in session cookie".
 function csrfProtection(req, res, next) {
   if (["GET", "HEAD", "OPTIONS"].includes(req.method)) {
     next();
     return;
   }
 
-  if (!req.session?.user && !req.headers.authorization) {
+  if (!req.session?.user) {
     next();
     return;
   }
 
   const expectedToken = req.session.csrfToken;
   const actualToken = req.get("x-csrf-token");
-  if (!expectedToken || !actualToken || actualToken !== expectedToken) {
+  if (!expectedToken || !actualToken || !safeEquals(actualToken, expectedToken)) {
     res.status(403).json({ message: "CSRF_REQUIRED" });
     return;
   }
   next();
+}
+
+// Constant-time compare so the token can't be recovered a character at a time
+// by timing the 403s.
+function safeEquals(a, b) {
+  const left = Buffer.from(`${a}`, "utf8");
+  const right = Buffer.from(`${b}`, "utf8");
+  if (left.length !== right.length) return false;
+  return crypto.timingSafeEqual(left, right);
 }
 
 function forceHttps(req, res, next) {
