@@ -76,6 +76,41 @@ describe("request approval flow", () => {
     assert.equal(await pendingStepFor(approver2, id), null);
   });
 
+  // request_no = <PREFIX>-<yymmdd of the Thai day>-<4-digit tail>, where the
+  // tail is a per-section running number that only restarts when the YEAR rolls
+  // over — see generateRequestNumber.
+  it("continues the running number across days and only resets per year", async () => {
+    // Thai calendar day (UTC+7), the same clock the generator stamps.
+    const thai = new Date(Date.now() + 7 * 60 * 60 * 1000);
+    const yy = `${thai.getUTCFullYear()}`.slice(-2);
+    const today = `${yy}${`${thai.getUTCMonth() + 1}`.padStart(2, "0")}${`${thai.getUTCDate()}`.padStart(2, "0")}`;
+
+    // A request from an earlier day of the SAME year that already reached 0042.
+    await query(
+      `INSERT INTO requests (section_id, request_no, requester_user_id, title, request_type, priority, due_date, description, status)
+       VALUES (@sectionId, @requestNo, @userId, 'earlier day', 'IMPROVEMENT', 'NORMAL', '2026-12-31', 'seeded by test', 'PENDING_APPROVAL')`,
+      {
+        sectionId: fixture.sectionId,
+        requestNo: `${ctx.REQUEST_PREFIX}-${yy}0101-0042`,
+        userId: fixture.users.requester
+      }
+    );
+
+    const { requestNo } = await createRequest(requester);
+    assert.equal(requestNo, `${ctx.REQUEST_PREFIX}-${today}-0043`);
+  });
+
+  it("gives concurrent submissions distinct request numbers", async () => {
+    const created = await Promise.all([
+      createRequest(requester),
+      createRequest(requester),
+      createRequest(requester),
+      createRequest(requester)
+    ]);
+    const numbers = created.map(row => row.requestNo);
+    assert.equal(new Set(numbers).size, numbers.length, `duplicate request_no: ${numbers.join(", ")}`);
+  });
+
   it("does not let a non-approver act on a pending step", async () => {
     const { id } = await createRequest(requester);
     const step = await pendingStepFor(approver1, id);

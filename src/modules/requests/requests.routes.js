@@ -262,16 +262,13 @@ router.post("/", audit("CREATE", "REQUEST", req => req.body.title), asyncHandler
   const maxAttachments = await getMaxAttachments(req.section.id, "request");
   assertAttachmentLimit(attachments, maxAttachments);
   const requesterSectionId = await resolveRequesterSection(req.user.section, req.section.id);
-  const number = await generateRequestNumber(req.section.id, req.section.requestPrefix || "AR");
-  const insert = await query(
-    // is_kpi starts false — the approver decides whether it counts as KPI when
-    // they assign the work, not the requester at creation time.
-    `INSERT INTO requests (section_id, requester_section_id, request_no, requester_user_id, title, request_type, system_area, priority, due_date, description, business_impact, status, is_kpi)
-     OUTPUT INSERTED.id
-     VALUES (@sectionId, @requesterSectionId, @number, @userId, @title, @requestType, @systemArea, @priority, @dueDate, @description, @businessImpact, 'PENDING_APPROVAL', 0)`,
-    { ...values, sectionId: req.section.id, requesterSectionId, number, userId: req.user.id }
+  // The number is allocated inside the insert so a lost race just retries; see
+  // insertRequestRow.
+  const { id: requestId, number } = await insertRequestRow(
+    req.section.id,
+    req.section.requestPrefix || "AR",
+    { ...values, requesterSectionId, userId: req.user.id }
   );
-  const requestId = insert.recordset[0].id;
   await saveAttachments(requestId, attachments, maxAttachments);
   await createApprovalSteps(requestId, req.section.id, requesterSectionId, input.requestType);
   await notifyRequestParticipants(requestId, "CREATE", "Request submitted", number);
@@ -1018,24 +1015,87 @@ function attachmentSchema({ defaultEmpty = true } = {}) {
   return defaultEmpty ? schema.optional().default([]) : schema.optional();
 }
 
+// The date stamped into request_no is the local Thai calendar day, not the
+// server's. Asia/Bangkok is a fixed UTC+07:00 (Thailand dropped DST in 1976),
+// so shifting the clock by the offset and reading it back in UTC gives the
+// Thai date no matter which timezone the host is set to — a request submitted
+// at 18:00 Thai time stays on today's date instead of jumping to tomorrow.
+const THAI_UTC_OFFSET_MINUTES = 7 * 60;
+
+function thaiNow(now = new Date()) {
+  return new Date(now.getTime() + THAI_UTC_OFFSET_MINUTES * 60 * 1000);
+}
+
 async function generateRequestNumber(sectionId, requestPrefix = "AR") {
-  const now = new Date();
+  const now = thaiNow();
   const yy = `${now.getUTCFullYear()}`.slice(-2);
   const mm = `${now.getUTCMonth() + 1}`.padStart(2, "0");
   const dd = `${now.getUTCDate()}`.padStart(2, "0");
   const safePrefix = `${requestPrefix || "AR"}`.trim().toUpperCase().replace(/[^A-Z0-9]/g, "") || "AR";
   const prefix = `${safePrefix}-${yy}${mm}${dd}-`;
+  // The 4-digit tail is a per-section YEARLY running number: it keeps counting
+  // across days (AR-260803-0001 -> AR-260804-0002) and only restarts at 0001
+  // when the yy in the date part rolls over. So scan every number of this
+  // section whose date part starts with the same yy and take the highest tail
+  // rather than the tail of the newest row — that way a manually edited or
+  // out-of-order number can never hand out a duplicate.
+  const yearPattern = `${safePrefix}-${yy}[0-9][0-9][0-9][0-9]-%`;
+  const tailStart = prefix.length + 1; // 1-based index of the digits after the last dash
   const result = await query(
-    `SELECT TOP 1 request_no
+    `SELECT MAX(TRY_CAST(SUBSTRING(request_no, @tailStart, 10) AS INT)) AS max_no
      FROM requests
-     WHERE section_id=@sectionId AND request_no LIKE @prefix + '%'
-     ORDER BY request_no DESC`,
-    { prefix, sectionId }
+     WHERE section_id=@sectionId AND request_no LIKE @yearPattern`,
+    { yearPattern, tailStart, sectionId }
   );
-  const latest = result.recordset[0]?.request_no || "";
-  const latestNo = Number.parseInt(latest.slice(prefix.length), 10);
-  const nextNo = Number.isFinite(latestNo) ? latestNo + 1 : 1;
+  const latestNo = result.recordset[0]?.max_no;
+  const nextNo = Number.isFinite(latestNo) && latestNo > 0 ? latestNo + 1 : 1;
   return `${prefix}${String(nextNo).padStart(4, "0")}`;
+}
+
+// SQL Server's error numbers for a unique-constraint (2627) / unique-index
+// (2601) violation. mssql puts the number on the error, or one level down on
+// the driver's original error depending on where it was raised.
+function isDuplicateKeyError(err) {
+  const number = err?.number ?? err?.originalError?.info?.number;
+  return number === 2627 || number === 2601;
+}
+
+const REQUEST_NO_ATTEMPTS = 5;
+
+// Two people submitting in the same instant both read the same MAX() and would
+// build the same request_no. Rather than lock the table on every create, we let
+// the UNIQUE index on requests.request_no be the arbiter: whoever inserts first
+// wins, the loser gets a duplicate-key error, re-reads the counter (the winner's
+// row is committed by then) and takes the next number. Only the INSERT is
+// retried — attachments, approval steps and notifications happen after we hold
+// a number that is definitely ours.
+async function insertRequestRow(sectionId, requestPrefix, columns) {
+  let lastError;
+  for (let attempt = 0; attempt < REQUEST_NO_ATTEMPTS; attempt += 1) {
+    const number = await generateRequestNumber(sectionId, requestPrefix);
+    try {
+      const insert = await query(
+        // is_kpi starts false — the approver decides whether it counts as KPI when
+        // they assign the work, not the requester at creation time.
+        `INSERT INTO requests (section_id, requester_section_id, request_no, requester_user_id, title, request_type, system_area, priority, due_date, description, business_impact, status, is_kpi)
+         OUTPUT INSERTED.id
+         VALUES (@sectionId, @requesterSectionId, @number, @userId, @title, @requestType, @systemArea, @priority, @dueDate, @description, @businessImpact, 'PENDING_APPROVAL', 0)`,
+        { ...columns, sectionId, number }
+      );
+      return { id: insert.recordset[0].id, number };
+    } catch (err) {
+      // request_no is the only unique column on requests, so a duplicate here
+      // is always a number collision — anything else is a real failure.
+      if (!isDuplicateKeyError(err)) throw err;
+      lastError = err;
+      // Short random backoff so two racers don't line up and collide again.
+      await new Promise(resolve => setTimeout(resolve, 20 + Math.floor(Math.random() * 60)));
+    }
+  }
+  const err = new Error("Could not allocate a request number, please try again");
+  err.status = 409;
+  err.cause = lastError;
+  throw err;
 }
 
 async function notifyFirstCloseApprover(requestId) {
