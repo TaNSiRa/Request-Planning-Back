@@ -5,7 +5,6 @@
 # Environment/config
 .env
 .env.example
-web/auth_config.js
 
 # Flutter generated files
 .dart_tool/
