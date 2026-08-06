@@ -122,6 +122,149 @@ router.get("/attachments/:kind/:attachmentId/data-url", asyncHandler(async (req,
   res.json({ dataUrl });
 }));
 
+// ── Create Request sidebar ───────────────────────────────────────────────────
+// Two read-only previews for the New request form, answering the questions a
+// requester used to have to ask someone: where does this go, and has anyone
+// here done it before. Both are registered ahead of "/:id" so the words aren't
+// swallowed by the id route.
+
+// The approval chain this request WOULD get, resolved by the very same calls
+// POST / makes (resolveRequesterSection → findCrossRoute → findApprovalRoute),
+// so the preview cannot drift from what actually happens on submit.
+router.get("/route-preview", asyncHandler(async (req, res) => {
+  const requestType = `${req.query.requestType || ""}`.trim() || null;
+  const requesterSectionId = await resolveRequesterSection(req.user.section, req.section.id);
+  const crossSection = Boolean(requesterSectionId && requesterSectionId !== req.section.id);
+
+  const stages = [];
+  let originRoute = null;
+  if (crossSection) {
+    originRoute = await findCrossRoute(req.section.id, requesterSectionId, requestType);
+    if (originRoute) stages.push({ stage: "ORIGIN", routeId: originRoute.id });
+  }
+  const targetRoute = await findApprovalRoute(req.section.id, requestType);
+  if (targetRoute) stages.push({ stage: "TARGET", routeId: targetRoute.id });
+
+  const steps = [];
+  for (const { stage, routeId } of stages) {
+    for (const step of await getRouteSteps(routeId)) {
+      steps.push({
+        stage,
+        name: step.step_name,
+        // The step that may assign work is the one that picks incharge/support
+        // and sets the project period; the rest only confirm.
+        canAssign: Boolean(step.can_assign_work),
+        approvers: await approverDisplayNames(step.approver_ids || [])
+      });
+    }
+  }
+
+  const originSection = crossSection
+    ? (await query("SELECT name, code FROM request_sections WHERE id=@id", { id: requesterSectionId })).recordset[0]
+    : null;
+
+  res.json({
+    crossSection,
+    requestType,
+    sectionName: req.section.name,
+    sectionCode: req.section.code,
+    originSectionName: originSection ? originSection.name : null,
+    routeName: await routeDisplayName(targetRoute),
+    originRouteName: await routeDisplayName(originRoute),
+    steps
+  });
+}));
+
+// Closed requests in this section that look like the one being typed. Ranked
+// on the section's own history — nothing is invented, an empty list is a real
+// answer ("nothing like this has been done here").
+router.get("/similar", asyncHandler(async (req, res) => {
+  const title = `${req.query.title || ""}`.trim();
+  const systemArea = `${req.query.systemArea || ""}`.trim();
+  const requestType = `${req.query.requestType || ""}`.trim();
+  const limit = Math.min(Math.max(Number(req.query.limit) || 3, 1), 5);
+  if (title.length < 3 && systemArea.length < 2) return res.json({ data: [] });
+
+  const rows = (await query(
+    `SELECT TOP 300 r.id, r.request_no, r.title, r.system_area, r.request_type, r.closed_at,
+            DATEDIFF(DAY, r.created_at, r.closed_at) AS closed_days
+     FROM requests r
+     WHERE r.section_id=@sectionId AND r.status='COMPLETED' AND r.closed_at IS NOT NULL
+     ORDER BY r.closed_at DESC`,
+    { sectionId: req.section.id }
+  )).recordset;
+
+  const titleGrams = trigrams(title);
+  const areaGrams = trigrams(systemArea);
+  const scored = [];
+  for (const row of rows) {
+    const titleScore = dice(titleGrams, trigrams(row.title));
+    const areaScore = dice(areaGrams, trigrams(row.system_area));
+    const typeMatch = Boolean(requestType) && row.request_type === requestType;
+    // Type alone matches half the section's history, so a candidate has to
+    // look like this one in words before the type bonus counts for anything.
+    // The area bar is the higher one: "Line 3 / Packing" vs "Line 2 / Sealing"
+    // still shares most of its shape, and that is not the same place.
+    if (titleScore < 0.18 && areaScore < 0.55) continue;
+    const matchedOn = [];
+    if (titleScore >= 0.18) matchedOn.push("title");
+    if (areaScore >= 0.55) matchedOn.push("systemArea");
+    if (typeMatch) matchedOn.push("requestType");
+    scored.push({
+      score: titleScore * 6 + areaScore * 4 + (typeMatch ? 1.5 : 0),
+      item: {
+        id: row.id,
+        requestNo: row.request_no,
+        title: row.title,
+        systemArea: row.system_area,
+        requestType: row.request_type,
+        closedDays: row.closed_days === null ? null : Math.max(row.closed_days, 0),
+        matchedOn
+      }
+    });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  res.json({ data: scored.slice(0, limit).map(entry => entry.item) });
+}));
+
+async function approverDisplayNames(userIds) {
+  const ids = [...new Set(userIds.filter(Boolean))];
+  if (!ids.length) return [];
+  const params = {};
+  ids.forEach((id, index) => { params[`u${index}`] = id; });
+  const rows = (await query(
+    `SELECT id, display_name, full_name FROM users
+     WHERE id IN (${ids.map((_, index) => `@u${index}`).join(",")})`,
+    params
+  )).recordset;
+  const byId = new Map(rows.map(row => [row.id, row.display_name || row.full_name]));
+  return ids.map(id => byId.get(id)).filter(Boolean);
+}
+
+async function routeDisplayName(route) {
+  if (!route) return null;
+  const row = (await query("SELECT name FROM approval_routes WHERE id=@id", { id: route.id })).recordset[0];
+  return row ? row.name : null;
+}
+
+// Character trigrams + Dice coefficient: language-agnostic on purpose, so a
+// Thai title (no spaces to tokenise on) matches as well as an English one.
+function trigrams(text) {
+  const normalized = `${text || ""}`.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  const grams = new Set();
+  if (!normalized) return grams;
+  const padded = ` ${normalized} `;
+  for (let i = 0; i + 3 <= padded.length; i++) grams.add(padded.slice(i, i + 3));
+  return grams;
+}
+
+function dice(a, b) {
+  if (!a.size || !b.size) return 0;
+  let hits = 0;
+  for (const gram of a) if (b.has(gram)) hits++;
+  return (2 * hits) / (a.size + b.size);
+}
+
 router.get("/:id", asyncHandler(async (req, res) => {
   const id = Number(req.params.id);
   const request = (await query(

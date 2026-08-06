@@ -340,6 +340,11 @@ function sanitizeUser(user) {
       preset: user.reminder_preset || "CUSTOM"
     },
     roleCode: user.role_code,
+    // Account milestones shown on the Profile card. On the login response this
+    // is still the PREVIOUS login (completeLogin stamps the row after reading
+    // it), which is the reading people expect from "last login".
+    lastLoginAt: user.last_login_at ?? null,
+    createdAt: user.created_at ?? null,
     pdpaConsentAccepted,
     pdpaConsentAt: user.pdpa_consent_at,
     pdpaPolicyVersion: user.pdpa_policy_version
