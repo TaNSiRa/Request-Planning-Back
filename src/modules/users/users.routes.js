@@ -10,7 +10,7 @@ const { audit } = require("../../middleware/audit");
 const { requireSectionAdmin, resolveSection, isAdmin, isViewer, canManageTargetRole } = require("../../services/sectionService");
 const { blockViewerWrites } = require("../../middleware/viewerGuard");
 const { rejectWeakPassword } = require("../../services/passwordPolicy");
-const { bumpTokenVersion, forgetAccount } = require("../../services/accountState");
+const { bumpTokenVersion, forgetAccount, setMustChangePassword } = require("../../services/accountState");
 const { VIEWER_PAGE_KEYS, getViewerOverrides, setViewerOverrides } = require("../../services/viewerService");
 const { routeStepUserCondition } = require("../../services/approverService");
 const { getUserDisplayOrder, sortUsersByDisplayOrder } = require("../../services/settingsService");
@@ -30,7 +30,10 @@ router.use(blockViewerWrites("users"));
 
 router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
   // Global admins see every admin + this section's members. A section admin only
-  // manages plain requesters in their own section, so they see just those.
+  // manages plain requesters in their own section, so they see just those —
+  // PLUS their own row, which is otherwise filtered out by the REQUESTER test
+  // and is the only place they can set their own can_request / can_work. What
+  // they may actually change there is pinned by the PATCH guard below.
   const fullAdmin = isAdmin(req.user) ? 1 : 0;
   // "Approver of" badge counts primary approvers AND co-approvers.
   const approverCond = await routeStepUserCondition("ars", "u.id");
@@ -54,9 +57,10 @@ router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
      LEFT JOIN positions p ON p.id = u.position_id
      LEFT JOIN user_section_memberships m ON m.user_id = u.id AND m.section_id = @sectionId
      WHERE (@fullAdmin = 1 AND (r.code = 'ADMIN' OR m.id IS NOT NULL))
-        OR (@fullAdmin = 0 AND m.id IS NOT NULL AND m.is_active = 1 AND r.code = 'REQUESTER')
+        OR (@fullAdmin = 0 AND m.id IS NOT NULL AND m.is_active = 1
+            AND (r.code = 'REQUESTER' OR u.id = @selfId))
      ORDER BY u.display_name`,
-    { sectionId: req.section.id, fullAdmin }
+    { sectionId: req.section.id, fullAdmin, selfId: req.user.id }
   );
   // Same fixed user order as the assignee dropdowns / weekly plan (set with the
   // weekly-plan arrows); users not in the saved order stay alphabetical.
@@ -192,6 +196,11 @@ router.post("/", requireSectionAdmin, audit("CREATE", "USER", req => req.body.em
     { ...values, email: input.email.toLowerCase(), passwordHash }
   );
   const userId = result.recordset[0].id;
+  // The password above was typed by whoever created the account, not by its
+  // owner — flag it so the first sign-in has to replace it (see
+  // patch_must_change_password.sql). Set separately from the INSERT so the
+  // INSERT still works before that patch is applied.
+  await setMustChangePassword(userId, true);
   await applyMembershipsForActor(req, userId, input);
   emitSystem("users.updated", { id: userId });
   res.status(201).json({ id: userId });
@@ -216,14 +225,39 @@ router.patch("/:id(\\d+)", requireSectionAdmin, audit("EDIT", "USER", req => req
     memberships: membershipsSchema
   });
   const input = schema.parse(req.body);
+  const targetId = Number(req.params.id);
   // Privilege guards for a section admin (non-global): may not touch admins/section
   // admins, and may only assign the Requester role.
   if (!isAdmin(req.user)) {
-    if (!canManageTargetRole(req.user, await targetRoleCode(Number(req.params.id)))) {
-      return res.status(403).json({ message: "You cannot manage this user" });
-    }
-    if (!canManageTargetRole(req.user, await roleCodeById(input.roleId))) {
-      return res.status(403).json({ message: "You can only assign the Requester role" });
+    if (targetId === req.user.id) {
+      // Editing your OWN row is the exception — it is the only way a section
+      // admin can set their own can_request / can_work, and the guard below
+      // would otherwise refuse it for being a section-admin row. What it must
+      // NOT become is a way to rewrite your own authority, so the three things
+      // that decide that are pinned: your role, your active flag, and the
+      // sections you administer.
+      if (await roleCodeById(input.roleId) !== await targetRoleCode(targetId)) {
+        return res.status(403).json({ message: "You cannot change your own role" });
+      }
+      if (input.isActive === false) {
+        return res.status(403).json({ message: "You cannot deactivate your own account" });
+      }
+      // Unticking a section you administer would take away the access that let
+      // you open this page, and only a global admin could give it back.
+      if (input.memberships) {
+        const submitted = new Set(input.memberships.map(m => m.sectionId));
+        const dropped = (await sectionAdminSectionIds(targetId)).filter(id => !submitted.has(id));
+        if (dropped.length) {
+          return res.status(403).json({ message: "You cannot remove yourself from a section you administer" });
+        }
+      }
+    } else {
+      if (!canManageTargetRole(req.user, await targetRoleCode(targetId))) {
+        return res.status(403).json({ message: "You cannot manage this user" });
+      }
+      if (!canManageTargetRole(req.user, await roleCodeById(input.roleId))) {
+        return res.status(403).json({ message: "You can only assign the Requester role" });
+      }
     }
   }
   await query(
@@ -298,17 +332,12 @@ router.patch("/me", audit("EDIT_PROFILE", "USER", req => req.user.id), asyncHand
   });
   const input = schema.parse(req.body);
   const email = input.email.toLowerCase();
-  // Email is a hard unique key (also a login identifier) and employee_no is used
-  // to log in too — block a change that would collide with another account and
-  // return a clear message instead of a raw DB constraint error.
-  const clash = (await query(
-    `SELECT TOP 1 CASE WHEN LOWER(email)=@email THEN 'EMAIL_TAKEN' ELSE 'EMPLOYEE_NO_TAKEN' END AS reason
-     FROM users
-     WHERE id<>@id AND (LOWER(email)=@email OR employee_no=@employeeNo)
-     ORDER BY CASE WHEN LOWER(email)=@email THEN 0 ELSE 1 END`,
-    { email, employeeNo: input.employeeNo, id: req.user.id }
-  )).recordset[0];
-  if (clash) return res.status(409).json({ message: clash.reason });
+  const clash = await findIdentityClash(req.user.id, {
+    email,
+    employeeNo: input.employeeNo,
+    displayName: input.displayName
+  });
+  if (clash) return res.status(409).json({ message: clash });
   const values = {
     ...input,
     email,
@@ -331,6 +360,63 @@ router.patch("/me", audit("EDIT_PROFILE", "USER", req => req.user.id), asyncHand
   );
   emitSystem("users.updated", { id: req.user.id });
   res.json({ ok: true });
+}));
+
+// The three identity fields the Profile page lets people edit, and the only
+// ones another account may not already be using:
+//
+//   email        — a hard unique key AND a login identifier.
+//   employee_no  — the other login identifier, so a duplicate makes the login
+//                  ambiguous (findActiveUserByIdentifier picks one by id).
+//   display_name — the key the app identifies a person BY everywhere it is not
+//                  holding a row: presence, avatars, the weekly plan's per-user
+//                  columns, meeting viewers. Two people sharing one would show
+//                  up as one person in all of them.
+//
+// Returns the first clashing field's code, or null. Compared case-insensitively
+// and trimmed, because that is how a person reads "already taken".
+async function findIdentityClash(userId, { email, employeeNo, displayName }) {
+  const row = (await query(
+    `SELECT TOP 1
+       CASE WHEN @email <> '' AND LOWER(email)=@email THEN 'EMAIL_TAKEN'
+            WHEN @employeeNo <> '' AND LTRIM(RTRIM(employee_no))=@employeeNo THEN 'EMPLOYEE_NO_TAKEN'
+            ELSE 'DISPLAY_NAME_TAKEN' END AS reason
+     FROM users
+     WHERE id<>@id
+       AND ((@email <> '' AND LOWER(email)=@email)
+            OR (@employeeNo <> '' AND LTRIM(RTRIM(employee_no))=@employeeNo)
+            OR (@displayName <> '' AND LOWER(LTRIM(RTRIM(display_name)))=@displayName))
+     ORDER BY CASE WHEN @email <> '' AND LOWER(email)=@email THEN 0
+                   WHEN @employeeNo <> '' AND LTRIM(RTRIM(employee_no))=@employeeNo THEN 1
+                   ELSE 2 END`,
+    {
+      id: userId,
+      email: `${email || ""}`.trim().toLowerCase(),
+      employeeNo: `${employeeNo || ""}`.trim(),
+      displayName: `${displayName || ""}`.trim().toLowerCase()
+    }
+  )).recordset[0];
+  return row ? row.reason : null;
+}
+
+// Live "is this free?" check for the Profile page, so the three identity fields
+// are flagged while they are being typed instead of only on save. Every field
+// is optional — only the ones sent are checked. The PATCH above stays the
+// authority: this is a hint, and two people editing at once can still race it.
+router.get("/me/availability", asyncHandler(async (req, res) => {
+  const taken = {};
+  for (const [field, code] of [
+    ["email", "EMAIL_TAKEN"],
+    ["employeeNo", "EMPLOYEE_NO_TAKEN"],
+    ["displayName", "DISPLAY_NAME_TAKEN"]
+  ]) {
+    const value = `${req.query[field] || ""}`.trim();
+    if (!value) continue;
+    // One field at a time, so a clash is reported against the field that
+    // actually caused it rather than whichever the CASE ordering reached first.
+    taken[field] = (await findIdentityClash(req.user.id, { [field]: value })) === code;
+  }
+  res.json({ taken });
 }));
 
 // ── Due-date reminder schedule (Profile › การแจ้งเตือน) ────────────────────
@@ -442,6 +528,9 @@ router.patch("/me/password", audit("CHANGE_PASSWORD", "USER", req => req.user.id
   }
   const passwordHash = await bcrypt.hash(input.newPassword, env.bcryptRounds);
   await query("UPDATE users SET password_hash=@passwordHash, updated_at=SYSUTCDATETIME() WHERE id=@id", { id: req.user.id, passwordHash });
+  // The password is now one only its owner has typed, so the first-sign-in
+  // dialog has served its purpose and must let go.
+  await setMustChangePassword(req.user.id, false);
   // Changing your own password signs out every OTHER device holding a token for
   // this account — then re-issues a token and session for the caller, so the tab
   // that just did it stays logged in.
@@ -453,6 +542,10 @@ router.patch("/me/password", audit("CHANGE_PASSWORD", "USER", req => req.user.id
   const csrfToken = refreshed ? setLoggedInSession(req, refreshed) : null;
   res.json({ ok: true, token: refreshed ? signToken(refreshed) : null, csrfToken });
 }));
+
+// The forced first-sign-in change lives on the AUTH router, not here — this
+// router resolves a section on every call, and that dialog opens before one has
+// been picked. See POST /api/auth/first-password.
 
 router.get("/roles", asyncHandler(async (req, res) => {
   const result = await query("SELECT id, code, name FROM roles ORDER BY name");
@@ -582,12 +675,25 @@ const membershipsSchema = z
   }))
   .optional();
 
-async function setMemberships(userId, memberships, allowSectionAdmin = false) {
+// [keepAdminIn] are section ids whose is_section_admin flag survives the rewrite
+// even though the actor may not GRANT the flag — see applyMembershipsForActor.
+async function setMemberships(userId, memberships, allowSectionAdmin = false, keepAdminIn = []) {
+  const keep = new Set(keepAdminIn);
   await query("UPDATE user_section_memberships SET is_active=0 WHERE user_id=@userId", { userId });
   for (const m of memberships) {
     await upsertMembership(userId, m.sectionId, m.canRequest !== false, m.canWork !== false,
-      allowSectionAdmin && m.isSectionAdmin === true);
+      (allowSectionAdmin && m.isSectionAdmin === true) || keep.has(m.sectionId));
   }
+}
+
+// Sections this user currently administers.
+async function sectionAdminSectionIds(userId) {
+  const rows = (await query(
+    `SELECT section_id FROM user_section_memberships
+     WHERE user_id=@userId AND is_active=1 AND is_section_admin=1`,
+    { userId }
+  )).recordset;
+  return rows.map(row => row.section_id);
 }
 
 async function roleCodeById(roleId) {
@@ -609,7 +715,15 @@ async function targetRoleCode(userId) {
 async function applyMembershipsForActor(req, userId, input) {
   const allowSectionAdmin = isAdmin(req.user);
   if (input.memberships) {
-    await setMemberships(userId, input.memberships, allowSectionAdmin);
+    // setMemberships rewrites EVERY membership row, and a non-global actor is
+    // not allowed to set is_section_admin — which, for a section admin editing
+    // their own row to change can_request/can_work, would quietly strip the
+    // very flag that let them open the page. Carry the existing flags across
+    // for that one case; for anyone else this list is empty and nothing changes.
+    const keepAdminIn = !allowSectionAdmin && userId === req.user.id
+      ? await sectionAdminSectionIds(userId)
+      : [];
+    await setMemberships(userId, input.memberships, allowSectionAdmin, keepAdminIn);
     return;
   }
   await upsertMembership(userId, req.section.id, input.canRequest, input.canWork, false);

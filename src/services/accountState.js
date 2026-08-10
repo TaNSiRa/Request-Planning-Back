@@ -77,6 +77,21 @@ function forgetAccount(userId) {
   cache.delete(Number(userId));
 }
 
+// Raises or clears "this account still has the password someone else gave it".
+// Raised when an admin creates the account, cleared the first time its owner
+// sets their own — see database/patch_must_change_password.sql.
+//
+// Best-effort: before that patch is applied the column does not exist, and
+// nothing reads the flag either (sanitizeUser reports false), so doing nothing
+// leaves the pre-patch behaviour intact rather than failing a user creation.
+async function setMustChangePassword(userId, value) {
+  try {
+    await query("UPDATE users SET must_change_password=@value WHERE id=@id", { id: Number(userId), value });
+  } catch (err) {
+    if (!isMissingColumn(err)) throw err;
+  }
+}
+
 // The `tv` claim to stamp into a new token / session, accepting either a raw
 // users row (token_version) or an existing token payload (tv).
 function tokenVersionOf(user) {
@@ -94,5 +109,6 @@ module.exports = {
   forgetAccount,
   loadAccountState,
   resetAccountStateCache,
+  setMustChangePassword,
   tokenVersionOf
 };

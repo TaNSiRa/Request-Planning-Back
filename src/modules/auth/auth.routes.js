@@ -7,7 +7,8 @@ const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth, signToken } = require("../../middleware/auth");
 const { writeAudit } = require("../../middleware/audit");
 const { clearSession, setLoggedInSession } = require("../../services/securityService");
-const { bumpTokenVersion } = require("../../services/accountState");
+const { bumpTokenVersion, setMustChangePassword } = require("../../services/accountState");
+const { rejectWeakPassword } = require("../../services/passwordPolicy");
 const { getUserSections, isViewer, isAdmin } = require("../../services/sectionService");
 const { getViewerOverrides } = require("../../services/viewerService");
 const { verifyMicrosoftIdToken } = require("../../services/microsoftTokenService");
@@ -248,6 +249,67 @@ router.post("/pdpa-consent", requireAuth, asyncHandler(async (req, res) => {
   res.json({ token: signToken(userRow), csrfToken, user });
 }));
 
+// The forced first-sign-in password change, which asks for NO current password.
+//
+// It lives here rather than on the users router for a hard reason: that router
+// resolves a section on every call, and this dialog opens straight after PDPA
+// consent — before a section has been picked — so it would answer "Section is
+// required". Same lifecycle position as /pdpa-consent above.
+//
+// Kept separate from PATCH /users/me/password rather than making that route's
+// currentPassword optional, so the no-proof path cannot be reached by an
+// ordinary password change. Two things gate it:
+//
+//   * must_change_password = 1 — true only for an account that has never had
+//     its password changed, and cleared by this very call. Past first sign-in
+//     the route is closed and Profile › Security, with its current-password
+//     proof, is the only way.
+//   * the new password must differ from the one already on the account.
+//     Without the current-password box there is nothing else stopping someone
+//     retyping the password the admin handed them, which would clear the flag
+//     while leaving the shared credential in place — the exact thing this flow
+//     exists to prevent.
+router.post("/first-password", requireAuth, asyncHandler(async (req, res) => {
+  const input = z.object({ newPassword: z.string().min(1) }).parse(req.body);
+  let row;
+  try {
+    row = (await query(
+      "SELECT password_hash, must_change_password FROM users WHERE id=@id AND is_active=1",
+      { id: req.user.id }
+    )).recordset[0];
+  } catch (err) {
+    // Pre-patch database: no account can be in the first-sign-in state, so
+    // there is nothing for this route to do.
+    if (!`${err.message}`.includes("Invalid column name")) throw err;
+    row = null;
+  }
+  if (!row || !(row.must_change_password === true || row.must_change_password === 1)) {
+    return res.status(403).json({ message: "Use Profile › Security to change your password" });
+  }
+  if (rejectWeakPassword(res, input.newPassword)) return;
+  if (await bcrypt.compare(input.newPassword, row.password_hash || "")) {
+    return res.status(400).json({ message: "Choose a password different from the one you were given" });
+  }
+  const passwordHash = await bcrypt.hash(input.newPassword, env.bcryptRounds);
+  await query("UPDATE users SET password_hash=@passwordHash, updated_at=SYSUTCDATETIME() WHERE id=@id",
+    { id: req.user.id, passwordHash });
+  await setMustChangePassword(req.user.id, false);
+  await writeAudit({
+    actorId: req.user.id,
+    action: "CHANGE_PASSWORD",
+    entityType: "USER",
+    entityId: req.user.id,
+    ip: req.ip,
+    userAgent: req.headers["user-agent"]
+  });
+  // Same as the ordinary change: every other session holding this account's
+  // token is cut off, and the tab that did it gets a fresh one.
+  await bumpTokenVersion(req.user.id);
+  const userRow = await findActiveUserById(req.user.id);
+  const csrfToken = userRow ? setLoggedInSession(req, userRow) : null;
+  res.json({ ok: true, token: userRow ? signToken(userRow) : null, csrfToken });
+}));
+
 // Attach the per-request context every login/session response carries: the
 // user's accessible sections and, for a viewer, its page-level overrides (the
 // section-level ones already ride along on each section's viewerCanEdit flag).
@@ -347,7 +409,13 @@ function sanitizeUser(user) {
     createdAt: user.created_at ?? null,
     pdpaConsentAccepted,
     pdpaConsentAt: user.pdpa_consent_at,
-    pdpaPolicyVersion: user.pdpa_policy_version
+    pdpaPolicyVersion: user.pdpa_policy_version,
+    // Brand-new account still holding the password whoever created it typed.
+    // The app puts up a mandatory change-password dialog right after PDPA
+    // consent while this is true. Undefined until
+    // patch_must_change_password.sql is applied, which reads as false — i.e.
+    // the pre-patch behaviour.
+    mustChangePassword: user.must_change_password === true || user.must_change_password === 1
   };
 }
 
