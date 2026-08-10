@@ -193,6 +193,63 @@ describe("request approval flow", () => {
     assert.equal(await pendingStepFor(approver1, id), null);
   });
 
+  // PATCH /requests/:id/details — approvers on the request's own route correct
+  // what it says (type, area, description, impact) after it was raised.
+  it("lets an approver on the route edit the request detail", async () => {
+    const { id } = await createRequest(requester);
+    const edit = {
+      requestType: "BREAKDOWN",
+      systemArea: "Line 7 / Filling",
+      description: "rewritten by the approver",
+      businessImpact: "8 hours downtime a month"
+    };
+
+    const res = await approver1.patch(`/api/requests/${id}/details`).send(edit);
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+
+    const detail = await getRequest(requester, id);
+    assert.equal(detail.request_type, edit.requestType);
+    assert.equal(detail.system_area, edit.systemArea);
+    assert.equal(detail.description, edit.description);
+    assert.equal(detail.business_impact, edit.businessImpact);
+    // Correcting the type does not re-route the request.
+    assert.equal(detail.approvals.length, 2);
+    assert.equal(detail.approvals[0].approver_user_id, fixture.users.approver1);
+  });
+
+  it("refuses a request-detail edit from the requester or a plain member", async () => {
+    const { id } = await createRequest(requester);
+    const edit = {
+      requestType: "IMPROVEMENT",
+      systemArea: "Line 1",
+      description: "not allowed",
+      businessImpact: "none"
+    };
+
+    const asOwner = await requester.patch(`/api/requests/${id}/details`).send(edit);
+    assert.equal(asOwner.status, 403);
+
+    const asMember = await member.patch(`/api/requests/${id}/details`).send(edit);
+    assert.equal(asMember.status, 403);
+    // Meeting mode widens todo work, never this.
+    const inMeeting = await member.patch(`/api/requests/${id}/details?meeting=1`).send(edit);
+    assert.equal(inMeeting.status, 403);
+
+    const detail = await getRequest(requester, id);
+    assert.equal(detail.description, "created by automated test");
+  });
+
+  it("rejects a request-detail edit that blanks a field", async () => {
+    const { id } = await createRequest(requester);
+    const res = await approver1.patch(`/api/requests/${id}/details`).send({
+      requestType: "IMPROVEMENT",
+      systemArea: "   ",
+      description: "still here",
+      businessImpact: "none"
+    });
+    assert.equal(res.status, 400);
+  });
+
   it("lets a co-approver act on a step (any candidate may decide)", async () => {
     // Attach the co-approver to route step 2; requests created from here on
     // snapshot them as a step-2 candidate alongside approver 2.

@@ -491,6 +491,50 @@ router.patch("/:id/kpi", audit("EDIT", "REQUEST", req => req.params.id), asyncHa
   res.json({ ok: true });
 }));
 
+// Correct what the request SAYS — its type, system area, description and
+// business impact — from the request-detail page. Deliberately narrow: only an
+// approver on this request's own route (primary or co-approver), or a system
+// admin, may do it. Meeting mode does NOT widen this the way it widens todo
+// work: `?meeting=1` is ignored here on purpose, so a section member sitting in
+// the meeting cannot rewrite the request.
+router.patch("/:id/details", audit("EDIT", "REQUEST", req => req.params.id), asyncHandler(async (req, res) => {
+  const id = Number(req.params.id);
+  const input = z.object({
+    requestType: z.string().trim().min(1),
+    systemArea: z.string().trim().min(1),
+    description: z.string().trim().min(1),
+    businessImpact: z.string().trim().min(1)
+  }).parse(req.body);
+  const row = (await query(
+    "SELECT * FROM requests WHERE id=@id AND (section_id=@sectionId OR requester_section_id=@sectionId)",
+    { id, sectionId: req.section.id }
+  )).recordset[0];
+  if (!row) return res.status(404).json({ message: "Request not found" });
+  let allowed = isAdmin(req.user);
+  if (!allowed) {
+    const cond = await approvalStepUserCondition("a", "@userId");
+    const step = (await query(
+      `SELECT TOP 1 a.id FROM approval_steps a WHERE a.request_id=@id AND ${cond}`,
+      { id, userId: req.user.id }
+    )).recordset[0];
+    allowed = !!step;
+  }
+  if (!allowed) {
+    return res.status(403).json({ message: "Only an approver on this request's route can edit its details" });
+  }
+  // The approval route was picked from the type at submit time; changing the
+  // type afterwards corrects the record, it does not re-route the request.
+  await query(
+    `UPDATE requests
+     SET request_type=@requestType, system_area=@systemArea, description=@description,
+         business_impact=@businessImpact, updated_at=SYSUTCDATETIME()
+     WHERE id=@id`,
+    { id, ...input }
+  );
+  emitSystem("request.updated", { id, part: "details" });
+  res.json({ ok: true });
+}));
+
 router.post("/:id/todos", audit("CREATE", "TODO"), asyncHandler(async (req, res) => {
   const schema = z.object({
     title: z.string().trim().min(1),
