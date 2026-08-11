@@ -85,13 +85,16 @@ describe("section admin editing their own Manage Users row", () => {
     await closePool();
   });
 
-  it("sees their own row in the user list, but not another section admin's", async () => {
+  it("sees their own row in the user list, alongside every other member", async () => {
     const res = await admin.get("/api/users");
     assert.equal(res.status, 200);
     const ids = res.body.data.map(u => u.id);
     assert.ok(ids.includes(adminId), "a section admin must see their own row");
     assert.ok(ids.includes(fixture.users.requester), "and still sees the requesters they manage");
-    assert.ok(!ids.includes(otherAdminId), "but not another section admin they may not manage");
+    // Listed since 2026-08-11: another section admin holding a membership here is
+    // a member of this section, and their access to it is this section's to set.
+    // Seeing the row is not managing it — the identity guard below still holds.
+    assert.ok(ids.includes(otherAdminId), "and a peer section admin who is a member here");
   });
 
   it("can turn their own can_request / can_work off and on", async () => {

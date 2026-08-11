@@ -68,12 +68,36 @@ function isInternalSetting(key) {
     key === "weeklyPlan.leaveTypes";
 }
 
+// Fallbacks used when a section has never saved its own option lists — shared
+// by /request-options (what the forms actually offer) and the defaults below
+// (what the Settings page shows), so the two can't drift apart.
+// Request types start EMPTY on purpose: they are section vocabulary (the old
+// hard-coded PLC/SCADA list belonged to Automation), so a new section's admin
+// fills them in rather than inheriting someone else's.
+const DEFAULT_REQUEST_TYPES = [];
+const DEFAULT_REQUEST_PRIORITIES = ["LOW", "NORMAL", "HIGH", "URGENT"];
+// Skill matrix is opt-in for a new section, so nothing extra shows in its
+// sidebar until its admin asks for it. Sections that had it before keep it —
+// patch_skill_matrix.sql wrote them a real 'true' row.
+const DEFAULT_SKILL_MATRIX_ENABLED = false;
+
 // Section-level settings that must always be visible in the Settings UI even
 // before a row exists in app_settings — shown with their default until edited
 // (PUT /settings/:key inserts the row on first save).
+// Each default MUST repeat the fallback the feature itself uses (see
+// /request-options and /features below), or a brand-new section would be shown
+// a value it does not actually behave like.
 const SECTION_SETTING_DEFAULTS = [
   { key: "request.maxAttachments", value: "5", type: "number", description: "Max files attached to a request" },
   { key: "todo.maxAttachments", value: "5", type: "number", description: "Max files attached to a todo item" },
+  // Dropdown option lists. A new section has no rows at all, so without these
+  // its admin could never edit the lists — the page only showed what already
+  // existed in app_settings. Types and support types start empty: every section
+  // names its own.
+  { key: "request.types", value: DEFAULT_REQUEST_TYPES.join(","), type: "csv", description: "Request type dropdown options" },
+  { key: "request.priorities", value: DEFAULT_REQUEST_PRIORITIES.join(","), type: "csv", description: "Request priority dropdown options" },
+  { key: "request.supTypes", value: "", type: "csv", description: "Support type options (approver multi-select)" },
+  { key: "skillMatrix.enabled", value: `${DEFAULT_SKILL_MATRIX_ENABLED}`, type: "bool", description: "Enable the skill matrix for this section" },
   // Email delivery for this section. A section that has never saved it is off,
   // so a brand-new section never emails anyone until its admin opts in.
   { key: "mail.enabled", value: "false", type: "bool", description: "Send notification emails for this section" },
@@ -106,6 +130,13 @@ router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
       });
     }
   }
+  // Defaults were appended at the end, so re-apply the query's own ordering
+  // (app-wide rows first, then by key) — otherwise a section that has saved
+  // some of its settings would list the rest out of alphabetical order.
+  rows.sort((a, b) =>
+    (a.section_id == null ? 0 : 1) - (b.section_id == null ? 0 : 1) ||
+    `${a.setting_key}`.localeCompare(`${b.setting_key}`)
+  );
   res.json({ data: rows });
 }));
 
@@ -123,8 +154,8 @@ router.get("/request-options", asyncHandler(async (req, res) => {
     if (map[row.setting_key] == null) map[row.setting_key] = row.setting_value;
   }
   res.json({
-    types: splitCsv(map["request.types"], ["PLC", "SCADA", "Touch Screen", "Flutter App", "Express.js", "Node-RED", "Report", "Other"]),
-    priorities: splitCsv(map["request.priorities"], ["LOW", "NORMAL", "HIGH", "URGENT"]),
+    types: splitCsv(map["request.types"], DEFAULT_REQUEST_TYPES),
+    priorities: splitCsv(map["request.priorities"], DEFAULT_REQUEST_PRIORITIES),
     supTypes: splitCsv(map["request.supTypes"], []),
     maxRequestAttachments: normalizeMaxAttachments(map["request.maxAttachments"]),
     maxTodoAttachments: normalizeMaxAttachments(map["todo.maxAttachments"])
@@ -154,7 +185,7 @@ router.get("/features", asyncHandler(async (req, res) => {
     return raw == null ? fallback : `${raw}`.trim().toLowerCase() === "true";
   };
   res.json({
-    skillMatrixEnabled: flag("skillMatrix.enabled", true),
+    skillMatrixEnabled: flag("skillMatrix.enabled", DEFAULT_SKILL_MATRIX_ENABLED),
     mailEnabled: flag("mail.enabled", false),
     projectReminderEnabled: flag("projectReminder.enabled", true),
     todoReminderEnabled: flag("todoReminder.enabled", false)

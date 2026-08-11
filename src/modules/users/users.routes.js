@@ -11,7 +11,7 @@ const { requireSectionAdmin, resolveSection, isAdmin, isViewer, canManageTargetR
 const { blockViewerWrites } = require("../../middleware/viewerGuard");
 const { rejectWeakPassword } = require("../../services/passwordPolicy");
 const { bumpTokenVersion, forgetAccount, setMustChangePassword } = require("../../services/accountState");
-const { VIEWER_PAGE_KEYS, getViewerOverrides, setViewerOverrides } = require("../../services/viewerService");
+const { VIEWER_PAGE_KEYS, getViewerOverrides, setViewerOverrides, sectionCanEdit } = require("../../services/viewerService");
 const { routeStepUserCondition } = require("../../services/approverService");
 const { getUserDisplayOrder, sortUsersByDisplayOrder } = require("../../services/settingsService");
 const { emitSystem } = require("../../services/realtimeService");
@@ -29,11 +29,16 @@ router.use(resolveSection);
 router.use(blockViewerWrites("users"));
 
 router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
-  // Global admins see every admin + this section's members. A section admin only
-  // manages plain requesters in their own section, so they see just those —
-  // PLUS their own row, which is otherwise filtered out by the REQUESTER test
-  // and is the only place they can set their own can_request / can_work. What
-  // they may actually change there is pinned by the PATCH guard below.
+  // Global admins see every admin + this section's members.
+  //
+  // A section admin sees EVERYONE holding an active membership in their section,
+  // whatever role they carry — a section admin of Automation who was granted
+  // can_request here is a member of this section, and their access here is this
+  // section's business. Global admins are the exception: they are system-wide
+  // accounts a section admin has no authority over at all, so they stay hidden.
+  // How much of a listed row may actually be changed is decided per role by the
+  // PATCH guards below (identity and role stay off-limits for anyone the actor
+  // may not manage — only PATCH /:id/section-access is open to them).
   const fullAdmin = isAdmin(req.user) ? 1 : 0;
   // "Approver of" badge counts primary approvers AND co-approvers.
   const approverCond = await routeStepUserCondition("ars", "u.id");
@@ -57,10 +62,9 @@ router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
      LEFT JOIN positions p ON p.id = u.position_id
      LEFT JOIN user_section_memberships m ON m.user_id = u.id AND m.section_id = @sectionId
      WHERE (@fullAdmin = 1 AND (r.code = 'ADMIN' OR m.id IS NOT NULL))
-        OR (@fullAdmin = 0 AND m.id IS NOT NULL AND m.is_active = 1
-            AND (r.code = 'REQUESTER' OR u.id = @selfId))
+        OR (@fullAdmin = 0 AND m.id IS NOT NULL AND m.is_active = 1 AND r.code <> 'ADMIN')
      ORDER BY u.display_name`,
-    { sectionId: req.section.id, fullAdmin, selfId: req.user.id }
+    { sectionId: req.section.id, fullAdmin }
   );
   // Same fixed user order as the assignee dropdowns / weekly plan (set with the
   // weekly-plan arrows); users not in the saved order stay alphabetical.
@@ -170,9 +174,14 @@ router.post("/", requireSectionAdmin, audit("CREATE", "USER", req => req.body.em
   });
   const input = schema.parse(req.body);
   if (rejectWeakPassword(res, input.password)) return;
-  // Privilege guard: a section admin (non-global) may only create plain requesters.
+  // Privilege guard: a section admin (non-global) may only create plain requesters,
+  // and only into a section they administer — an account planted in someone else's
+  // section would belong to that section the moment it existed.
   if (!canManageTargetRole(req.user, await roleCodeById(input.roleId))) {
     return res.status(403).json({ message: "You can only assign the Requester role" });
+  }
+  if (!await actorOwnsSectionLabel(req, input.section)) {
+    return res.status(403).json({ message: "You can only create users in a section you administer" });
   }
   // Exclude non-column fields (arrays/flags) from the INSERT params — passing an
   // array to mssql throws "Invalid string".
@@ -255,8 +264,19 @@ router.patch("/:id(\\d+)", requireSectionAdmin, audit("EDIT", "USER", req => req
       if (!canManageTargetRole(req.user, await targetRoleCode(targetId))) {
         return res.status(403).json({ message: "You cannot manage this user" });
       }
+      // Role alone is not enough: a requester of ANOTHER section may be listed
+      // here because they hold a membership in this one, and their account is
+      // still that section's to edit. Only their section access is ours —
+      // PATCH /:id/section-access is the door left open for that.
+      if (!await actorOwnsUserHomeSection(req, targetId)) {
+        return res.status(403).json({ message: "This account belongs to another section" });
+      }
       if (!canManageTargetRole(req.user, await roleCodeById(input.roleId))) {
         return res.status(403).json({ message: "You can only assign the Requester role" });
+      }
+      // Nor may an account be handed to a section the actor does not administer.
+      if (!await actorOwnsSectionLabel(req, input.section)) {
+        return res.status(403).json({ message: "You can only move a user to a section you administer" });
       }
     }
   }
@@ -294,12 +314,38 @@ router.patch("/:id(\\d+)", requireSectionAdmin, audit("EDIT", "USER", req => req
   res.json({ ok: true });
 }));
 
+// Section access on its own, for a row the actor may SEE but not manage: another
+// section's admin who also holds a membership here. Their identity, role, active
+// flag and password belong to whoever administers them — PATCH /:id refuses the
+// whole request for those accounts — but the access they hold in YOUR section is
+// yours to set. Scoping is the same as everywhere else: applyMembershipsForActor
+// only touches the sections the actor administers, and never a membership that
+// carries is_section_admin.
+router.patch("/:id(\\d+)/section-access", requireSectionAdmin, audit("EDIT_SECTION_ACCESS", "USER", req => req.params.id), asyncHandler(async (req, res) => {
+  const input = z.object({ memberships: z.array(membershipEntrySchema) }).parse(req.body);
+  const targetId = Number(req.params.id);
+  // A global admin is a system-wide account, not a member a section admin has
+  // any say over. (A global admin editing anyone still uses PATCH /:id.)
+  if (!isAdmin(req.user) && await targetRoleCode(targetId) === "ADMIN") {
+    return res.status(403).json({ message: "You cannot manage this user" });
+  }
+  await applyMembershipsForActor(req, targetId, { memberships: input.memberships });
+  emitSystem("users.updated", { id: targetId });
+  res.json({ ok: true });
+}));
+
 router.post("/:id(\\d+)/reset-password", requireSectionAdmin, audit("RESET_PASSWORD", "USER", req => req.params.id), asyncHandler(async (req, res) => {
   const schema = z.object({ password: z.string().min(1) });
   const input = schema.parse(req.body);
   if (rejectWeakPassword(res, input.password)) return;
   if (!canManageTargetRole(req.user, await targetRoleCode(Number(req.params.id)))) {
     return res.status(403).json({ message: "You cannot manage this user" });
+  }
+  // A password is part of the account, not of the access it holds here — so it
+  // follows the same rule as the identity block: only the section that owns the
+  // account may reset it.
+  if (!await actorOwnsUserHomeSection(req, Number(req.params.id))) {
+    return res.status(403).json({ message: "This account belongs to another section" });
   }
   const passwordHash = await bcrypt.hash(input.password, env.bcryptRounds);
   await query("UPDATE users SET password_hash=@passwordHash, updated_at=SYSUTCDATETIME() WHERE id=@id", {
@@ -552,14 +598,24 @@ router.get("/roles", asyncHandler(async (req, res) => {
   res.json({ data: result.recordset });
 }));
 
-// All active request sections — feeds the user form's section-access editor so
-// a section admin can grant can_request/can_work in any section (not just the
-// one they administer). Read-only lookup, so requireSectionAdmin is enough.
+// All active request sections — feeds the user form's section-access editor.
+// Every section is LISTED (a section admin has to see that a requester of theirs
+// also belongs to Automation), but `manageable` says which rows that actor may
+// actually change: all of them for a global admin, only the ones they administer
+// for a section admin. The UI renders the rest disabled; applyMembershipsForActor
+// enforces the same scope on save. Read-only lookup, so requireSectionAdmin is enough.
 router.get("/manage-sections", requireSectionAdmin, asyncHandler(async (req, res) => {
   const result = await query(
     "SELECT id, code, name FROM request_sections WHERE is_active=1 ORDER BY name"
   );
-  res.json({ data: result.recordset });
+  const adminSectionIds = await actorAdminSectionIds(req);
+  const adminSet = adminSectionIds == null ? null : new Set(adminSectionIds);
+  res.json({
+    data: result.recordset.map(s => ({
+      ...s,
+      manageable: adminSet == null || adminSet.has(s.id)
+    }))
+  });
 }));
 
 // Managing a VIEWER's page/section access is an administrative action, so it must
@@ -570,10 +626,67 @@ function realSectionAdminOnly(req, res, next) {
   return res.status(403).json({ message: "Forbidden" });
 }
 
-// Which sections the actor administers (global admin → every section). Scopes a
-// section admin so they can only toggle a viewer's access to their own sections.
+// A section label reduced to what "the same section" means to a person: trimmed,
+// case-insensitive, and without the trailing " Request" that every section name
+// carries. users.section stores the HOME section as a plain label — the user form
+// fills it from the live request-section list (Settings → org-options hands out
+// request_sections.name) with that suffix stripped, which is why the two compare.
+function sectionLabelKey(value) {
+  const trimmed = `${value || ""}`.trim().toLowerCase();
+  return trimmed.endsWith(" request") ? trimmed.slice(0, -" request".length).trim() : trimmed;
+}
+
+// Label keys of every section the actor administers, or null for "all of them".
+async function actorAdministeredSectionKeys(req) {
+  const allowed = await actorAdminSectionIds(req);
+  if (allowed == null) return null;
+  const keys = new Set();
+  if (!allowed.length) return keys;
+  const rows = (await query(
+    `SELECT name, code FROM request_sections WHERE id IN (${allowed.map((_, i) => `@s${i}`).join(",")})`,
+    Object.fromEntries(allowed.map((id, i) => [`s${i}`, id]))
+  )).recordset;
+  for (const row of rows) {
+    keys.add(sectionLabelKey(row.name));
+    keys.add(`${row.code || ""}`.trim().toLowerCase());
+  }
+  keys.delete("");
+  return keys;
+}
+
+// Whether the actor administers the section an account BELONGS to. Holding a
+// membership here is not belonging: a requester of Automation may be granted
+// can_request in Delivery, and Delivery still does not own that person's name,
+// email, role or password — only the access they hold in Delivery.
+async function actorOwnsSectionLabel(req, label) {
+  const keys = await actorAdministeredSectionKeys(req);
+  if (keys == null) return true;
+  const key = sectionLabelKey(label);
+  return key !== "" && keys.has(key);
+}
+
+async function actorOwnsUserHomeSection(req, targetId) {
+  const row = (await query("SELECT section FROM users WHERE id=@id", { id: targetId })).recordset[0];
+  return actorOwnsSectionLabel(req, row?.section);
+}
+
+// Which sections the actor may hand out access in (global admin → every section,
+// signalled by null). Scopes a section admin to the sections they administer, so
+// they can only toggle another account's access — viewer overrides or plain
+// section memberships — where their own authority actually reaches.
 async function actorAdminSectionIds(req) {
   if (isAdmin(req.user)) return null; // null = all sections
+  // A viewer granted edit on the Manage Users page administers nothing, but it
+  // was let through here on the strength of its per-section edit grants — so
+  // those grants are its scope. Without this branch the list below is empty and
+  // a granted viewer could no longer change anything at all.
+  if (isViewer(req.user)) {
+    const overrides = req.viewerOverrides || (await getViewerOverrides(req.user.id));
+    const rows = (await query(
+      "SELECT id FROM request_sections WHERE is_active=1"
+    )).recordset;
+    return rows.map(r => r.id).filter(id => sectionCanEdit(overrides, id));
+  }
   const rows = (await query(
     `SELECT ms.section_id FROM user_section_memberships ms
      WHERE ms.user_id=@userId AND ms.is_active=1 AND ms.is_section_admin=1`,
@@ -666,21 +779,46 @@ async function upsertMembership(userId, sectionId, canRequest = true, canWork = 
 // request/work in (and, for global admins, administer). Deactivates any section
 // not in the list. is_section_admin is only honoured when allowSectionAdmin is
 // true (i.e. the actor is a global admin) — a section admin can never mint another.
-const membershipsSchema = z
-  .array(z.object({
-    sectionId: z.number().int().positive(),
-    canRequest: z.boolean().optional().default(true),
-    canWork: z.boolean().optional().default(true),
-    isSectionAdmin: z.boolean().optional().default(false)
-  }))
-  .optional();
+const membershipEntrySchema = z.object({
+  sectionId: z.number().int().positive(),
+  canRequest: z.boolean().optional().default(true),
+  canWork: z.boolean().optional().default(true),
+  isSectionAdmin: z.boolean().optional().default(false)
+});
 
-// [keepAdminIn] are section ids whose is_section_admin flag survives the rewrite
-// even though the actor may not GRANT the flag — see applyMembershipsForActor.
-async function setMemberships(userId, memberships, allowSectionAdmin = false, keepAdminIn = []) {
+const membershipsSchema = z.array(membershipEntrySchema).optional();
+
+// [keepAdminIn] are section ids where the target ALREADY holds is_section_admin
+// and the actor may not set that flag (i.e. the actor is not a global admin).
+// Those rows are protected twice over: the flag survives the rewrite, and the
+// row cannot be deactivated. Without the first, every save by a section admin
+// would silently demote the person; without the second, unticking the row would
+// do the same thing by another route — and both reach peers, not just the actor
+// editing their own row.
+//
+// [allowedSectionIds] scopes the rewrite: null means "every section" (global
+// admin), an array means only those rows may be created, changed or deactivated.
+// A section admin editing a requester who also belongs to another section must
+// leave that other membership exactly as it was — so the blanket "deactivate
+// everything, then re-insert what was submitted" pass is narrowed to the allowed
+// ids, and submitted rows outside them are dropped rather than written.
+async function setMemberships(userId, memberships, allowSectionAdmin = false, keepAdminIn = [], allowedSectionIds = null) {
   const keep = new Set(keepAdminIn);
-  await query("UPDATE user_section_memberships SET is_active=0 WHERE user_id=@userId", { userId });
+  const allowed = allowedSectionIds == null ? null : new Set(allowedSectionIds);
+  const submitted = new Set(memberships.map(m => m.sectionId));
+  if (allowed == null) {
+    await query("UPDATE user_section_memberships SET is_active=0 WHERE user_id=@userId", { userId });
+  } else {
+    for (const sectionId of allowed) {
+      if (submitted.has(sectionId) || keep.has(sectionId)) continue;
+      await query(
+        "UPDATE user_section_memberships SET is_active=0 WHERE user_id=@userId AND section_id=@sectionId",
+        { userId, sectionId }
+      );
+    }
+  }
   for (const m of memberships) {
+    if (allowed != null && !allowed.has(m.sectionId)) continue;
     await upsertMembership(userId, m.sectionId, m.canRequest !== false, m.canWork !== false,
       (allowSectionAdmin && m.isSectionAdmin === true) || keep.has(m.sectionId));
   }
@@ -709,21 +847,24 @@ async function targetRoleCode(userId) {
 }
 
 // Apply the section-membership part of a create/edit. A global admin gets full
-// replace-all control (including granting section-admin). A section admin gets
-// the same replace-all control over can_request/can_work for EVERY section
-// (managed users are plain requesters), but can never grant section-admin.
+// replace-all control over every section (including granting section-admin). A
+// section admin only controls can_request/can_work in the sections they actually
+// administer — a requester of theirs may also belong to someone else's section,
+// and that membership is not theirs to grant, revoke or retune. They can never
+// grant section-admin anywhere.
 async function applyMembershipsForActor(req, userId, input) {
   const allowSectionAdmin = isAdmin(req.user);
   if (input.memberships) {
-    // setMemberships rewrites EVERY membership row, and a non-global actor is
-    // not allowed to set is_section_admin — which, for a section admin editing
-    // their own row to change can_request/can_work, would quietly strip the
-    // very flag that let them open the page. Carry the existing flags across
-    // for that one case; for anyone else this list is empty and nothing changes.
-    const keepAdminIn = !allowSectionAdmin && userId === req.user.id
-      ? await sectionAdminSectionIds(userId)
-      : [];
-    await setMemberships(userId, input.memberships, allowSectionAdmin, keepAdminIn);
+    // Inside the allowed scope setMemberships still rewrites every row, and a
+    // non-global actor is not allowed to set is_section_admin — so any flag the
+    // target already holds has to be carried across, or the save is a silent
+    // demotion. That is true whether the target is the actor themselves (the
+    // flag that let them open the page) or a peer who administers another
+    // section and merely holds a membership here.
+    const keepAdminIn = allowSectionAdmin ? [] : await sectionAdminSectionIds(userId);
+    // null for a global admin (every section), the administered ids otherwise.
+    const allowedSectionIds = await actorAdminSectionIds(req);
+    await setMemberships(userId, input.memberships, allowSectionAdmin, keepAdminIn, allowedSectionIds);
     return;
   }
   await upsertMembership(userId, req.section.id, input.canRequest, input.canWork, false);
