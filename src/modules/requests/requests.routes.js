@@ -1215,16 +1215,28 @@ async function getExtensionHistory(requestId) {
 // Detail-edit trail for the request-detail "Detail history" popup: newest first,
 // one row per field that changed (rows sharing an edited_at are one edit).
 async function getDetailEdits(requestId) {
-  const result = await query(
-    `SELECT e.id, e.field, e.old_value, e.new_value, e.edited_at, e.edited_by,
-            u.display_name AS edited_by_name
-     FROM request_detail_edits e
-     LEFT JOIN users u ON u.id = e.edited_by
-     WHERE e.request_id=@requestId
-     ORDER BY e.edited_at DESC, e.id DESC`,
-    { requestId }
-  );
-  return result.recordset;
+  try {
+    const result = await query(
+      `SELECT e.id, e.field, e.old_value, e.new_value, e.edited_at, e.edited_by,
+              u.display_name AS edited_by_name
+       FROM request_detail_edits e
+       LEFT JOIN users u ON u.id = e.edited_by
+       WHERE e.request_id=@requestId
+       ORDER BY e.edited_at DESC, e.id DESC`,
+      { requestId }
+    );
+    return result.recordset;
+  } catch (err) {
+    // A database that hasn't had patch_request_detail_history.sql applied has no
+    // request_detail_edits table (SQL Server error 208, "Invalid object name").
+    // The whole request-detail page must not 500 over a missing history table —
+    // it just has no history yet. Anything else is a real failure: rethrow.
+    if (err?.originalError?.info?.number === 208 || err?.number === 208) {
+      console.warn("request_detail_edits table missing — apply database/patch_request_detail_history.sql");
+      return [];
+    }
+    throw err;
+  }
 }
 
 function attachmentSchema({ defaultEmpty = true } = {}) {
