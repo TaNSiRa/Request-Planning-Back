@@ -11,8 +11,8 @@ let ioRef;
 const online = new Map();
 
 // Everything a client needs to render presence: who is online (for the count
-// and the avatar dots) and who is looking at the Meeting page per section
-// (for the per-section viewer strip).
+// and the avatar dots) and who is looking at which page per section (for the
+// per-page viewer strip in the top bar).
 // Which section each online user is working in right now (userId -> code).
 // Clients report it on every section change, so this is the live pick — not
 // the sections they merely belong to.
@@ -37,7 +37,10 @@ function presenceSnapshot() {
     fullName: u.fullName,
     section: sections.get(id) || ""
   }));
-  const meeting = {};
+  // Page presence: page -> section -> [user]. Every page the client reports
+  // lands here (the client skips the pages that must not show a strip), so the
+  // top bar can show "who else is on this page" anywhere.
+  const pages = {};
   // Live focus maps (who is where right now, SharePoint-style):
   //   requests: requestId -> [user]     (request-detail dialog open)
   //   todos:    todoId    -> [user]     (todo editor open)
@@ -58,7 +61,10 @@ function presenceSnapshot() {
       const { userId, page, section, focus } = socket.data || {};
       if (!userId) continue;
       const sectionKey = `${section || ""}`.toUpperCase();
-      if (page === "meeting") pushUser(meeting, sectionKey, userId);
+      if (page) {
+        if (!pages[page]) pages[page] = {};
+        pushUser(pages[page], sectionKey, userId);
+      }
       if (focus) {
         if (focus.requestId) pushUser(requests, `${focus.requestId}`, userId);
         if (focus.todoId) pushUser(todos, `${focus.todoId}`, userId);
@@ -69,7 +75,9 @@ function presenceSnapshot() {
       }
     }
   }
-  return { users, meeting, requests, todos, plan };
+  // `meeting` is the pre-page-presence shape, kept so a frontend build older
+  // than this change still renders its Meeting-mode strip.
+  return { users, pages, meeting: pages.meeting || {}, requests, todos, plan };
 }
 
 // Debounced fan-out so a burst of connects/disconnects costs one broadcast.
@@ -125,10 +133,12 @@ function registerRealtime(io) {
     socket.join("system");
     socket.emit("system.connected", { ok: true, timeUtc: new Date().toISOString() });
 
-    // The client reports which page it is on (currently only the Meeting page
-    // needs this) — re-sent by the client after every reconnect.
+    // The client reports which page it is on — re-sent after every reconnect.
+    // The name is client-defined (the AppPage enum), so cap it; the client
+    // sends null for pages that must not show a viewer strip.
     socket.on("presence.page", data => {
-      socket.data.page = data && typeof data.page === "string" ? data.page : null;
+      socket.data.page =
+        data && typeof data.page === "string" && data.page ? data.page.slice(0, 40) : null;
       socket.data.section = data && typeof data.section === "string" ? data.section : null;
       broadcastPresence();
     });

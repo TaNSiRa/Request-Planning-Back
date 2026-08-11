@@ -193,8 +193,9 @@ describe("request approval flow", () => {
     assert.equal(await pendingStepFor(approver1, id), null);
   });
 
-  // PATCH /requests/:id/details — approvers on the request's own route correct
-  // what it says (type, area, description, impact) after it was raised.
+  // PATCH /requests/:id/details — the requester, or an approver on the request's
+  // own route, corrects what it says (type, area, description, impact) after it
+  // was raised. Every changed field lands in the detail-edit history.
   it("lets an approver on the route edit the request detail", async () => {
     const { id } = await createRequest(requester);
     const edit = {
@@ -217,7 +218,38 @@ describe("request approval flow", () => {
     assert.equal(detail.approvals[0].approver_user_id, fixture.users.approver1);
   });
 
-  it("refuses a request-detail edit from the requester or a plain member", async () => {
+  it("lets the requester edit their own request detail, with history", async () => {
+    const { id } = await createRequest(requester);
+    const edit = {
+      requestType: "IMPROVEMENT",
+      systemArea: "Line 2 / Capper",
+      description: "rewritten by the requester",
+      businessImpact: "none"
+    };
+
+    const res = await requester.patch(`/api/requests/${id}/details`).send(edit);
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+
+    const detail = await getRequest(requester, id);
+    assert.equal(detail.description, edit.description);
+    // One history row per field that actually moved, newest first, with the
+    // editor's name and both sides of the change.
+    const fields = detail.detailEdits.map(row => row.field).sort();
+    assert.deepEqual(fields, ["description", "system_area"]);
+    const desc = detail.detailEdits.find(row => row.field === "description");
+    assert.equal(desc.old_value, "created by automated test");
+    assert.equal(desc.new_value, edit.description);
+    assert.equal(desc.edited_by, fixture.users.requester);
+    assert.ok(desc.edited_by_name);
+
+    // An edit that changes nothing adds no history.
+    const again = await requester.patch(`/api/requests/${id}/details`).send(edit);
+    assert.equal(again.status, 200);
+    const after = await getRequest(requester, id);
+    assert.equal(after.detailEdits.length, 2);
+  });
+
+  it("refuses a request-detail edit from a plain member", async () => {
     const { id } = await createRequest(requester);
     const edit = {
       requestType: "IMPROVEMENT",
@@ -225,9 +257,6 @@ describe("request approval flow", () => {
       description: "not allowed",
       businessImpact: "none"
     };
-
-    const asOwner = await requester.patch(`/api/requests/${id}/details`).send(edit);
-    assert.equal(asOwner.status, 403);
 
     const asMember = await member.patch(`/api/requests/${id}/details`).send(edit);
     assert.equal(asMember.status, 403);

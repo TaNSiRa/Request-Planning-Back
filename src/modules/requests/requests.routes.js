@@ -293,6 +293,7 @@ router.get("/:id", asyncHandler(async (req, res) => {
   }
   const attachments = await getAttachments(id);
   const extensionHistory = await getExtensionHistory(id);
+  const detailEdits = await getDetailEdits(id);
   const approvals = (await query(
     `SELECT a.*, u.display_name AS approver_name,
             u.branch AS approver_branch, u.department AS approver_department, u.section AS approver_section
@@ -320,7 +321,7 @@ router.get("/:id", asyncHandler(async (req, res) => {
     levelName: r.level_name
   }));
   applySupports(request, await getSupports(id));
-  res.json({ data: { ...request, todos, approvals, attachments, extensionHistory, supTypes } });
+  res.json({ data: { ...request, todos, approvals, attachments, extensionHistory, detailEdits, supTypes } });
 }));
 
 router.get("/:id/export.txt", asyncHandler(async (req, res) => {
@@ -492,11 +493,12 @@ router.patch("/:id/kpi", audit("EDIT", "REQUEST", req => req.params.id), asyncHa
 }));
 
 // Correct what the request SAYS — its type, system area, description and
-// business impact — from the request-detail page. Deliberately narrow: only an
-// approver on this request's own route (primary or co-approver), or a system
-// admin, may do it. Meeting mode does NOT widen this the way it widens todo
-// work: `?meeting=1` is ignored here on purpose, so a section member sitting in
-// the meeting cannot rewrite the request.
+// business impact — from the request-detail page. Deliberately narrow: the
+// requester who raised it, an approver on this request's own route (primary or
+// co-approver), or a system admin. Meeting mode does NOT widen this the way it
+// widens todo work: `?meeting=1` is ignored here on purpose, so a section member
+// sitting in the meeting cannot rewrite someone else's request.
+// Every change is written to request_detail_edits so the edit can be traced.
 router.patch("/:id/details", audit("EDIT", "REQUEST", req => req.params.id), asyncHandler(async (req, res) => {
   const id = Number(req.params.id);
   const input = z.object({
@@ -510,7 +512,7 @@ router.patch("/:id/details", audit("EDIT", "REQUEST", req => req.params.id), asy
     { id, sectionId: req.section.id }
   )).recordset[0];
   if (!row) return res.status(404).json({ message: "Request not found" });
-  let allowed = isAdmin(req.user);
+  let allowed = isAdmin(req.user) || row.requester_user_id === req.user.id;
   if (!allowed) {
     const cond = await approvalStepUserCondition("a", "@userId");
     const step = (await query(
@@ -520,7 +522,7 @@ router.patch("/:id/details", audit("EDIT", "REQUEST", req => req.params.id), asy
     allowed = !!step;
   }
   if (!allowed) {
-    return res.status(403).json({ message: "Only an approver on this request's route can edit its details" });
+    return res.status(403).json({ message: "Only the requester or an approver on this request's route can edit its details" });
   }
   // The approval route was picked from the type at submit time; changing the
   // type afterwards corrects the record, it does not re-route the request.
@@ -531,8 +533,32 @@ router.patch("/:id/details", audit("EDIT", "REQUEST", req => req.params.id), asy
      WHERE id=@id`,
     { id, ...input }
   );
+  // History: one row per field that actually moved, so the popup can show
+  // old -> new. An edit that changes nothing leaves no trace.
+  const changes = [
+    ["request_type", row.request_type, input.requestType],
+    ["system_area", row.system_area, input.systemArea],
+    ["description", row.description, input.description],
+    ["business_impact", row.business_impact, input.businessImpact]
+  ].filter(([, before, after]) => `${before ?? ""}` !== after);
+  if (changes.length) {
+    // One statement on purpose: SYSUTCDATETIME() is evaluated once per
+    // statement, so every row of this edit shares an edited_at and the popup can
+    // group them back into a single entry.
+    const params = { id, userId: req.user.id };
+    changes.forEach(([field, before, after], i) => {
+      params[`field${i}`] = field;
+      params[`oldValue${i}`] = before ?? null;
+      params[`newValue${i}`] = after;
+    });
+    await query(
+      `INSERT INTO request_detail_edits (request_id, edited_by, field, old_value, new_value, edited_at)
+       VALUES ${changes.map((_, i) => `(@id, @userId, @field${i}, @oldValue${i}, @newValue${i}, SYSUTCDATETIME())`).join(", ")}`,
+      params
+    );
+  }
   emitSystem("request.updated", { id, part: "details" });
-  res.json({ ok: true });
+  res.json({ ok: true, changed: changes.length });
 }));
 
 router.post("/:id/todos", audit("CREATE", "TODO"), asyncHandler(async (req, res) => {
@@ -1183,6 +1209,21 @@ async function getExtensionHistory(requestId) {
       { extensionId: extension.id }
     )).recordset;
   }
+  return result.recordset;
+}
+
+// Detail-edit trail for the request-detail "Detail history" popup: newest first,
+// one row per field that changed (rows sharing an edited_at are one edit).
+async function getDetailEdits(requestId) {
+  const result = await query(
+    `SELECT e.id, e.field, e.old_value, e.new_value, e.edited_at, e.edited_by,
+            u.display_name AS edited_by_name
+     FROM request_detail_edits e
+     LEFT JOIN users u ON u.id = e.edited_by
+     WHERE e.request_id=@requestId
+     ORDER BY e.edited_at DESC, e.id DESC`,
+    { requestId }
+  );
   return result.recordset;
 }
 
