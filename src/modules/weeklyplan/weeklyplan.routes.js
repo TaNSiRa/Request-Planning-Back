@@ -4,6 +4,7 @@ const { sql, getPool, query } = require("../../db/pool");
 const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
 const { resolveSection, requireSectionAdmin } = require("../../services/sectionService");
+const { audit } = require("../../middleware/audit");
 const { blockViewerWrites } = require("../../middleware/viewerGuard");
 const { getUserDisplayOrder, sortUsersByDisplayOrder, getSectionSetting } = require("../../services/settingsService");
 const { getHolidayDates } = require("../../db/holidayPool");
@@ -295,7 +296,8 @@ router.get("/default-cars", asyncHandler(async (req, res) => {
   res.json({ cars: rows.map(r => ({ label: r.label ?? "", plate: r.plate ?? "" })) });
 }));
 
-router.put("/default-cars", requireSectionAdmin, asyncHandler(async (req, res) => {
+router.put("/default-cars", requireSectionAdmin,
+  audit("EDIT", "SETTING", () => "weeklyPlan.defaultCars"), asyncHandler(async (req, res) => {
   const schema = z.object({
     cars: z.array(z.object({
       label: z.string().optional().nullable(),
@@ -383,7 +385,8 @@ router.get("/default-user-values", asyncHandler(async (req, res) => {
   });
 }));
 
-router.put("/default-user-values", requireSectionAdmin, asyncHandler(async (req, res) => {
+router.put("/default-user-values", requireSectionAdmin,
+  audit("EDIT", "SETTING", () => "weeklyPlan.defaultUserValues"), asyncHandler(async (req, res) => {
   const schema = z.object({
     users: z.array(z.object({
       userId: z.number().int(),
@@ -459,7 +462,8 @@ router.get("/leave-types", asyncHandler(async (req, res) => {
   res.json({ leaveTypes: await loadLeaveTypes(req.section.id) });
 }));
 
-router.put("/leave-types", requireSectionAdmin, asyncHandler(async (req, res) => {
+router.put("/leave-types", requireSectionAdmin,
+  audit("EDIT", "SETTING", () => "weeklyPlan.leaveTypes"), asyncHandler(async (req, res) => {
   const schema = z.object({
     leaveTypes: z.array(z.string().max(100)).max(100).optional().default([])
   });

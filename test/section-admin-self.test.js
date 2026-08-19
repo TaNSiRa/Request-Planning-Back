@@ -8,7 +8,7 @@
 // actor performs with is_section_admin forced to 0) silently demote yourself.
 const { after, before, describe, it } = require("node:test");
 const assert = require("node:assert/strict");
-const { createApp, closePool, fixtureContext, query } = require("./helpers/setup");
+const { createApp, closePool, fixtureContext, query, POLICY_VERSION } = require("./helpers/setup");
 
 const ctx = fixtureContext("SELFED");
 const app = createApp();
@@ -59,15 +59,16 @@ describe("section admin editing their own Manage Users row", () => {
       .recordset[0].password_hash;
     for (const name of ["sectionadmin", "othersectionadmin"]) {
       const id = (await query(
-        `INSERT INTO users (email, display_name, password_hash, role_id, section, is_active, pdpa_consent_accepted)
+        `INSERT INTO users (email, display_name, password_hash, role_id, section, is_active, pdpa_consent_accepted, pdpa_policy_version)
          OUTPUT INSERTED.id
-         VALUES (@email, @displayName, @hash, @roleId, @section, 1, 1)`,
+         VALUES (@email, @displayName, @hash, @roleId, @section, 1, 1, @policyVersion)`,
         {
           email: ctx.testEmail(name),
           displayName: `SELFED ${name}`,
           hash,
           roleId: roles.SECTION_ADMIN,
-          section: ctx.SECTION_CODE
+          section: ctx.SECTION_CODE,
+          policyVersion: POLICY_VERSION
         }
       )).recordset[0].id;
       await query(

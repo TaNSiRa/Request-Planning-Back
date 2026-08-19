@@ -244,7 +244,7 @@ router.get("/meeting-group-order", asyncHandler(async (req, res) => {
   res.json({ data });
 }));
 
-router.put("/meeting-group-order", asyncHandler(async (req, res) => {
+router.put("/meeting-group-order", audit("EDIT", "SETTING", () => "meeting.groupOrder"), asyncHandler(async (req, res) => {
   const schema = z.object({
     groupBy: z.number().int().min(0).max(3),
     order: z.array(z.string().max(300)).max(500)
@@ -276,7 +276,7 @@ router.get("/user-order", asyncHandler(async (req, res) => {
   res.json({ order: await getUserDisplayOrder(req.section.id) });
 }));
 
-router.put("/user-order", asyncHandler(async (req, res) => {
+router.put("/user-order", audit("EDIT", "SETTING", () => "users.displayOrder"), asyncHandler(async (req, res) => {
   const schema = z.object({ order: z.array(z.number().int().positive()).max(500) });
   const input = schema.parse(req.body);
   await query(

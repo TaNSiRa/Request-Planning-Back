@@ -3,6 +3,7 @@ const { sql, getPool, query } = require("../../db/pool");
 const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
 const { requireSectionManager, resolveSection } = require("../../services/sectionService");
+const { audit } = require("../../middleware/audit");
 const { blockViewerWrites } = require("../../middleware/viewerGuard");
 const { emitSystem } = require("../../services/realtimeService");
 
@@ -137,7 +138,8 @@ router.get("/users", resolveSection, requireSectionManager, asyncHandler(async (
   });
 }));
 
-router.put("/users/:userId(\\d+)", resolveSection, blockViewerWrites("skillMatrix"), requireSectionManager, asyncHandler(async (req, res) => {
+router.put("/users/:userId(\\d+)", resolveSection, blockViewerWrites("skillMatrix"), requireSectionManager,
+  audit("EDIT_SKILL_LEVEL", "USER", req => req.params.userId), asyncHandler(async (req, res) => {
   const targetId = Number(req.params.userId);
   const member = await query(
     `SELECT 1 FROM user_section_memberships
@@ -157,7 +159,9 @@ router.put("/users/:userId(\\d+)", resolveSection, blockViewerWrites("skillMatri
 // edited, get a new id when added, and are removed when dropped. Cell text is
 // rebuilt from each item's `cells` map (keyed by level `key`).
 // ---------------------------------------------------------------------------
-router.put("/", resolveSection, blockViewerWrites("skillMatrix"), requireSectionManager, asyncHandler(async (req, res) => {
+router.put("/", resolveSection, blockViewerWrites("skillMatrix"), requireSectionManager,
+  audit("EDIT", "SKILL_MATRIX", req => (req.section ? `section:${req.section.id}` : null)),
+  asyncHandler(async (req, res) => {
   const body = req.body || {};
   const sectionId = req.section.id;
   const cornerLabel = `${body.cornerLabel ?? "Items/Level"}`.slice(0, 200);

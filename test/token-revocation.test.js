@@ -8,7 +8,7 @@
 const { after, before, describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const supertest = require("supertest");
-const { createApp, closePool, fixtureContext, query, PASSWORD } = require("./helpers/setup");
+const { createApp, closePool, fixtureContext, query, PASSWORD, POLICY_VERSION } = require("./helpers/setup");
 const { forgetAccount } = require("../src/services/accountState");
 
 const ctx = fixtureContext("REVOKE");
@@ -47,10 +47,16 @@ describe("bearer token revocation", () => {
     const hash = (await query("SELECT TOP 1 password_hash FROM users WHERE id=@id", { id: fixture.users.requester }))
       .recordset[0].password_hash;
     adminId = (await query(
-      `INSERT INTO users (email, display_name, password_hash, role_id, section, is_active, pdpa_consent_accepted)
+      `INSERT INTO users (email, display_name, password_hash, role_id, section, is_active, pdpa_consent_accepted, pdpa_policy_version)
        OUTPUT INSERTED.id
-       VALUES (@email, 'REVOKE sysadmin', @hash, @roleId, @section, 1, 1)`,
-      { email: ctx.testEmail("sysadmin"), hash, roleId: adminRole.id, section: ctx.SECTION_CODE }
+       VALUES (@email, 'REVOKE sysadmin', @hash, @roleId, @section, 1, 1, @policyVersion)`,
+      {
+        email: ctx.testEmail("sysadmin"),
+        hash,
+        roleId: adminRole.id,
+        section: ctx.SECTION_CODE,
+        policyVersion: POLICY_VERSION
+      }
     )).recordset[0].id;
   });
 

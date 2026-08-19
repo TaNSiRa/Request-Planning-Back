@@ -2,6 +2,7 @@ const crypto = require("crypto");
 const session = require("express-session");
 const { env } = require("../config/env");
 const { tokenVersionOf } = require("./accountState");
+const { hasCurrentConsent } = require("./pdpa");
 
 function createCsrfToken() {
   return crypto.randomBytes(32).toString("base64url");
@@ -15,10 +16,32 @@ function sameSiteValue() {
   return value;
 }
 
+// MemoryStore drops an expired session only when something reads it
+// (`getSession` in express-session/session/memory.js). Nobody ever reads the
+// session of a person who closed their browser, so those sit in the heap until
+// the process restarts. `store.all()` walks every entry THROUGH that same read
+// path, so calling it on a timer is a sweep — no expiry logic of our own, no
+// extra dependency.
+//
+// This does not make MemoryStore a shared store: sessions still live in one
+// process, which is only correct while the API runs as a single instance.
+// Moving to SQL Server (`connect-mssql-v2`) is the change to make before ever
+// running more than one.
+const sessionStore = new session.MemoryStore();
+
+const SWEEP_MINUTES = 5;
+setInterval(() => {
+  sessionStore.all(error => {
+    // eslint-disable-next-line no-console
+    if (error) console.error(`[session] sweep failed: ${error.message}`);
+  });
+}, SWEEP_MINUTES * 60 * 1000).unref();
+
 function sessionMiddleware() {
   return session({
     name: env.session.cookieName,
     secret: env.session.secret,
+    store: sessionStore,
     resave: false,
     saveUninitialized: false,
     rolling: true,
@@ -43,9 +66,9 @@ function buildSessionUser(user) {
     // Same revocation counter the JWT carries, so a session cookie is cut off by
     // a password reset or deactivation exactly like a bearer token.
     tv: tokenVersionOf(user),
-    pdpaConsentAccepted: user.pdpa_consent_accepted === true ||
-      user.pdpa_consent_accepted === 1 ||
-      user.pdpaConsentAccepted === true
+    // Same rule as the bearer token: consent is per policy version.
+    pdpaConsentAccepted: hasCurrentConsent(user),
+    pdpaVersion: user.pdpa_policy_version ?? user.pdpaVersion ?? null
   };
 }
 

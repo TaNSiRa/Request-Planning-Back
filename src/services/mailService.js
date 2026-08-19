@@ -35,7 +35,11 @@ async function verifyMail() {
     await getTransporter().verify();
     return { ok: true };
   } catch (err) {
-    return { ok: false, reason: err.message };
+    // Same reasoning as the holiday DB check: nodemailer's failure text carries
+    // the host and the authentication reason. Stable code out, detail to the log.
+    // eslint-disable-next-line no-console
+    console.error(`[mail] verify failed: ${err.message}`);
+    return { ok: false, reason: "SMTP_VERIFY_FAILED" };
   }
 }
 
@@ -98,7 +102,10 @@ async function sendMail({ to, subject, html, text, requestId, type, sectionId, i
     });
     // eslint-disable-next-line no-console
     console.error(`[mail] send failed to ${to}: ${err.message}`);
-    return { sent: false, reason: err.message };
+    // The outbox row above keeps the real message for troubleshooting; the
+    // value returned here reaches the Settings page ("send test email"), so it
+    // stays a stable code rather than the SMTP server's own text.
+    return { sent: false, reason: "MAIL_SEND_FAILED" };
   }
 }
 

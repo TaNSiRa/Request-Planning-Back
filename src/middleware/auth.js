@@ -1,6 +1,7 @@
 const jwt = require("jsonwebtoken");
 const { env } = require("../config/env");
 const { loadAccountState, tokenVersionOf } = require("../services/accountState");
+const { POLICY_VERSION, hasCurrentConsent } = require("../services/pdpa");
 
 // A verified token/session is not enough on its own — the account behind it must
 // still be active and must not have been revoked since the credential was issued
@@ -57,9 +58,11 @@ function signToken(user) {
       // Revocation counter — requireAuth rejects the token once this no longer
       // matches users.token_version.
       tv: tokenVersionOf(user),
-      pdpaConsentAccepted: user.pdpa_consent_accepted === true ||
-        user.pdpa_consent_accepted === 1 ||
-        user.pdpaConsentAccepted === true
+      // Consent is to a specific policy text, so the claim carries the version
+      // it was given against and only reads true while that is the current one.
+      pdpaConsentAccepted: hasCurrentConsent(user),
+      pdpaVersion: user.pdpa_policy_version ?? user.pdpaVersion ?? null,
+      policyVersion: POLICY_VERSION
     },
     env.jwtSecret,
     { expiresIn: env.jwtExpiresIn }

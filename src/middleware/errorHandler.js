@@ -15,10 +15,24 @@ function errorHandler(err, req, res, next) {
     return res.status(400).json({ message: "Validation error", issues: err.issues });
   }
   const status = Number(err.status) || 500;
-  const isIntentional = status >= 400 && status < 500;
+  // "Deliberate" means WE set the status, not merely that something arrived
+  // with a 4xx on it. Third-party middleware sets its own — body-parser marks a
+  // malformed payload `{ status: 400, expose: true }` and its message is the
+  // raw parser text ("Expected property name or '}' in JSON at position 1"),
+  // which is noise to the user and detail we would rather not echo. Those carry
+  // `expose`; ours never do, so that flag is what separates the two.
+  const isIntentional = status >= 400 && status < 500 && err.expose !== true;
   res.status(status).json({
-    message: isIntentional && err.message ? err.message : "Internal server error"
+    message: isIntentional && err.message ? err.message : messageFor(status)
   });
+}
+
+// Generic, stable text for anything we did not raise on purpose.
+function messageFor(status) {
+  if (status === 400) return "Invalid request";
+  if (status === 413) return "Payload too large";
+  if (status === 415) return "Unsupported content type";
+  return "Internal server error";
 }
 
 module.exports = { notFound, errorHandler };

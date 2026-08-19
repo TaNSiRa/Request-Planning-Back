@@ -9,7 +9,7 @@ const { buildApproverEmail, buildParticipantEmail, buildExtensionApproverEmail, 
 const { notify } = require("../../services/notificationService");
 const { emitSystem } = require("../../services/realtimeService");
 const { storeDataUrlAttachment, readAttachmentAsDataUrl, deleteStoredAttachment } = require("../../services/attachmentStorage");
-const { isAdmin, resolveSection } = require("../../services/sectionService");
+const { isAdmin, getUserSections, resolveSection } = require("../../services/sectionService");
 const { blockViewerWrites } = require("../../middleware/viewerGuard");
 const { getMaxAttachments, MAX_ATTACHMENTS_CEILING } = require("../../services/settingsService");
 const { loadSupportsMap, getSupports, applySupports, isSupportUser } = require("../../services/supportService");
@@ -26,6 +26,11 @@ const {
 const router = express.Router();
 router.use(requireAuth);
 
+// Ceiling for the free-text columns stored as NVARCHAR(MAX) (description,
+// business impact, reasons). The column itself would take far more; this is the
+// point past which the content is not a person writing a request any more.
+const TEXT_MAX = 20000;
+
 // Which section a request belongs to — used by deep links that lack ?section=
 // so the SPA can auto-enter the right section instead of asking the recipient
 // to pick one first. Registered BEFORE resolveSection because no section is
@@ -34,13 +39,21 @@ router.get("/:id/section", asyncHandler(async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id) || id <= 0) return res.status(400).json({ message: "Invalid request id" });
   const row = (await query(
-    `SELECT s.code, s.name
+    `SELECT s.code, s.name, r.section_id, r.requester_section_id
      FROM requests r
      JOIN request_sections s ON s.id = r.section_id
      WHERE r.id = @id`,
     { id }
   )).recordset[0];
-  if (!row) return res.status(404).json({ message: "Request not found" });
+  // Answer only for a request the caller could open anyway. Without this the
+  // route is an id-to-section map for the whole database: it runs before
+  // resolveSection (a deep link has no section yet), so anyone signed in could
+  // walk the ids and learn how many requests exist and which section each
+  // belongs to. Same 404 for "no such request" and "not yours" — a different
+  // answer for each would put the map back.
+  const reachable = new Set((await getUserSections(req.user)).map(section => section.id));
+  const allowed = row && (reachable.has(row.section_id) || reachable.has(row.requester_section_id));
+  if (!allowed) return res.status(404).json({ message: "Request not found" });
   res.json({ sectionCode: row.code, sectionName: row.name });
 }));
 
@@ -382,14 +395,19 @@ router.get("/:id/export.txt", asyncHandler(async (req, res) => {
 }));
 
 router.post("/", audit("CREATE", "REQUEST", req => req.body.title), asyncHandler(async (req, res) => {
+  // Lengths mirror database/schema.sql for the `requests` table, so an oversized
+  // value is a 400 that names the field instead of an mssql truncation error
+  // surfacing as a 500. TEXT_MAX covers the NVARCHAR(MAX) columns, which have no
+  // ceiling of their own — a bound there is about refusing absurd payloads, not
+  // about fitting the column.
   const schema = z.object({
-    title: z.string().min(1),
-    requestType: z.string().min(1),
-    systemArea: z.string().min(1),
-    priority: z.string().min(1).default("NORMAL"),
-    dueDate: z.string(),
-    description: z.string().min(1),
-    businessImpact: z.string().min(1),
+    title: z.string().min(1).max(255),
+    requestType: z.string().min(1).max(80),
+    systemArea: z.string().min(1).max(100),
+    priority: z.string().min(1).max(20).default("NORMAL"),
+    dueDate: z.string().max(40),
+    description: z.string().min(1).max(TEXT_MAX),
+    businessImpact: z.string().min(1).max(TEXT_MAX),
     attachments: attachmentSchema()
   });
   const input = schema.parse(req.body);
@@ -502,10 +520,10 @@ router.patch("/:id/kpi", audit("EDIT", "REQUEST", req => req.params.id), asyncHa
 router.patch("/:id/details", audit("EDIT", "REQUEST", req => req.params.id), asyncHandler(async (req, res) => {
   const id = Number(req.params.id);
   const input = z.object({
-    requestType: z.string().trim().min(1),
-    systemArea: z.string().trim().min(1),
-    description: z.string().trim().min(1),
-    businessImpact: z.string().trim().min(1)
+    requestType: z.string().trim().min(1).max(80),
+    systemArea: z.string().trim().min(1).max(100),
+    description: z.string().trim().min(1).max(TEXT_MAX),
+    businessImpact: z.string().trim().min(1).max(TEXT_MAX)
   }).parse(req.body);
   const row = (await query(
     "SELECT * FROM requests WHERE id=@id AND (section_id=@sectionId OR requester_section_id=@sectionId)",
@@ -563,10 +581,10 @@ router.patch("/:id/details", audit("EDIT", "REQUEST", req => req.params.id), asy
 
 router.post("/:id/todos", audit("CREATE", "TODO"), asyncHandler(async (req, res) => {
   const schema = z.object({
-    title: z.string().trim().min(1),
-    description: z.string().optional().nullable(),
-    plannedStart: z.string(),
-    plannedEnd: z.string(),
+    title: z.string().trim().min(1).max(255),
+    description: z.string().max(TEXT_MAX).optional().nullable(),
+    plannedStart: z.string().max(40),
+    plannedEnd: z.string().max(40),
     sortOrder: z.number().int().optional().default(0),
     isImportant: z.boolean().optional().default(false),
     attachments: attachmentSchema()
@@ -632,10 +650,10 @@ router.patch("/:id/todos/reorder", audit("REORDER", "TODO", req => req.params.id
 
 router.patch("/:id/todos/:todoId", audit("EDIT", "TODO", req => req.params.todoId), asyncHandler(async (req, res) => {
   const schema = z.object({
-    title: z.string().trim().min(1),
-    description: z.string().optional().nullable(),
-    plannedStart: z.string(),
-    plannedEnd: z.string(),
+    title: z.string().trim().min(1).max(255),
+    description: z.string().max(TEXT_MAX).optional().nullable(),
+    plannedStart: z.string().max(40),
+    plannedEnd: z.string().max(40),
     isDone: z.boolean().optional().default(false),
     // Optional so callers that don't know about the star (e.g. the done-toggle)
     // leave the stored value untouched via COALESCE below.

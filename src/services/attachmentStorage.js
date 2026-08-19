@@ -28,6 +28,59 @@ const ALLOWED_ATTACHMENTS = {
 
 const GENERIC_CONTENT_TYPES = new Set(["", "application/octet-stream", "binary/octet-stream"]);
 
+// What the first bytes of a file must look like for each accepted extension.
+// Keyed by EXTENSION rather than by the declared content type on purpose: the
+// whitelist above tolerates a generic "application/octet-stream" (browsers send
+// it for Office files), so keying on the declared type would let anything
+// claiming to be generic skip the check entirely. The extension is the thing
+// the rest of the pipeline believes, so the extension is what has to be true.
+//
+// `at` lets a signature sit past the start — WebP is "RIFF" then four length
+// bytes then "WEBP".
+const B = s => [...s].map(c => c.charCodeAt(0));
+const SIG = {
+  pdf: [{ at: 0, bytes: [0x25, 0x50, 0x44, 0x46, 0x2d] }],                    // %PDF-
+  png: [{ at: 0, bytes: [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a] }],
+  jpeg: [{ at: 0, bytes: [0xff, 0xd8, 0xff] }],
+  webp: [{ at: 0, bytes: B("RIFF") }, { at: 8, bytes: B("WEBP") }],
+  // docx/xlsx are ZIP containers. The two rarer ZIP headers (empty archive,
+  // spanned archive) are not valid Office files, so only the normal one counts.
+  zip: [{ at: 0, bytes: [0x50, 0x4b, 0x03, 0x04] }],
+  // Legacy Office (.doc/.xls) is an OLE2 compound document.
+  ole2: [{ at: 0, bytes: [0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1] }]
+};
+
+const EXTENSION_SIGNATURES = {
+  ".pdf": ["pdf"],
+  ".png": ["png"],
+  ".jpg": ["jpeg"],
+  ".jpeg": ["jpeg"],
+  ".webp": ["webp"],
+  ".doc": ["ole2"],
+  ".docx": ["zip"],
+  ".xls": ["ole2"],
+  ".xlsx": ["zip"]
+};
+
+function matchesSignature(buffer, name) {
+  return SIG[name].every(part => part.bytes.every((byte, i) => buffer[part.at + i] === byte));
+}
+
+// The extension and the declared content type both come from the client, so
+// agreeing with each other proves nothing — a renamed executable carries
+// whatever name and type its sender chooses. This reads the bytes that actually
+// arrived, which the sender cannot fake without shipping a real file of that
+// type.
+function assertMagicByte(fileName, buffer) {
+  const ext = path.extname(`${fileName || ""}`).toLowerCase();
+  const expected = EXTENSION_SIGNATURES[ext];
+  if (!expected) return; // unreachable: assertAllowedAttachment ran first
+  if (expected.some(name => matchesSignature(buffer, name))) return;
+  throw badRequest(
+    `File "${fileName}" is not a real ${ext.slice(1).toUpperCase()} file — its contents do not match its extension`
+  );
+}
+
 const ALLOWED_EXTENSION_LIST = Object.keys(ALLOWED_ATTACHMENTS).join(", ");
 
 function badRequest(message) {
@@ -63,6 +116,19 @@ function splitDataUrl(dataUrl) {
   const payload = match[3] || "";
   const buffer = isBase64 ? Buffer.from(payload, "base64") : Buffer.from(decodeURIComponent(payload), "utf8");
   return { contentType, buffer };
+}
+
+// Size ceiling for ONE file, measured on the decoded bytes. Until now nothing
+// checked this: the only thing standing between an upload and the disk was the
+// whole-body limit, so the failure a user met was a bare 413 with no idea which
+// file caused it. Checked here, they get the name and the number.
+function assertAttachmentSize(fileName, buffer) {
+  const maxBytes = env.maxAttachmentMb * 1024 * 1024;
+  if (buffer.length <= maxBytes) return;
+  const mb = (buffer.length / (1024 * 1024)).toFixed(1);
+  throw badRequest(
+    `File "${fileName || "attachment"}" is ${mb} MB, over the ${env.maxAttachmentMb} MB limit for a single file`
+  );
 }
 
 function safeExtension(fileName, contentType) {
@@ -124,6 +190,8 @@ async function storeDataUrlAttachment({ dataUrl, fileName, contentType }, contex
   const finalContentType = contentType || parsed.contentType;
   // Single choke point — every upload path in the app goes through here.
   assertAllowedAttachment(fileName, finalContentType);
+  assertAttachmentSize(fileName, parsed.buffer);
+  assertMagicByte(fileName, parsed.buffer);
   const dir = path.join(attachmentRoot, ...storageFolderParts(context));
   await fs.mkdir(dir, { recursive: true });
   const storedName = `${crypto.randomUUID()}${safeExtension(fileName, finalContentType)}`;
@@ -176,8 +244,11 @@ async function removeEmptyParents(dir, root) {
 module.exports = {
   ALLOWED_ATTACHMENTS,
   assertAllowedAttachment,
+  assertAttachmentSize,
+  assertMagicByte,
   attachmentRoot,
   legacyAttachmentRoot,
+  splitDataUrl,
   storeDataUrlAttachment,
   readAttachmentAsDataUrl,
   deleteStoredAttachment

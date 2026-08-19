@@ -33,6 +33,19 @@ function listEnv(name, fallback) {
     .filter(Boolean);
 }
 
+// A secret with no value must stop the process, not quietly borrow another one.
+// SESSION_SECRET used to fall back to JWT_SECRET, which meant a host where
+// someone left it blank signed session cookies with the same key that signs
+// bearer tokens — one leak costing both, and no sign anywhere that it had
+// happened. Failing at startup is the only version of this a person notices.
+function requiredEnv(name) {
+  const value = process.env[name];
+  if (value === undefined || `${value}`.trim() === "") {
+    throw new Error(`Refusing to start: ${name} is required (see .env.example)`);
+  }
+  return value;
+}
+
 const frontendOrigins = listEnv("FRONTEND_ORIGINS", "FRONTEND_ORIGIN");
 
 const env = {
@@ -44,12 +57,24 @@ const env = {
   jwtSecret: process.env.JWT_SECRET,
   jwtExpiresIn: process.env.JWT_EXPIRES_IN,
   bcryptRounds: Number(process.env.BCRYPT_ROUNDS),
+  // Failed sign-ins allowed from one IP per 15 minutes (Control 16, R16.2).
+  loginRateLimitMax: numberEnv("LOGIN_RATE_LIMIT_MAX", 5),
   attachmentRoot: process.env.ATTACHMENT_ROOT,
+  // Request body ceilings, in MB. The security standard caps a JSON body at
+  // 10MB, and at 5MB for anything that does not carry an upload — so the
+  // ordinary limit is the tighter one and only the two routers that receive
+  // base64 file payloads (requests, branch maps) get the larger one.
+  bodyLimitMb: numberEnv("JSON_BODY_LIMIT_MB", 5),
+  uploadBodyLimitMb: numberEnv("UPLOAD_BODY_LIMIT_MB", 10),
+  // Per-file ceiling for one attachment, in MB of ACTUAL file bytes. A data URL
+  // is base64, so it arrives about 4/3 the size of the file it carries — this
+  // is checked against the decoded buffer, not the string.
+  maxAttachmentMb: numberEnv("MAX_ATTACHMENT_MB", 6),
   forceHttps: boolEnv("FORCE_HTTPS"),
   enableHsts: boolEnv("ENABLE_HSTS"),
   trustProxyHops: numberEnv("TRUST_PROXY_HOPS"),
   session: {
-    secret: firstEnv("SESSION_SECRET", "JWT_SECRET"),
+    secret: requiredEnv("SESSION_SECRET"),
     cookieName: process.env.SESSION_COOKIE_NAME,
     cookieSecure: boolEnv("SESSION_COOKIE_SECURE"),
     cookieSameSite: (process.env.SESSION_COOKIE_SAME_SITE).toLowerCase(),

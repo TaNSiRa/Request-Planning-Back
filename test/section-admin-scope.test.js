@@ -10,7 +10,7 @@
 // giving a global admin the full replace-all it always had.
 const { after, before, describe, it } = require("node:test");
 const assert = require("node:assert/strict");
-const { createApp, closePool, fixtureContext, query } = require("./helpers/setup");
+const { createApp, closePool, fixtureContext, query, POLICY_VERSION } = require("./helpers/setup");
 
 const ctx = fixtureContext("SASCOPE");
 const app = createApp();
@@ -106,10 +106,17 @@ describe("section admin may only touch the sections they administer", () => {
     // this is. The fixture stores section CODES there, which is one of the two
     // forms the ownership check accepts (the other is the display name).
     const newUser = async (name, roleId, section = ctx.SECTION_CODE) => (await query(
-      `INSERT INTO users (email, display_name, password_hash, role_id, section, is_active, pdpa_consent_accepted)
+      `INSERT INTO users (email, display_name, password_hash, role_id, section, is_active, pdpa_consent_accepted, pdpa_policy_version)
        OUTPUT INSERTED.id
-       VALUES (@email, @displayName, @hash, @roleId, @section, 1, 1)`,
-      { email: ctx.testEmail(name), displayName: `SASCOPE ${name}`, hash, roleId, section }
+       VALUES (@email, @displayName, @hash, @roleId, @section, 1, 1, @policyVersion)`,
+      {
+        email: ctx.testEmail(name),
+        displayName: `SASCOPE ${name}`,
+        hash,
+        roleId,
+        section,
+        policyVersion: POLICY_VERSION
+      }
     )).recordset[0].id;
 
     const adminId = await newUser("sectionadmin", roles.SECTION_ADMIN);

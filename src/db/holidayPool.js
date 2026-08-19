@@ -126,7 +126,12 @@ async function verifyHoliday() {
     await pool.request().query(`SELECT TOP 1 [${cfg.dateColumn}] FROM [${cfg.table}]`);
     return { configured: true, ok: true, message: `Connected to ${cfg.database} · ${cfg.table}` };
   } catch (err) {
-    return { configured: true, ok: false, message: err.message };
+    // The driver's own text names the host, database, and the reason a login
+    // failed — useful in the server log, not something to hand back over HTTP
+    // even to an admin. Return a stable code and keep the detail here.
+    // eslint-disable-next-line no-console
+    console.error(`[holiday] verify failed: ${err.message}`);
+    return { configured: true, ok: false, message: "HOLIDAY_DB_CONNECT_FAILED" };
   }
 }
 

@@ -13,6 +13,10 @@ const { getUserSections, isViewer, isAdmin } = require("../../services/sectionSe
 const { getViewerOverrides } = require("../../services/viewerService");
 const { verifyMicrosoftIdToken } = require("../../services/microsoftTokenService");
 const { getGlobalBool } = require("../../services/settingsService");
+const { POLICY_VERSION, hasCurrentConsent } = require("../../services/pdpa");
+const {
+  MAX_FAILURES, LOCK_MINUTES, lockedUntil, recordFailure, recordSuccess
+} = require("../../services/loginLockout");
 const { planFromUserRow } = require("../../services/reminderPlan");
 const { env } = require("../../config/env");
 
@@ -31,11 +35,17 @@ function pruneBlockedLogins() {
 }
 
 // Brute-force guard for credential logins. Only FAILED attempts count
-// (skipSuccessfulRequests), so an active legitimate user is never locked out,
+// (skipSuccessfulRequests), so an active legitimate user is never logged out,
 // while password guessing against an account/IP is throttled hard.
+//
+// max = 5 / 15 min / IP is the figure the security standard names for
+// POST /login (R16.2). It only ever counts failures, so a person who simply
+// mistypes has 5 tries per quarter hour and every success resets nothing.
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 10,
+  // Tunable so the account-lockout tests can take the per-IP limiter out of the
+  // way and exercise the per-account one on its own. Production leaves it at 5.
+  max: env.loginRateLimitMax,
   standardHeaders: true,
   legacyHeaders: false,
   skipSuccessfulRequests: true,
@@ -72,10 +82,75 @@ const microsoftLoginSchema = z.object({
 router.post("/login", loginLimiter, asyncHandler(async (req, res) => {
   const input = loginSchema.parse(req.body);
   const user = await findActiveUserByIdentifier(input.email);
-  if (!user || !(await bcrypt.compare(input.password, user.password_hash || ""))) {
+  const passwordOk = Boolean(user) && await bcrypt.compare(input.password, user.password_hash || "");
+
+  // A locked account is refused even when the password is right — a lock that
+  // only stopped wrong guesses would stop nothing. The password is still
+  // checked first, and deliberately so: it decides WHICH refusal is sent.
+  //
+  //   right password + locked → say it is locked, with the time it reopens.
+  //     Only the account's owner can reach this branch, and they are the one
+  //     person who needs to know why their correct password stopped working.
+  //   wrong password           → the same generic line as always, whether or
+  //     not the account is locked. A guesser learns nothing about which names
+  //     exist or which ones they have managed to lock.
+  const locked = user ? lockedUntil(user) : null;
+  if (locked && passwordOk) {
+    const minutes = Math.max(1, Math.ceil((locked.getTime() - Date.now()) / 60000));
+    await writeAudit({
+      actorId: user.id,
+      action: "LOGIN_BLOCKED",
+      entityType: "AUTH",
+      entityId: `${input.email || ""}`.slice(0, 100),
+      afterValue: { reason: "ACCOUNT_LOCKED", lockedUntil: locked.toISOString() },
+      ip: req.ip,
+      userAgent: req.headers["user-agent"]
+    });
+    return res.status(401).json({
+      message: `Too many failed sign-ins. This account is locked for another ${minutes} minute${minutes === 1 ? "" : "s"}.`
+    });
+  }
+
+  if (!passwordOk) {
+    // A failed sign-in is the one event password guessing leaves behind, so it
+    // has to reach the audit trail with its IP and user agent — without this a
+    // slow attempt spread across addresses passes under the rate limiter and
+    // leaves nothing to find afterwards.
+    //
+    // entityId is the identifier that was TYPED, not a resolved account: for an
+    // unknown user there is no id, and knowing which non-existent names are
+    // being tried is itself the signal. The password never goes anywhere near
+    // this call.
+    await writeAudit({
+      actorId: user ? user.id : null,
+      action: "LOGIN_FAILED",
+      entityType: "AUTH",
+      entityId: `${input.email || ""}`.slice(0, 100),
+      afterValue: { reason: user ? "BAD_PASSWORD" : "NO_SUCH_ACTIVE_USER" },
+      ip: req.ip,
+      userAgent: req.headers["user-agent"]
+    });
+    // Count it against the account (not just the IP) and lock at 5 in a row.
+    if (user) {
+      const state = await recordFailure(user.id);
+      if (state.locked) {
+        await writeAudit({
+          actorId: user.id,
+          action: "ACCOUNT_LOCKED",
+          entityType: "AUTH",
+          entityId: `${input.email || ""}`.slice(0, 100),
+          afterValue: { failures: MAX_FAILURES, lockMinutes: LOCK_MINUTES },
+          ip: req.ip,
+          userAgent: req.headers["user-agent"]
+        });
+      }
+    }
     return res.status(401).json({ message: "Invalid email, employee no, or password" });
   }
 
+  // The right password clears the count, so an ordinary run of typos never
+  // adds up to a lock across days.
+  await recordSuccess(user.id);
   await writeAudit({ actorId: user.id, action: "LOGIN", entityType: "AUTH", ip: req.ip, userAgent: req.headers["user-agent"] });
   res.json(await completeLogin(req, user));
 }));
@@ -231,7 +306,7 @@ router.post("/pdpa-consent", requireAuth, asyncHandler(async (req, res) => {
       id: req.user.id,
       ip: req.ip,
       userAgent: `${req.headers["user-agent"] || ""}`.slice(0, 512),
-      policyVersion: "privacy-policy-2026"
+      policyVersion: POLICY_VERSION
     }
   );
   const userRow = await findActiveUserById(req.user.id);
@@ -241,7 +316,7 @@ router.post("/pdpa-consent", requireAuth, asyncHandler(async (req, res) => {
     action: "PDPA_ACCEPT",
     entityType: "USER",
     entityId: req.user.id,
-    afterValue: { pdpaConsentAccepted: true, policyVersion: "privacy-policy-2026" },
+    afterValue: { pdpaConsentAccepted: true, policyVersion: POLICY_VERSION },
     ip: req.ip,
     userAgent: req.headers["user-agent"]
   });
@@ -365,9 +440,10 @@ async function completeLogin(req, user) {
 }
 
 function sanitizeUser(user) {
-  const pdpaConsentAccepted = user?.pdpa_consent_accepted === true ||
-    user?.pdpa_consent_accepted === 1 ||
-    user?.pdpaConsentAccepted === true;
+  // Per POLICY version — raising PDPA_POLICY_VERSION makes this false again for
+  // everyone, which is what puts the consent page back in front of them (the
+  // client shows it whenever this reads false). R10.5 with no extra plumbing.
+  const pdpaConsentAccepted = hasCurrentConsent(user);
   return {
     id: user.id,
     employeeNo: user.employee_no,

@@ -7,6 +7,7 @@ process.env.SESSION_COOKIE_SECURE = "false"; // supertest talks plain http
 const bcrypt = require("bcryptjs");
 const supertest = require("supertest");
 const { env } = require("../../src/config/env");
+const { POLICY_VERSION } = require("../../src/services/pdpa");
 
 // Hard safety gate: tests insert and delete rows, so they may only ever run
 // against a local database — never the production server.
@@ -57,10 +58,21 @@ function fixtureContext(tag) {
     const users = {};
     for (const name of ["requester", "approver1", "approver2", "member", "coapprover"]) {
       users[name] = (await query(
-        `INSERT INTO users (email, display_name, password_hash, role_id, section, is_active, pdpa_consent_accepted)
+        // The policy version goes in with the flag: consent is recorded against
+        // a specific text, and the server now refuses a request whose account
+        // agreed to some other one (or to none we can name). A fixture without
+        // it is a user the real /auth/pdpa-consent could never have produced.
+        `INSERT INTO users (email, display_name, password_hash, role_id, section, is_active, pdpa_consent_accepted, pdpa_policy_version)
          OUTPUT INSERTED.id
-         VALUES (@email, @displayName, @hash, @roleId, @section, 1, 1)`,
-        { email: testEmail(name), displayName: `${TAG} ${name}`, hash, roleId: role.id, section: SECTION_CODE }
+         VALUES (@email, @displayName, @hash, @roleId, @section, 1, 1, @policyVersion)`,
+        {
+          email: testEmail(name),
+          displayName: `${TAG} ${name}`,
+          hash,
+          roleId: role.id,
+          section: SECTION_CODE,
+          policyVersion: POLICY_VERSION
+        }
       )).recordset[0].id;
       await query(
         `INSERT INTO user_section_memberships (user_id, section_id, can_request, can_work, is_active)
@@ -198,5 +210,9 @@ module.exports = {
   closePool,
   fixtureContext,
   query,
-  PASSWORD
+  PASSWORD,
+  // Re-exported so a test that seeds its own users can stamp the same consent
+  // version the app records — without it those accounts read as "has not agreed
+  // to the current policy" and every call comes back 403.
+  POLICY_VERSION
 };

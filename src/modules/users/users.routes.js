@@ -11,9 +11,11 @@ const { requireSectionAdmin, resolveSection, isAdmin, isViewer, canManageTargetR
 const { blockViewerWrites } = require("../../middleware/viewerGuard");
 const { rejectWeakPassword } = require("../../services/passwordPolicy");
 const { bumpTokenVersion, forgetAccount, setMustChangePassword } = require("../../services/accountState");
+const { recordSuccess: clearLoginLockout } = require("../../services/loginLockout");
 const { VIEWER_PAGE_KEYS, getViewerOverrides, setViewerOverrides, sectionCanEdit } = require("../../services/viewerService");
 const { routeStepUserCondition } = require("../../services/approverService");
 const { getUserDisplayOrder, sortUsersByDisplayOrder } = require("../../services/settingsService");
+const { assertAllowedAttachment, assertMagicByte, splitDataUrl } = require("../../services/attachmentStorage");
 const { emitSystem } = require("../../services/realtimeService");
 const {
   PRESETS,
@@ -156,18 +158,18 @@ async function getAssigneeSkills(userIds, sectionId) {
 
 router.post("/", requireSectionAdmin, audit("CREATE", "USER", req => req.body.email), asyncHandler(async (req, res) => {
   const schema = z.object({
-    employeeNo: z.string().min(1),
-    email: z.string().email(),
-    displayName: z.string().min(2),
-    fullName: z.string().optional().nullable(),
-    namePrefix: z.string().optional().nullable(),
+    employeeNo: z.string().min(1).max(50),
+    email: z.string().email().max(255),
+    displayName: z.string().min(2).max(150),
+    fullName: z.string().max(200).optional().nullable(),
+    namePrefix: z.string().max(20).optional().nullable(),
     positionId: z.number().int().positive().optional().nullable(),
-    password: z.string().min(1),
+    password: z.string().min(1).max(128),
     roleId: z.number().int(),
-    branch: z.string().min(1),
-    department: z.string().min(1),
-    section: z.string().min(1),
-    phone: z.string().optional().nullable(),
+    branch: z.string().min(1).max(100),
+    department: z.string().min(1).max(100),
+    section: z.string().min(1).max(100),
+    phone: z.string().max(50).optional().nullable(),
     canRequest: z.boolean().optional().default(true),
     canWork: z.boolean().optional().default(true),
     memberships: membershipsSchema
@@ -217,17 +219,17 @@ router.post("/", requireSectionAdmin, audit("CREATE", "USER", req => req.body.em
 
 router.patch("/:id(\\d+)", requireSectionAdmin, audit("EDIT", "USER", req => req.params.id), asyncHandler(async (req, res) => {
   const schema = z.object({
-    employeeNo: z.string().min(1),
-    email: z.string().email(),
-    displayName: z.string().min(2),
-    fullName: z.string().optional().nullable(),
-    namePrefix: z.string().optional().nullable(),
+    employeeNo: z.string().min(1).max(50),
+    email: z.string().email().max(255),
+    displayName: z.string().min(2).max(150),
+    fullName: z.string().max(200).optional().nullable(),
+    namePrefix: z.string().max(20).optional().nullable(),
     positionId: z.number().int().positive().optional().nullable(),
     roleId: z.number().int(),
-    branch: z.string().min(1),
-    department: z.string().min(1),
-    section: z.string().min(1),
-    phone: z.string().optional().nullable(),
+    branch: z.string().min(1).max(100),
+    department: z.string().min(1).max(100),
+    section: z.string().min(1).max(100),
+    phone: z.string().max(50).optional().nullable(),
     isActive: z.boolean(),
     canRequest: z.boolean().optional().default(true),
     canWork: z.boolean().optional().default(true),
@@ -355,21 +357,26 @@ router.post("/:id(\\d+)/reset-password", requireSectionAdmin, audit("RESET_PASSW
   // An admin resetting a password is usually responding to a lost or leaked
   // credential — sign the account out everywhere it is currently signed in.
   await bumpTokenVersion(Number(req.params.id));
+  // …and it is also how someone locked out by failed sign-ins gets back in, so
+  // hand them an account that is actually open. Without this the new password
+  // would be refused until the lock timed out on its own.
+  await clearLoginLockout(Number(req.params.id));
   res.json({ ok: true });
 }));
 
 router.patch("/me", audit("EDIT_PROFILE", "USER", req => req.user.id), asyncHandler(async (req, res) => {
+  // Bounds mirror the `users` columns in database/schema.sql.
   const schema = z.object({
-    employeeNo: z.string().trim().min(1),
-    email: z.string().trim().email(),
-    displayName: z.string().min(2),
-    fullName: z.string().optional().nullable(),
-    namePrefix: z.string().optional().nullable(),
+    employeeNo: z.string().trim().min(1).max(50),
+    email: z.string().trim().email().max(255),
+    displayName: z.string().min(2).max(150),
+    fullName: z.string().max(200).optional().nullable(),
+    namePrefix: z.string().max(20).optional().nullable(),
     positionId: z.number().int().positive().optional().nullable(),
-    phone: z.string().optional().nullable(),
-    branch: z.string().min(1),
-    department: z.string().min(1),
-    section: z.string().min(1),
+    phone: z.string().max(50).optional().nullable(),
+    branch: z.string().min(1).max(100),
+    department: z.string().min(1).max(100),
+    section: z.string().min(1).max(100),
     // Working days before a request end date to email a reminder (0 disables
     // the "near end date" digest; today/overdue reminders still send).
     endDateNotifyDays: z.number().int().min(0).max(365).optional(),
@@ -528,6 +535,18 @@ router.put("/me/avatar", audit("EDIT_AVATAR", "USER", req => req.user.id), async
       .nullable()
   });
   const input = schema.parse(req.body);
+  // The prefix above is a string the client writes, not evidence about the
+  // bytes behind it: anything base64-encoded can be sent under
+  // "data:image/png;base64,". Avatars used to stop at that prefix while every
+  // other upload went through the attachment gate — this puts them through the
+  // same door. It is the one upload path that stores its payload on the user
+  // row rather than on disk, so it never met storeDataUrlAttachment().
+  if (input.avatar) {
+    const { contentType, buffer } = splitDataUrl(input.avatar);
+    const ext = contentType === "image/png" ? ".png" : contentType === "image/webp" ? ".webp" : ".jpg";
+    assertAllowedAttachment(`avatar${ext}`, contentType);
+    assertMagicByte(`avatar${ext}`, buffer);
+  }
   try {
     await query("UPDATE users SET avatar=@avatar, updated_at=SYSUTCDATETIME() WHERE id=@id", {
       id: req.user.id,
