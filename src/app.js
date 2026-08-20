@@ -105,15 +105,22 @@ function createApp() {
     // Return JSON (not plain text) so the frontend can parse the error body.
     message: { message: "Too many requests, please slow down and try again shortly." }
   }));
+  // ABOVE the session middleware on purpose. /health is public and needs no
+  // session, and the login page polls it every 10 seconds — under `rolling: true`
+  // that poll re-issued the session cookie on every tick, so a session could
+  // never idle out while a tab was open and the server-side idle timeout was
+  // decorative. Mounted here it never touches the session at all, and the only
+  // thing that keeps a session alive is real use (see /api/auth/keepalive).
+  app.use("/api/health", healthRoutes);
+
   app.use(sessionMiddleware());
   app.use(csrfProtection);
 
-  // Open to a signed-in account that has not consented yet: /health needs no
-  // account at all, and /auth is how the consent page is reached, accepted and
-  // left. Everything below them is closed until consent is on record — see
-  // services/pdpa.js. Each business router runs requireAuth itself, so the gate
-  // is mounted inside them rather than here (it needs req.user).
-  app.use("/api/health", healthRoutes);
+  // Open to a signed-in account that has not consented yet: /auth is how the
+  // consent page is reached, accepted and left. Everything below it is closed
+  // until consent is on record — see services/pdpa.js. Each business router runs
+  // requireAuth itself, so the gate is mounted inside them rather than here (it
+  // needs req.user).
   app.use("/api/auth", authRoutes);
 
   const guarded = [

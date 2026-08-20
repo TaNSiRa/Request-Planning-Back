@@ -6,7 +6,7 @@ const { query } = require("../../db/pool");
 const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth, signToken } = require("../../middleware/auth");
 const { writeAudit } = require("../../middleware/audit");
-const { clearSession, setLoggedInSession } = require("../../services/securityService");
+const { clearSession, regenerateSession, setLoggedInSession } = require("../../services/securityService");
 const { bumpTokenVersion, setMustChangePassword } = require("../../services/accountState");
 const { rejectWeakPassword } = require("../../services/passwordPolicy");
 const { getUserSections, isViewer, isAdmin } = require("../../services/sectionService");
@@ -225,6 +225,17 @@ router.get("/session", requireAuth, asyncHandler(async (req, res) => {
   res.json({ token: signToken(userRow), user, csrfToken: req.session?.csrfToken || null });
 }));
 
+// A no-op whose entire purpose is its SIDE EFFECT: any authenticated request
+// re-issues the rolling session cookie. /health no longer does that (it is
+// mounted above the session middleware), so a tab that is being used but only
+// READ from — a long request detail, a form being filled in — would otherwise
+// let the session idle out under someone who is sitting right there. The client
+// calls this at most once a minute, and only on real pointer activity, which is
+// the same signal its own idle timer runs on.
+router.get("/keepalive", requireAuth, (req, res) => {
+  res.json({ ok: true });
+});
+
 router.get("/csrf-token", requireAuth, asyncHandler(async (req, res) => {
   if (!req.session) return res.json({ csrfToken: null });
   if (!req.session.csrfToken) req.session.csrfToken = setLoggedInSession(req, req.user);
@@ -434,6 +445,10 @@ async function findActiveUserByIdentifier(identifier) {
 
 async function completeLogin(req, user) {
   await query("UPDATE users SET last_login_at = SYSUTCDATETIME() WHERE id = @id", { id: user.id });
+  // New session id for the new sign-in: whatever the browser arrived with is
+  // discarded rather than adopted (session fixation), which is also what makes
+  // the CSRF exemption on the login endpoints safe.
+  await regenerateSession(req);
   const csrfToken = setLoggedInSession(req, user);
   const sanitized = await attachUserContext(sanitizeUser(user));
   return { token: signToken(user), csrfToken, user: sanitized };

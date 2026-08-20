@@ -2,6 +2,7 @@ const jwt = require("jsonwebtoken");
 const { env } = require("../config/env");
 const { loadAccountState, tokenVersionOf } = require("../services/accountState");
 const { POLICY_VERSION, hasCurrentConsent } = require("../services/pdpa");
+const { clearSession } = require("../services/securityService");
 
 // A verified token/session is not enough on its own — the account behind it must
 // still be active and must not have been revoked since the credential was issued
@@ -22,6 +23,7 @@ async function requireAuth(req, res, next) {
   const token = header.startsWith("Bearer ") ? header.slice(7) : null;
 
   let user;
+  let fromSession = false;
   if (token) {
     try {
       user = jwt.verify(token, env.jwtSecret);
@@ -30,13 +32,23 @@ async function requireAuth(req, res, next) {
     }
   } else if (req.session?.user) {
     user = req.session.user;
+    fromSession = true;
   } else {
     return res.status(401).json({ message: "Unauthorized" });
   }
 
   try {
     const problem = await revocationProblem(user);
-    if (problem) return res.status(401).json({ message: problem });
+    if (problem) {
+      // A session cookie that no longer authenticates anyone is not just dead —
+      // it is in the way: csrfProtection still sees `.user` on it and would
+      // answer the next sign-in with CSRF_REQUIRED. Bin it here so the browser
+      // lands on the login page clean.
+      if (fromSession) {
+        return clearSession(req, res, () => res.status(401).json({ message: problem }));
+      }
+      return res.status(401).json({ message: problem });
+    }
   } catch (err) {
     return next(err);
   }

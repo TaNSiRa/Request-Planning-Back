@@ -78,6 +78,20 @@ function setLoggedInSession(req, user) {
   return req.session.csrfToken;
 }
 
+// Login has to be allowed to throw away whatever session the browser turns up
+// with — otherwise a stale one is INHERITED by the person who just signed in
+// (session fixation), and the CSRF exemption below would be the hole that lets
+// it happen. Callback API wrapped so the login routes can just await it.
+function regenerateSession(req) {
+  return new Promise((resolve, reject) => {
+    if (typeof req.session?.regenerate !== "function") {
+      resolve();
+      return;
+    }
+    req.session.regenerate(error => (error ? reject(error) : resolve()));
+  });
+}
+
 function clearSession(req, res, callback) {
   if (!req.session) {
     callback();
@@ -89,6 +103,27 @@ function clearSession(req, res, callback) {
   });
 }
 
+// The two endpoints that CREATE a session. They cannot be asked for a CSRF
+// token — the login page has never been given one — and they do not need to be:
+// both demand a credential (password / verified Microsoft id_token) that an
+// attacker's page cannot produce from the victim's browser.
+//
+// Without this exemption a session cookie that outlives its own login (revoked
+// by a logout elsewhere, a password change, a deactivation — requireAuth rejects
+// those but the session object survives) turns into a lockout: the session still
+// carries `.user`, the freshly-loaded login page has no token, so signing in
+// again answers 403 CSRF_REQUIRED. And it does not heal on its own, because the
+// login page polls /health every 10s and `rolling: true` re-ups the cookie on
+// every one of those.
+const SESSION_ENTRY_PATHS = new Set(["/api/auth/login", "/api/auth/microsoft/login"]);
+
+// Express routes case-insensitively and ignores a trailing slash, so the set
+// above is compared against a path normalised the same way it matches.
+function entryPath(req) {
+  const path = `${req.path}`.toLowerCase();
+  return path.length > 1 && path.endsWith("/") ? path.slice(0, -1) : path;
+}
+
 // CSRF is only exploitable against credentials the BROWSER attaches on its own —
 // i.e. the session cookie. A Bearer token has to be set by same-origin JS, which
 // an attacker's page cannot do, so a caller presenting only `Authorization` and
@@ -96,6 +131,11 @@ function clearSession(req, res, callback) {
 // Gate strictly on "is there a logged-in session cookie".
 function csrfProtection(req, res, next) {
   if (["GET", "HEAD", "OPTIONS"].includes(req.method)) {
+    next();
+    return;
+  }
+
+  if (SESSION_ENTRY_PATHS.has(entryPath(req))) {
     next();
     return;
   }
@@ -136,6 +176,7 @@ module.exports = {
   createCsrfToken,
   csrfProtection,
   forceHttps,
+  regenerateSession,
   sessionMiddleware,
   setLoggedInSession
 };
