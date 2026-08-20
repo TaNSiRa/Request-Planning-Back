@@ -72,6 +72,7 @@ router.get("/", asyncHandler(async (req, res) => {
             au.branch AS incharge_branch, au.department AS incharge_department, au.section AS incharge_section,
             su.branch AS support_branch, su.department AS support_department, su.section AS support_section,
             todo.todo_total, todo.todo_done, todo.todo_progress_percent,
+            ext.pending_extension_count, ext.pending_extension_end,
             (SELECT t2.id, t2.title, t2.planned_start, t2.planned_end, t2.is_done, t2.is_important
                FROM request_todos t2
                WHERE t2.request_id = r.id
@@ -91,6 +92,15 @@ router.get("/", asyncHandler(async (req, res) => {
        FROM request_todos t
        WHERE t.request_id = r.id
      ) todo
+     -- A schedule extension waiting for a decision is an approval the request
+     -- is blocked on, but it lives outside r.status — the request stays
+     -- IN_PROGRESS while it waits. The dashboards' approval queues need it, so
+     -- the list carries the flag rather than making them fetch per request.
+     OUTER APPLY (
+       SELECT COUNT(1) AS pending_extension_count, MAX(e.requested_end) AS pending_extension_end
+       FROM schedule_extension_requests e
+       WHERE e.request_id = r.id AND e.status = 'PENDING_APPROVAL'
+     ) ext
      WHERE (@status IS NULL OR r.status = @status)
        AND (r.section_id = @sectionId OR r.requester_section_id = @sectionId)
        AND (@type IS NULL OR r.request_type = @type)

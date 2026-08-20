@@ -80,7 +80,7 @@ router.get("/extensions/pending", asyncHandler(async (req, res) => {
   const userCond = await extensionStepUserCondition("a", "@userId");
   const result = await query(
     `SELECT a.id AS step_id, a.sequence_no, a.step_name,
-            e.*, r.request_no, r.title, requester.display_name AS requester_name, requested_by.display_name AS requested_by_name,
+            e.*, r.request_no, r.title, r.priority, requester.display_name AS requester_name, requested_by.display_name AS requested_by_name,
             requester.branch AS requester_branch, requester.department AS requester_department, requester.section AS requester_section,
             requested_by.branch AS requested_by_branch, requested_by.department AS requested_by_department, requested_by.section AS requested_by_section
      FROM schedule_extension_requests e
