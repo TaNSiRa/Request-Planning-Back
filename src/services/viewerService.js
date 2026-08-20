@@ -4,6 +4,7 @@ const { query } = require("../db/pool");
 // frontend AppPage enum names (see app_shell.dart). "profile" is intentionally
 // omitted — every account may always view and edit its own profile.
 const VIEWER_PAGE_KEYS = [
+  "deptDashboard",
   "dashboard",
   "create",
   "list",
