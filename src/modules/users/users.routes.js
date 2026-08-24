@@ -350,7 +350,7 @@ router.post("/:id(\\d+)/reset-password", requireSectionAdmin, audit("RESET_PASSW
     return res.status(403).json({ message: "This account belongs to another section" });
   }
   const passwordHash = await bcrypt.hash(input.password, env.bcryptRounds);
-  await query("UPDATE users SET password_hash=@passwordHash, updated_at=SYSUTCDATETIME() WHERE id=@id", {
+  await query("UPDATE users SET password_hash=@passwordHash, must_change_password=1, updated_at=SYSUTCDATETIME() WHERE id=@id", {
     id: Number(req.params.id),
     passwordHash
   });
