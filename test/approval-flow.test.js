@@ -194,8 +194,9 @@ describe("request approval flow", () => {
   });
 
   // PATCH /requests/:id/details — the requester, or an approver on the request's
-  // own route, corrects what it says (type, area, description, impact) after it
-  // was raised. Every changed field lands in the detail-edit history.
+  // own route, corrects what it says (project name, type, area, due date,
+  // description, impact) after it was raised. Every changed field lands in the
+  // detail-edit history.
   it("lets an approver on the route edit the request detail", async () => {
     const { id } = await createRequest(requester);
     const edit = {
@@ -247,6 +248,58 @@ describe("request approval flow", () => {
     assert.equal(again.status, 200);
     const after = await getRequest(requester, id);
     assert.equal(after.detailEdits.length, 2);
+  });
+
+  it("edits the project name and due date, and keeps them in the history", async () => {
+    const { id } = await createRequest(requester);
+    const edit = {
+      title: "Renamed project",
+      requestType: "IMPROVEMENT",
+      systemArea: "Test area",
+      dueDate: "2027-03-15",
+      description: "created by automated test",
+      businessImpact: "none"
+    };
+
+    const res = await requester.patch(`/api/requests/${id}/details`).send(edit);
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+
+    const detail = await getRequest(requester, id);
+    assert.equal(detail.title, edit.title);
+    assert.equal(`${detail.due_date}`.slice(0, 10), edit.dueDate);
+    const fields = detail.detailEdits.map(row => row.field).sort();
+    assert.deepEqual(fields, ["due_date", "title"]);
+    const due = detail.detailEdits.find(row => row.field === "due_date");
+    // Stored as a plain day on both sides, never an ISO timestamp.
+    assert.equal(due.old_value, "2026-12-31");
+    assert.equal(due.new_value, edit.dueDate);
+
+    // Leaving the two new fields out is a no-op, not a wipe: an older client
+    // that only knows the original four fields must not blank them.
+    const legacy = await requester.patch(`/api/requests/${id}/details`).send({
+      requestType: "BREAKDOWN",
+      systemArea: edit.systemArea,
+      description: edit.description,
+      businessImpact: edit.businessImpact
+    });
+    assert.equal(legacy.status, 200, JSON.stringify(legacy.body));
+    const after = await getRequest(requester, id);
+    assert.equal(after.title, edit.title);
+    assert.equal(`${after.due_date}`.slice(0, 10), edit.dueDate);
+    assert.equal(after.detailEdits.length, 3); // only request_type moved
+  });
+
+  it("rejects a request-detail edit with a malformed due date", async () => {
+    const { id } = await createRequest(requester);
+    const res = await requester.patch(`/api/requests/${id}/details`).send({
+      title: "Still fine",
+      requestType: "IMPROVEMENT",
+      systemArea: "Test area",
+      dueDate: "31-12-2027",
+      description: "created by automated test",
+      businessImpact: "none"
+    });
+    assert.equal(res.status, 400);
   });
 
   it("refuses a request-detail edit from a plain member", async () => {

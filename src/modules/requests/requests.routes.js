@@ -520,8 +520,8 @@ router.patch("/:id/kpi", audit("EDIT", "REQUEST", req => req.params.id), asyncHa
   res.json({ ok: true });
 }));
 
-// Correct what the request SAYS — its type, system area, description and
-// business impact — from the request-detail page. Deliberately narrow: the
+// Correct what the request SAYS — its title, type, system area, due date,
+// description and business impact — from the request-detail page. Deliberately narrow: the
 // requester who raised it, an approver on this request's own route (primary or
 // co-approver), or a system admin. Meeting mode does NOT widen this the way it
 // widens todo work: `?meeting=1` is ignored here on purpose, so a section member
@@ -529,9 +529,13 @@ router.patch("/:id/kpi", audit("EDIT", "REQUEST", req => req.params.id), asyncHa
 // Every change is written to request_detail_edits so the edit can be traced.
 router.patch("/:id/details", audit("EDIT", "REQUEST", req => req.params.id), asyncHandler(async (req, res) => {
   const id = Number(req.params.id);
+  // title / dueDate are optional so a client that only knows the original four
+  // fields keeps working — anything left out is carried over unchanged.
   const input = z.object({
+    title: z.string().trim().min(1).max(255).optional(),
     requestType: z.string().trim().min(1).max(80),
     systemArea: z.string().trim().min(1).max(100),
+    dueDate: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/, "dueDate must be yyyy-mm-dd").optional(),
     description: z.string().trim().min(1).max(TEXT_MAX),
     businessImpact: z.string().trim().min(1).max(TEXT_MAX)
   }).parse(req.body);
@@ -552,22 +556,34 @@ router.patch("/:id/details", audit("EDIT", "REQUEST", req => req.params.id), asy
   if (!allowed) {
     return res.status(403).json({ message: "Only the requester or an approver on this request's route can edit its details" });
   }
+  // due_date is a DATE column: mssql reads it back as UTC midnight, so both
+  // sides are compared (and stored in the history) as a plain yyyy-mm-dd day.
+  const values = {
+    title: input.title ?? row.title,
+    requestType: input.requestType,
+    systemArea: input.systemArea,
+    dueDate: input.dueDate ?? dateOnly(row.due_date),
+    description: input.description,
+    businessImpact: input.businessImpact
+  };
   // The approval route was picked from the type at submit time; changing the
   // type afterwards corrects the record, it does not re-route the request.
   await query(
     `UPDATE requests
-     SET request_type=@requestType, system_area=@systemArea, description=@description,
-         business_impact=@businessImpact, updated_at=SYSUTCDATETIME()
+     SET title=@title, request_type=@requestType, system_area=@systemArea, due_date=@dueDate,
+         description=@description, business_impact=@businessImpact, updated_at=SYSUTCDATETIME()
      WHERE id=@id`,
-    { id, ...input }
+    { id, ...values }
   );
   // History: one row per field that actually moved, so the popup can show
   // old -> new. An edit that changes nothing leaves no trace.
   const changes = [
-    ["request_type", row.request_type, input.requestType],
-    ["system_area", row.system_area, input.systemArea],
-    ["description", row.description, input.description],
-    ["business_impact", row.business_impact, input.businessImpact]
+    ["title", row.title, values.title],
+    ["request_type", row.request_type, values.requestType],
+    ["system_area", row.system_area, values.systemArea],
+    ["due_date", dateOnly(row.due_date), values.dueDate],
+    ["description", row.description, values.description],
+    ["business_impact", row.business_impact, values.businessImpact]
   ].filter(([, before, after]) => `${before ?? ""}` !== after);
   if (changes.length) {
     // One statement on purpose: SYSUTCDATETIME() is evaluated once per
@@ -1532,6 +1548,16 @@ async function assertCanManageRequestWork(requestId, user, sectionAccess, sectio
     throw err;
   }
   return request;
+}
+
+// A DATE/DATETIME column as a plain yyyy-mm-dd day. mssql hands DATE back as a
+// Date at UTC midnight, so never go through the local timezone here.
+function dateOnly(value) {
+  if (!value) return null;
+  if (value instanceof Date) return value.toISOString().slice(0, 10);
+  const s = `${value}`;
+  const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+  return m ? m[1] : new Date(s).toISOString().slice(0, 10);
 }
 
 function formatDate(value) {
