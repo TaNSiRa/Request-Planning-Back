@@ -30,6 +30,39 @@ const PASSWORD = "ApiTest#1234";
 // unique tag (section code, request prefix, and user email domain all derive
 // from it). Rows are tagged so cleanup can find them, including leftovers from
 // a crashed earlier run.
+// Runs a list of DELETEs, tolerating two things.
+//
+// A table that a later DB patch introduced may simply not exist on a given dev
+// database — "Invalid object name" is then a skip, not a failure.
+//
+// And FK 547 is a LOST RACE, not a bug. The files run in parallel against one
+// database and some of them touch every section on purpose: section-email
+// switches the other sections' project reminder off around its own scan
+// (an app_settings row per section), and the reminder scans themselves queue
+// outbox rows against whatever open requests they find. Either can drop a row
+// into a section this file is in the middle of deleting, and SQL Server reports
+// that as a REFERENCE constraint conflict on the parent DELETE. Every statement
+// here is an idempotent delete, so the answer is to wait for the other file to
+// tidy up after itself and sweep again.
+async function sweep(steps, params, attempts = 5) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      for (const sqlText of steps) {
+        try {
+          await query(sqlText, params);
+        } catch (err) {
+          if (!`${err.message}`.includes("Invalid object name")) throw err;
+        }
+      }
+      return;
+    } catch (err) {
+      const lostRace = err.number === 547 || `${err.message}`.includes("REFERENCE constraint");
+      if (!lostRace || attempt >= attempts) throw err;
+      await new Promise(resolve => setTimeout(resolve, 200 * attempt));
+    }
+  }
+}
+
 function fixtureContext(tag) {
   const TAG = `${tag}`.toUpperCase().replace(/[^A-Z0-9]/g, "");
   if (!TAG) throw new Error("fixtureContext needs a non-empty tag");
@@ -135,14 +168,7 @@ function fixtureContext(tag) {
         `DELETE FROM weekly_plan_default_user_values WHERE section_id=@sid`,
         `DELETE FROM request_sections WHERE id=@sid`
       ];
-      for (const sqlText of steps) {
-        // Optional tables (later DB patches) may not exist on every dev DB.
-        try {
-          await query(sqlText, { sid });
-        } catch (err) {
-          if (!`${err.message}`.includes("Invalid object name")) throw err;
-        }
-      }
+      await sweep(steps, { sid });
     }
 
     const userIds = (await query(
@@ -151,7 +177,7 @@ function fixtureContext(tag) {
     if (userIds.length) {
       const params = Object.fromEntries(userIds.map((id, i) => [`u${i}`, id]));
       const inUsers = `(${userIds.map((_, i) => `@u${i}`).join(",")})`;
-      for (const sqlText of [
+      await sweep([
         `DELETE FROM notifications WHERE user_id IN ${inUsers}`,
         `DELETE FROM audit_logs WHERE actor_user_id IN ${inUsers}`,
         `DELETE FROM user_skill_levels WHERE user_id IN ${inUsers}`,
@@ -160,13 +186,7 @@ function fixtureContext(tag) {
         `DELETE FROM personal_todo_columns WHERE user_id IN ${inUsers}`,
         `DELETE FROM user_section_memberships WHERE user_id IN ${inUsers}`,
         `DELETE FROM users WHERE id IN ${inUsers}`
-      ]) {
-        try {
-          await query(sqlText, params);
-        } catch (err) {
-          if (!`${err.message}`.includes("Invalid object name")) throw err;
-        }
-      }
+      ], params)
     }
   }
 

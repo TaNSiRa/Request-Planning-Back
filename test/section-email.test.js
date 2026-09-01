@@ -109,8 +109,16 @@ async function isolateProjectScanToThisSection() {
     )).recordset;
   }
   await query(
+    // Only sections that actually hold an open request can produce a digest, so
+    // only those need switching off. It keeps our rows out of the fixtures that
+    // have no requests at all (a login-only file, say), which would otherwise
+    // trip over them while deleting their own section.
     `MERGE app_settings AS t
-     USING (SELECT id FROM request_sections WHERE is_active=1 AND id<>@sectionId) AS src
+     USING (SELECT s.id FROM request_sections s
+             WHERE s.is_active=1 AND s.id<>@sectionId
+               AND EXISTS (SELECT 1 FROM requests r
+                            WHERE r.section_id = s.id
+                              AND r.status IN ('IN_PROGRESS','ON_HOLD','WAITING_CLOSE'))) AS src
      ON t.setting_key='projectReminder.enabled' AND t.section_id = src.id
      WHEN MATCHED THEN UPDATE SET setting_value='false'
      WHEN NOT MATCHED BY TARGET THEN
@@ -118,6 +126,18 @@ async function isolateProjectScanToThisSection() {
        VALUES (src.id, 'projectReminder.enabled', 'false', 'bool', 0);`,
     { sectionId: fixture.sectionId }
   );
+}
+
+// Isolation is held for exactly one scan: the rows we write point at other
+// files' sections, and the longer they stand the likelier one of those files is
+// deleting its section right then.
+async function withProjectScanIsolated(run) {
+  await isolateProjectScanToThisSection();
+  try {
+    return await run();
+  } finally {
+    await restoreProjectSwitches();
+  }
 }
 
 async function restoreProjectSwitches() {
@@ -207,15 +227,13 @@ describe("per-section email switches", () => {
     assert.ok(id);
 
     await putSetting("projectReminder.enabled", false);
-    await isolateProjectScanToThisSection();
     await clearOutbox();
-    await sendEndDateReminders(PROJECT_END, new Set());
+    await withProjectScanIsolated(() => sendEndDateReminders(PROJECT_END, new Set()));
     assert.deepEqual(await outbox("END_DATE_%"), [], "switched off, the section gets no project digest");
 
     await putSetting("projectReminder.enabled", true);
-    await isolateProjectScanToThisSection();
     await clearOutbox();
-    await sendEndDateReminders(PROJECT_END, new Set());
+    await withProjectScanIsolated(() => sendEndDateReminders(PROJECT_END, new Set()));
     const digests = await outbox("END_DATE_%");
     assert.equal(digests.length, 1, "switched on, one digest bundles the section's requests");
     assert.equal(digests[0].mail_type, "END_DATE_TODAY", "the fixture period ends on PROJECT_END");
