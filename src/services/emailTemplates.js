@@ -526,6 +526,119 @@ async function buildAssigneeEmail(requestId, { greetingName, roleLabel, assigned
   };
 }
 
+// Every to-do on a request, in board order — feeds the handover card below.
+async function loadTodos(requestId) {
+  try {
+    return (await query(
+      `SELECT title, planned_start, planned_end, is_done
+       FROM request_todos WHERE request_id=@requestId ORDER BY sort_order, id`,
+      { requestId }
+    )).recordset;
+  } catch (err) {
+    if (`${err.message}`.includes("Invalid object name")) return [];
+    throw err;
+  }
+}
+
+// HANDOVER — the job changed hands while it was already running.
+//
+// Deliberately NOT buildAssigneeEmail: that one announces a freshly approved
+// request ("your request was approved and assigned to you"), which reads wrong
+// for work that has been in progress for weeks. This one leads with where the
+// job is coming FROM and what is still open on it, because the first thing a
+// new incharge needs is the state of the to-do list they just inherited.
+// At most WORK_PREVIEW open to-dos are listed; the rest are counted.
+const WORK_PREVIEW = 5;
+
+async function buildReassignedEmail(requestId, { greetingName, previousInchargeName, assignedByName } = {}) {
+  const ctx = await loadRequestContext(requestId);
+  if (!ctx) return null;
+  const accent = ACCENTS.amber;
+  const by = assignedByName ? `<strong>คุณ${esc(assignedByName)}</strong>ได้` : "ผู้อนุมัติได้";
+  const from = previousInchargeName
+    ? `ต่อจาก <strong>คุณ${esc(previousInchargeName)}</strong> `
+    : "";
+
+  const todos = await loadTodos(requestId);
+  const open = todos.filter(t => !(t.is_done === true || t.is_done === 1));
+  const done = todos.length - open.length;
+
+  // The handover card: who it came from, where the work stands, what is left.
+  let rows = "";
+  rows += kvRow("ผู้รับผิดชอบเดิม",
+    previousInchargeName
+      ? `<span style="color:${INK};font-weight:600;">${esc(previousInchargeName)}</span>`
+      : "-");
+  rows += kvRow("ผู้รับผิดชอบใหม่",
+    `<span style="color:${INK};font-weight:700;">${esc(greetingName || "คุณ")}</span>`
+    + ` <span style="color:${FAINT};font-size:12px;">· คือคุณ</span>`);
+  if (ctx.support_name) rows += kvRow("ทีม Support", esc(ctx.support_name));
+  rows += kvRow("สถานะงานตอนนี้", esc(STATUS_TH[ctx.status] || ctx.status));
+  const period = (ctx.planned_start || ctx.planned_end)
+    ? `${formatThaiDate(ctx.planned_start) || "-"} – ${formatThaiDate(ctx.planned_end) || "-"}`
+    : null;
+  if (period) {
+    const hint = daysHint(ctx.planned_end);
+    rows += kvRow("ช่วงเวลาโครงการ",
+      esc(period) + (hint ? ` <span style="color:${FAINT};font-size:12px;">· ${esc(hint)}</span>` : ""));
+  }
+  if (todos.length) {
+    rows += kvRow("ความคืบหน้า To-do", esc(`${done} / ${todos.length} รายการ`));
+    for (const todo of open.slice(0, WORK_PREVIEW)) {
+      const endHint = formatThaiDate(todo.planned_end);
+      rows += kvRow("ยังไม่เสร็จ",
+        `<span style="color:${INK};">${esc(todo.title)}</span>`
+        + (endHint ? ` <span style="color:${FAINT};font-size:12px;">· ถึง ${esc(endHint)}</span>` : ""));
+    }
+    if (open.length > WORK_PREVIEW) {
+      rows += kvRow("", `<span style="color:${FAINT};font-size:12px;">และอีก ${open.length - WORK_PREVIEW} รายการที่ยังไม่เสร็จ</span>`);
+    }
+  } else {
+    rows += kvRow("To-do", `<span style="color:${FAINT};">ยังไม่มีรายการ — วางแผนงานย่อยได้เลย</span>`);
+  }
+
+  const opts = {
+    sectionName: ctx.section_name,
+    requestNo: ctx.request_no,
+    accent,
+    pillText: "โอนงานมาให้คุณ · งานกำลังดำเนินการอยู่",
+    headline: "คุณได้รับโอนงานนี้มาดูแลต่อ",
+    greetingName,
+    paragraphs: [
+      `${by}เปลี่ยนผู้รับผิดชอบของคำขอนี้ ${from}มาเป็นคุณ `
+      + `งานนี้ผ่านการอนุมัติและกำลังดำเนินการอยู่แล้ว จึงไม่ได้เริ่มจากศูนย์ `
+      + `กรุณาเปิดงานเพื่อดูรายการ To-do ที่ค้างอยู่ ตรวจกรอบเวลาที่เหลือ และรับช่วงต่อได้ทันที`
+    ],
+    extraHtml: detailCard("สรุปการโอนงาน", ctx.title, rows),
+    detailTitle: ctx.title,
+    detailRows: baseDetailRows(ctx, { roleLabel: "ผู้รับผิดชอบหลัก (Incharge)", period: true }),
+    description: ctx.description,
+    attachments: ctx.attachments,
+    primary: { label: "เปิดงานที่รับโอน →", url: buildDeeplink(ctx.id, null, ctx.section_code) },
+    footerNote: "คุณได้รับอีเมลนี้เพราะถูกกำหนดให้เป็นผู้รับผิดชอบคนใหม่ของคำขอนี้"
+  };
+  return {
+    subject: `🔄 คุณได้รับโอนงานมาดูแลต่อ · ${ctx.request_no}`,
+    html: renderEmail(opts),
+    text: renderText({
+      ...opts,
+      plainParagraphs: [
+        `คุณได้รับโอนงานนี้มาดูแลต่อ${previousInchargeName ? ` ต่อจากคุณ${previousInchargeName}` : ""}`,
+        todos.length
+          ? `To-do ที่ทำแล้ว ${done} จาก ${todos.length} รายการ`
+          : "ยังไม่มีรายการ To-do บนงานนี้"
+      ],
+      plainRows: [
+        ["ผู้รับผิดชอบเดิม", previousInchargeName || "-"],
+        ["สถานะงานตอนนี้", STATUS_TH[ctx.status] || ctx.status],
+        ["ช่วงเวลาโครงการ", period],
+        ...plainRowsOf(ctx, { roleLabel: "ผู้รับผิดชอบหลัก (Incharge)" })
+      ]
+    }),
+    type: "REASSIGN"
+  };
+}
+
 // 4) Status update to participants. event: APPROVED | REJECTED | COMPLETED |
 //    CLOSE_REJECTED | EXTENSION | HOLD
 async function buildStatusEmail(requestId, { event, greetingName, comment } = {}) {
@@ -1004,6 +1117,7 @@ module.exports = {
   buildRequesterCreatedEmail,
   buildApproverEmail,
   buildAssigneeEmail,
+  buildReassignedEmail,
   buildStatusEmail,
   buildParticipantEmail,
   buildExtensionApproverEmail,

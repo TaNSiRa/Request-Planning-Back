@@ -12,7 +12,17 @@ const { storeDataUrlAttachment, readAttachmentAsDataUrl, deleteStoredAttachment 
 const { isAdmin, getUserSections, resolveSection } = require("../../services/sectionService");
 const { blockViewerWrites } = require("../../middleware/viewerGuard");
 const { getMaxAttachments, MAX_ATTACHMENTS_CEILING } = require("../../services/settingsService");
-const { loadSupportsMap, getSupports, applySupports, isSupportUser } = require("../../services/supportService");
+const { loadSupportsMap, getSupports, applySupports, setSupports, isSupportUser } = require("../../services/supportService");
+// Shared with the approval inbox's "Approve to accept request" card, so the
+// reassignment endpoint below applies exactly the same assignment rules.
+const {
+  normalizeSupTypes,
+  saveSupportTypes,
+  evaluateSkillSufficiency,
+  assignableUserIds,
+  notifyAssignedUsers,
+  notifyUnassignedUser
+} = require("../../services/assignmentService");
 const {
   approvalStepUserCondition,
   routeStepApproverIds,
@@ -523,7 +533,8 @@ router.patch("/:id/kpi", audit("EDIT", "REQUEST", req => req.params.id), asyncHa
 // Correct what the request SAYS — its title, type, system area, due date,
 // description and business impact — from the request-detail page. Deliberately narrow: the
 // requester who raised it, an approver on this request's own route (primary or
-// co-approver), or a system admin. Meeting mode does NOT widen this the way it
+// co-approver), a section admin of this section, or a system admin. Meeting mode
+// does NOT widen this the way it
 // widens todo work: `?meeting=1` is ignored here on purpose, so a section member
 // sitting in the meeting cannot rewrite someone else's request.
 // Every change is written to request_detail_edits so the edit can be traced.
@@ -544,7 +555,11 @@ router.patch("/:id/details", audit("EDIT", "REQUEST", req => req.params.id), asy
     { id, sectionId: req.section.id }
   )).recordset[0];
   if (!row) return res.status(404).json({ message: "Request not found" });
-  let allowed = isAdmin(req.user) || row.requester_user_id === req.user.id;
+  // A system admin, a section admin of this section, or the requester who raised
+  // it — otherwise it has to be an approver on this request's own route (below).
+  let allowed = isAdmin(req.user) ||
+    req.sectionAccess?.isSectionAdmin === true ||
+    row.requester_user_id === req.user.id;
   if (!allowed) {
     const cond = await approvalStepUserCondition("a", "@userId");
     const step = (await query(
@@ -554,7 +569,9 @@ router.patch("/:id/details", audit("EDIT", "REQUEST", req => req.params.id), asy
     allowed = !!step;
   }
   if (!allowed) {
-    return res.status(403).json({ message: "Only the requester or an approver on this request's route can edit its details" });
+    return res.status(403).json({
+      message: "Only the requester, an approver on this request's route, a section admin, or a system admin can edit its details"
+    });
   }
   // due_date is a DATE column: mssql reads it back as UTC midnight, so both
   // sides are compared (and stored in the history) as a plain yyyy-mm-dd day.
@@ -602,6 +619,199 @@ router.patch("/:id/details", audit("EDIT", "REQUEST", req => req.params.id), asy
     );
   }
   emitSystem("request.updated", { id, part: "details" });
+  res.json({ ok: true, changed: changes.length });
+}));
+
+// Which statuses may still have their assignment re-decided: work that is
+// running (or paused, or waiting for the close approval). A draft/pending
+// request is still being routed — its assignment belongs to the approval inbox
+// — and a finished/cancelled one is history.
+const ASSIGNMENT_EDITABLE_STATUSES = ["IN_PROGRESS", "ON_HOLD", "WAITING_CLOSE"];
+
+// Re-decide who works on an already-approved request: incharge, supports,
+// required support types / skills, project period and the KPI flag. Same form
+// and the same rules as the "Approve to accept request" card in the approval
+// inbox (both go through services/assignmentService.js) — what differs is WHO
+// may use it: a candidate on this request's LAST approval step — the approver
+// who signs it off at the end of the route (primary approver or any co-approver
+// of that step) — plus a section admin of this section and a system admin. The
+// requester and the assigned incharge never qualify on their own. Every change
+// lands in request_detail_edits, so the request's "Edit history" popup shows
+// reassignments next to detail edits.
+router.patch("/:id/assignment", audit("EDIT", "REQUEST_ASSIGNMENT", req => req.params.id), asyncHandler(async (req, res) => {
+  const id = Number(req.params.id);
+  const input = z.object({
+    inchargeUserId: z.number().int(),
+    supportUserIds: z.array(z.number().int()).optional().nullable(),
+    plannedStart: z.string().trim().min(1).max(40),
+    plannedEnd: z.string().trim().min(1).max(40),
+    isKpi: z.boolean().optional().nullable(),
+    // A support type is either a plain string (matrix off) or an object carrying
+    // the picked skill item + required level (matrix on) — the same shape the
+    // approval card posts.
+    supTypes: z.array(z.union([
+      z.string().trim().min(1),
+      z.object({
+        supType: z.string().trim().min(1).optional(),
+        name: z.string().trim().min(1).optional(),
+        itemId: z.number().int().optional().nullable(),
+        levelId: z.number().int().optional().nullable(),
+        levelName: z.string().optional().nullable()
+      })
+    ])).optional().nullable()
+  }).parse(req.body);
+
+  // Scoped to the HANDLING section: the people who can be assigned come from
+  // there, so an origin-section approver looking in from the other side of a
+  // cross-section request cannot reassign from their own inbox.
+  const row = (await query(
+    `SELECT r.id, r.request_no, r.status, r.section_id, r.incharge_user_id, r.planned_start, r.planned_end, r.is_kpi,
+            inc.display_name AS incharge_name
+     FROM requests r
+     LEFT JOIN users inc ON inc.id = r.incharge_user_id
+     WHERE r.id=@id AND r.section_id=@sectionId`,
+    { id, sectionId: req.section.id }
+  )).recordset[0];
+  if (!row) return res.status(404).json({ message: "Request not found" });
+  if (!ASSIGNMENT_EDITABLE_STATUSES.includes(row.status)) {
+    return res.status(400).json({
+      message: "The assignment can only be changed while the request is in progress, on hold, or waiting to be closed"
+    });
+  }
+
+  // Admins may always step in: a system admin anywhere, a section admin inside
+  // the section they administer. Everyone else has to BE the route's last
+  // approver (below).
+  const isOverride = isAdmin(req.user) || req.sectionAccess?.isSectionAdmin === true;
+  if (!isOverride) {
+    // The route's LAST request-approval step (sequence_no >= 100 are the close
+    // approvals — a different chain, which never assigns work).
+    const userCond = await approvalStepUserCondition("a", "@userId");
+    const lastStep = (await query(
+      `SELECT TOP 1 a.id, CASE WHEN ${userCond} THEN 1 ELSE 0 END AS is_mine
+       FROM approval_steps a
+       WHERE a.request_id=@id AND a.sequence_no < 100
+       ORDER BY a.sequence_no DESC`,
+      { id, userId: req.user.id }
+    )).recordset[0];
+    if (!lastStep || !lastStep.is_mine) {
+      return res.status(403).json({
+        message: "Only the last approver on this request's route, a section admin, or a system admin can change the assignment"
+      });
+    }
+  }
+
+  // The incharge never doubles as their own support.
+  const supportUserIds = [...new Set(
+    (input.supportUserIds ?? []).filter(uid => Number.isInteger(uid) && uid !== input.inchargeUserId)
+  )];
+  const assignable = await assignableUserIds([input.inchargeUserId, ...supportUserIds], row.section_id);
+  if (!assignable.has(input.inchargeUserId)) {
+    return res.status(400).json({ message: "The incharge must be an active member of this section who can be given work" });
+  }
+  if (supportUserIds.some(uid => !assignable.has(uid))) {
+    return res.status(400).json({ message: "Every support must be an active member of this section who can be given work" });
+  }
+
+  const startDay = dateOnly(input.plannedStart);
+  const endDay = dateOnly(input.plannedEnd);
+  if (!startDay || !endDay || startDay > endDay) {
+    return res.status(400).json({ message: "Project start must be before project end" });
+  }
+  // Todos must sit inside the project period (see assertTodoWithinProject), so a
+  // shrunken period that would strand an existing todo is refused rather than
+  // silently breaking that rule.
+  const strandedTodo = (await query(
+    "SELECT title, planned_start, planned_end FROM request_todos WHERE request_id=@id ORDER BY sort_order, id",
+    { id }
+  )).recordset.find(todo => dateOnly(todo.planned_start) < startDay || dateOnly(todo.planned_end) > endDay);
+  if (strandedTodo) {
+    return res.status(400).json({
+      message: `The project period must still cover every to-do — "${strandedTodo.title}" falls outside it`
+    });
+  }
+
+  // Skill-matrix gate: when the picked support types carry a required level,
+  // every required skill must be covered by the incharge and supports pooled
+  // together — one may fill the gaps the other leaves. Same check as approval.
+  const normalizedSupTypes = normalizeSupTypes(input.supTypes);
+  const required = normalizedSupTypes.filter(st => st.itemId && st.levelId);
+  if (required.length) {
+    const skill = await evaluateSkillSufficiency(required, input.inchargeUserId, supportUserIds);
+    if (!skill.combinedOk) return res.status(400).json({ message: "INCHARGE_SKILL_INSUFFICIENT" });
+  }
+
+  // Snapshot what is about to be replaced, for the history rows below.
+  const oldSupports = await getSupports(id);
+  const oldSupTypes = (await query(
+    "SELECT sup_type, level_name FROM request_support_types WHERE request_id=@id ORDER BY sup_type",
+    { id }
+  )).recordset.map(st => ({ supType: st.sup_type, levelName: st.level_name }));
+  const oldIsKpi = row.is_kpi === true || row.is_kpi === 1;
+  const isKpi = input.isKpi ?? oldIsKpi;
+
+  await query(
+    `UPDATE requests
+     SET incharge_user_id=@inchargeUserId, planned_start=@plannedStart, planned_end=@plannedEnd,
+         is_kpi=@isKpi, updated_at=SYSUTCDATETIME()
+     WHERE id=@id`,
+    {
+      id,
+      inchargeUserId: input.inchargeUserId,
+      plannedStart: input.plannedStart,
+      plannedEnd: input.plannedEnd,
+      isKpi
+    }
+  );
+  // request_supports is the real support list; requests.support_user_id keeps
+  // mirroring the first one for the legacy queries/exports.
+  await setSupports(id, supportUserIds);
+  await saveSupportTypes(id, normalizedSupTypes);
+
+  // History: names, not ids — people read this popup.
+  const nameIds = [...new Set([input.inchargeUserId, ...supportUserIds])];
+  const names = new Map((await query(
+    `SELECT id, display_name FROM users WHERE id IN (${nameIds.map((_, i) => `@n${i}`).join(",")})`,
+    Object.fromEntries(nameIds.map((uid, i) => [`n${i}`, uid]))
+  )).recordset.map(u => [u.id, u.display_name]));
+  const nameOf = uid => names.get(uid) || `#${uid}`;
+  const supTypeLabel = list =>
+    list.map(st => (st.levelName ? `${st.supType} (${st.levelName})` : st.supType)).join(", ");
+
+  const changes = [
+    ["incharge", row.incharge_name, nameOf(input.inchargeUserId)],
+    ["support", oldSupports.map(s => s.name).join(", "), supportUserIds.map(nameOf).join(", ")],
+    ["sup_types", supTypeLabel(oldSupTypes), supTypeLabel(normalizedSupTypes)],
+    ["planned_start", dateOnly(row.planned_start), startDay],
+    ["planned_end", dateOnly(row.planned_end), endDay],
+    ["is_kpi", oldIsKpi ? "Yes" : "No", isKpi ? "Yes" : "No"]
+  ].filter(([, before, after]) => `${before ?? ""}` !== `${after ?? ""}`);
+  if (changes.length) {
+    // One statement, so every row of this edit shares an edited_at and the popup
+    // groups them back into a single entry (same as /details).
+    const params = { id, userId: req.user.id };
+    changes.forEach(([field, before, after], i) => {
+      params[`field${i}`] = field;
+      params[`oldValue${i}`] = before ?? null;
+      params[`newValue${i}`] = after;
+    });
+    await query(
+      `INSERT INTO request_detail_edits (request_id, edited_by, field, old_value, new_value, edited_at)
+       VALUES ${changes.map((_, i) => `(@id, @userId, @field${i}, @oldValue${i}, @newValue${i}, SYSUTCDATETIME())`).join(", ")}`,
+      params
+    );
+  }
+
+  // A new incharge is told they own this work (in-app + email); the outgoing one
+  // gets an in-app notice so the job doesn't just vanish off their board.
+  if (row.incharge_user_id !== input.inchargeUserId) {
+    await notifyAssignedUsers(id, row.request_no, input.inchargeUserId, null, req.user.displayName, {
+      reassigned: true,
+      previousInchargeName: row.incharge_name
+    });
+    await notifyUnassignedUser(id, row.request_no, row.incharge_user_id, req.section.name);
+  }
+  emitSystem("request.updated", { id, part: "assignment" });
   res.json({ ok: true, changed: changes.length });
 }));
 

@@ -8,15 +8,23 @@ const { notify } = require("../../services/notificationService");
 const { sendMail } = require("../../services/mailService");
 const {
   buildApproverEmail,
-  buildAssigneeEmail,
   buildParticipantEmail,
   buildExtensionApproverEmail,
   buildExtensionResultEmail
 } = require("../../services/emailTemplates");
 const { emitSystem } = require("../../services/realtimeService");
-const { isAdmin, resolveSection, getSectionName } = require("../../services/sectionService");
+const { isAdmin, resolveSection } = require("../../services/sectionService");
 const { blockViewerWrites } = require("../../middleware/viewerGuard");
 const { loadSupportsMap, applySupports, setSupports } = require("../../services/supportService");
+// Assignment (incharge / support / support types / period / KPI) is shared with
+// PATCH /requests/:id/assignment, which lets the route's last approver re-do it
+// after approval — both must apply the same rules.
+const {
+  normalizeSupTypes,
+  saveSupportTypes,
+  evaluateSkillSufficiency,
+  notifyAssignedUsers
+} = require("../../services/assignmentService");
 const {
   approvalStepUserCondition,
   extensionStepUserCondition,
@@ -28,6 +36,19 @@ const router = express.Router();
 router.use(requireAuth);
 router.use(resolveSection);
 router.use(blockViewerWrites("approvals"));
+
+// SEEING the section's inbox and being allowed to ACT on a step are two
+// different things.
+//
+// A section admin watches over their own section, so every pending step of that
+// section is listed for them — but read-only: unless they are a candidate on
+// the step itself they cannot approve, reject or assign, and the decision
+// endpoints below (which keep using isAdmin only) refuse them. A system admin
+// keeps acting on everything, as before. Every query here is already scoped to
+// the resolved section, so a section admin never reaches another section.
+function seesWholeInbox(req) {
+  return isAdmin(req.user) || req.sectionAccess?.isSectionAdmin === true;
+}
 
 router.get("/pending", asyncHandler(async (req, res) => {
   // A step is "yours" when you're its primary approver OR any co-approver.
@@ -41,7 +62,11 @@ router.get("/pending", asyncHandler(async (req, res) => {
             u.branch AS requester_branch, u.department AS requester_department, u.section AS requester_section,
             inc.branch AS incharge_branch, inc.department AS incharge_department, inc.section AS incharge_section,
             sup.branch AS support_branch, sup.department AS support_department, sup.section AS support_section,
-            CASE WHEN a.sequence_no >= 100 THEN 'CLOSE' ELSE 'REQUEST' END AS approval_kind
+            CASE WHEN a.sequence_no >= 100 THEN 'CLOSE' ELSE 'REQUEST' END AS approval_kind,
+            -- Can the caller actually decide THIS step, or are they only
+            -- watching it (a section admin who isn't on the route)? The card
+            -- renders read-only when this is 0.
+            CAST(CASE WHEN @canAct = 1 OR ${userCond} THEN 1 ELSE 0 END AS BIT) AS can_act
      FROM approval_steps a
      JOIN requests r ON r.id = a.request_id
      JOIN users u ON u.id = r.requester_user_id
@@ -50,11 +75,16 @@ router.get("/pending", asyncHandler(async (req, res) => {
      LEFT JOIN users inc ON inc.id = r.incharge_user_id
      LEFT JOIN users sup ON sup.id = r.support_user_id
      WHERE r.section_id=@sectionId
-       AND (@isAdmin = 1 OR ${userCond})
+       AND (@canSee = 1 OR ${userCond})
        AND a.status='PENDING'
        AND r.status NOT IN ('CANCELLED','REJECTED')
      ORDER BY r.created_at`,
-    { userId: req.user.id, sectionId: req.section.id, isAdmin: isAdmin(req.user) ? 1 : 0 }
+    {
+      userId: req.user.id,
+      sectionId: req.section.id,
+      canSee: seesWholeInbox(req) ? 1 : 0,
+      canAct: isAdmin(req.user) ? 1 : 0
+    }
   );
   const supportsMap = await loadSupportsMap(result.recordset.map(row => row.request_id));
   const rows = [];
@@ -80,6 +110,7 @@ router.get("/extensions/pending", asyncHandler(async (req, res) => {
   const userCond = await extensionStepUserCondition("a", "@userId");
   const result = await query(
     `SELECT a.id AS step_id, a.sequence_no, a.step_name,
+            CAST(CASE WHEN @canAct = 1 OR ${userCond} THEN 1 ELSE 0 END AS BIT) AS can_act,
             e.*, r.request_no, r.title, r.priority, requester.display_name AS requester_name, requested_by.display_name AS requested_by_name,
             requester.branch AS requester_branch, requester.department AS requester_department, requester.section AS requester_section,
             requested_by.branch AS requested_by_branch, requested_by.department AS requested_by_department, requested_by.section AS requested_by_section
@@ -91,9 +122,14 @@ router.get("/extensions/pending", asyncHandler(async (req, res) => {
      WHERE r.section_id=@sectionId
        AND e.status='PENDING_APPROVAL'
        AND a.status='PENDING'
-       AND (@isAdmin = 1 OR ${userCond})
+       AND (@canSee = 1 OR ${userCond})
      ORDER BY e.created_at`,
-    { userId: req.user.id, sectionId: req.section.id, isAdmin: isAdmin(req.user) ? 1 : 0 }
+    {
+      userId: req.user.id,
+      sectionId: req.section.id,
+      canSee: seesWholeInbox(req) ? 1 : 0,
+      canAct: isAdmin(req.user) ? 1 : 0
+    }
   );
   res.json({ data: result.recordset });
 }));
@@ -183,14 +219,7 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
     // Multi-support list (also mirrors the first into the legacy column).
     await setSupports(step.request_id, supportUserIds);
     // Replace the request's support-type tags with the approver's selection.
-    await query("DELETE FROM request_support_types WHERE request_id=@requestId", { requestId: step.request_id });
-    for (const st of normalizedSupTypes) {
-      await query(
-        `INSERT INTO request_support_types (request_id, sup_type, item_id, level_id, level_name)
-         VALUES (@requestId, @supType, @itemId, @levelId, @levelName)`,
-        { requestId: step.request_id, supType: st.supType, itemId: st.itemId, levelId: st.levelId, levelName: st.levelName }
-      );
-    }
+    await saveSupportTypes(step.request_id, normalizedSupTypes);
     // NOTE: the assignee is NOT notified here. Assignment can happen at an early
     // step (e.g. the section manager assigns at step 1) while later approvers
     // haven't signed off yet — telling the incharge now would be premature. The
@@ -409,110 +438,6 @@ async function getExtensionStep(extensionId, user, sectionId) {
       isAdmin: isAdmin(user) ? 1 : 0
     }
   )).recordset[0];
-}
-
-async function notifyAssignedUsers(requestId, requestNo, inchargeUserId, supportUserId, assignedByName) {
-  // Only the incharge is notified — support gets no assignment notification/email.
-  if (!inchargeUserId) return;
-  const sectionName = await getSectionName(requestId);
-  const user = (await query(
-    "SELECT id, email, display_name FROM users WHERE id=@id", { id: inchargeUserId }
-  )).recordset[0];
-  if (!user) return;
-  await notify({
-    userId: user.id,
-    requestId,
-    type: "ASSIGN",
-    title: `${sectionName} assigned`,
-    body: requestNo
-  });
-  const mail = await buildAssigneeEmail(requestId, {
-    greetingName: user.display_name,
-    roleLabel: "ผู้รับผิดชอบหลัก (Incharge)",
-    assignedByName
-  });
-  if (mail && user.email) {
-    await sendMail({ to: user.email, subject: mail.subject, html: mail.html, text: mail.text, requestId, type: mail.type });
-  }
-}
-
-// Collapse the approver's supTypes payload (strings and/or objects) into a
-// de-duplicated list of { supType, itemId, levelId, levelName }. sup_type (the
-// skill item name) is always kept so KPI aggregation by name keeps working.
-function normalizeSupTypes(raw) {
-  const seen = new Set();
-  const out = [];
-  for (const entry of raw ?? []) {
-    let name;
-    let itemId = null;
-    let levelId = null;
-    let levelName = null;
-    if (typeof entry === "string") {
-      name = entry.trim();
-    } else if (entry && typeof entry === "object") {
-      name = `${entry.supType ?? entry.name ?? ""}`.trim();
-      itemId = Number.isInteger(entry.itemId) ? entry.itemId : null;
-      levelId = Number.isInteger(entry.levelId) ? entry.levelId : null;
-      levelName = entry.levelName ? `${entry.levelName}`.slice(0, 200) : null;
-    }
-    if (!name || seen.has(name)) continue;
-    seen.add(name);
-    out.push({ supType: name, itemId, levelId, levelName });
-  }
-  return out;
-}
-
-// A person is "sufficient" when, for every required (itemId, levelId), they hold
-// that skill at a rank (level sort_order) >= the required rank. Missing skill or
-// a lower level = insufficient. Used to gate assignment on the server.
-// supportUserIds is the request's full (multi-)support list.
-async function evaluateSkillSufficiency(required, inchargeUserId, supportUserIds) {
-  const supports = (supportUserIds || []).filter(Boolean);
-  const levels = (await query("SELECT id, sort_order FROM skill_matrix_levels")).recordset;
-  const rank = new Map(levels.map(l => [l.id, l.sort_order]));
-  const userIds = [inchargeUserId, ...supports].filter(Boolean);
-  const skillRows = userIds.length
-    ? (await query(
-      `SELECT user_id, item_id, level_id FROM user_skill_levels
-         WHERE user_id IN (${userIds.map((_, i) => `@u${i}`).join(",")})`,
-      Object.fromEntries(userIds.map((id, i) => [`u${i}`, id]))
-    )).recordset
-    : [];
-  const byUser = new Map();
-  for (const row of skillRows) {
-    if (!byUser.has(row.user_id)) byUser.set(row.user_id, new Map());
-    byUser.get(row.user_id).set(row.item_id, row.level_id);
-  }
-  const rankOf = (userId, itemId) => {
-    if (!userId) return -1;
-    const skills = byUser.get(userId);
-    if (!skills) return -1;
-    const have = skills.get(itemId);
-    if (have == null) return -1;
-    const r = rank.get(have);
-    return r == null ? -1 : r;
-  };
-  const isSufficient = userId => {
-    if (!userId) return false;
-    for (const req of required) {
-      const needRank = rank.get(req.levelId);
-      if (needRank == null || rankOf(userId, req.itemId) < needRank) return false;
-    }
-    return true;
-  };
-  // Combined coverage: each required skill may be satisfied by the incharge OR
-  // any support — their skills are pooled, not judged one person at a time.
-  const combinedOk = required.every(req => {
-    const needRank = rank.get(req.levelId);
-    if (needRank == null) return false;
-    const best = Math.max(rankOf(inchargeUserId, req.itemId), ...supports.map(id => rankOf(id, req.itemId)), -1);
-    return best >= needRank;
-  });
-  return {
-    inchargeOk: isSufficient(inchargeUserId),
-    supportOk: supports.some(isSufficient),
-    combinedOk
-  };
 }
 
 async function getAttachments(requestId) {

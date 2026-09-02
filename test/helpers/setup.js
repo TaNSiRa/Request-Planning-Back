@@ -217,6 +217,52 @@ function fixtureContext(tag) {
   return { SECTION_CODE, REQUEST_PREFIX, EMAIL_DOMAIN, testEmail, createFixture, cleanupFixture, login };
 }
 
+// Three accounts the standard fixture doesn't ship, for the tests about admin
+// powers: a system admin, a section admin OF THIS fixture's section, and a
+// section-admin account that administers some OTHER section (a member here, but
+// without the flag). They reuse the fixture's password hash, so ctx.login works
+// for them like any other fixture user, and cleanupFixture sweeps them up with
+// the rest of the email domain.
+async function createAdminUsers(ctx, fixture, tag) {
+  const roles = Object.fromEntries((await query(
+    "SELECT id, code FROM roles WHERE code IN ('ADMIN','SECTION_ADMIN')"
+  )).recordset.map(r => [r.code, r.id]));
+  if (!roles.ADMIN || !roles.SECTION_ADMIN) {
+    throw new Error("roles table has no ADMIN / SECTION_ADMIN role — is this the RAP dev database?");
+  }
+  const seed = (await query(
+    "SELECT TOP 1 password_hash, pdpa_policy_version FROM users WHERE id=@id",
+    { id: fixture.users.requester }
+  )).recordset[0];
+
+  const ids = {};
+  for (const [name, roleId, isSectionAdmin] of [
+    ["sysadmin", roles.ADMIN, 0],
+    ["sectionadmin", roles.SECTION_ADMIN, 1],
+    ["othersectionadmin", roles.SECTION_ADMIN, 0]
+  ]) {
+    ids[name] = (await query(
+      `INSERT INTO users (email, display_name, password_hash, role_id, section, is_active, pdpa_consent_accepted, pdpa_policy_version)
+       OUTPUT INSERTED.id
+       VALUES (@email, @displayName, @hash, @roleId, @section, 1, 1, @policyVersion)`,
+      {
+        email: ctx.testEmail(name),
+        displayName: `${tag} ${name}`,
+        hash: seed.password_hash,
+        roleId,
+        section: ctx.SECTION_CODE,
+        policyVersion: seed.pdpa_policy_version
+      }
+    )).recordset[0].id;
+    await query(
+      `INSERT INTO user_section_memberships (user_id, section_id, can_request, can_work, is_section_admin, is_active)
+       VALUES (@userId, @sectionId, 1, 1, @isSectionAdmin, 1)`,
+      { userId: ids[name], sectionId: fixture.sectionId, isSectionAdmin }
+    );
+  }
+  return ids;
+}
+
 async function closePool() {
   try {
     (await getPool()).close();
@@ -228,6 +274,7 @@ async function closePool() {
 module.exports = {
   createApp,
   closePool,
+  createAdminUsers,
   fixtureContext,
   query,
   PASSWORD,
