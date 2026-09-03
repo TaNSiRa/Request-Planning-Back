@@ -85,22 +85,44 @@ router.get("/summary", asyncHandler(async (req, res) => {
      GROUP BY MONTH(planned_end) ORDER BY month`,
     { mine, kpiOnly, chartYear, userId: req.user.id, requesterOrgSection, sectionId: req.section.id }
   );
+  // Done ON TIME: committed to this month and finished inside it. Every
+  // completed request is bucketed by its period-end month, never by the month
+  // it happened to be closed in — a job due in August that was closed on 2
+  // September belongs to August's plan, and crediting September for it made
+  // every month look missed while the next one collected work it never planned
+  // (and requests finished early were counted twice, once in each month).
   const monthlyActual = await query(
-    `SELECT MONTH(work_completed_at) AS month, COUNT(*) AS total
+    `SELECT MONTH(planned_end) AS month, COUNT(*) AS total
      FROM requests
-     WHERE (@kpiOnly = 0 OR is_kpi = 1) AND status = 'COMPLETED' AND work_completed_at IS NOT NULL
-       AND YEAR(work_completed_at) = @chartYear
+     WHERE (@kpiOnly = 0 OR is_kpi = 1) AND status = 'COMPLETED'
+       AND planned_end IS NOT NULL AND work_completed_at IS NOT NULL
+       AND YEAR(work_completed_at) = YEAR(planned_end) AND MONTH(work_completed_at) = MONTH(planned_end)
+       AND YEAR(planned_end) = @chartYear
        AND section_id=@sectionId
        AND ((@mine=1 AND incharge_user_id=@userId) OR (@mine=0 AND (@requesterOrgSection IS NULL OR requester_user_id IN (SELECT id FROM users WHERE section=@requesterOrgSection))))
-     GROUP BY MONTH(work_completed_at) ORDER BY month`,
+     GROUP BY MONTH(planned_end) ORDER BY month`,
     { mine, kpiOnly, chartYear, userId: req.user.id, requesterOrgSection, sectionId: req.section.id }
   );
-  // Completed earlier than the target month — shown faded at the target month.
+  // Completed BEFORE the target month — a pale green cap on the target month.
   const monthlyEarly = await query(
     `SELECT MONTH(planned_end) AS month, COUNT(*) AS total
      FROM requests
      WHERE (@kpiOnly = 0 OR is_kpi = 1) AND status = 'COMPLETED' AND planned_end IS NOT NULL AND work_completed_at IS NOT NULL
        AND work_completed_at < DATEFROMPARTS(YEAR(planned_end), MONTH(planned_end), 1)
+       AND YEAR(planned_end) = @chartYear
+       AND section_id=@sectionId
+       AND ((@mine=1 AND incharge_user_id=@userId) OR (@mine=0 AND (@requesterOrgSection IS NULL OR requester_user_id IN (SELECT id FROM users WHERE section=@requesterOrgSection))))
+     GROUP BY MONTH(planned_end) ORDER BY month`,
+    { mine, kpiOnly, chartYear, userId: req.user.id, requesterOrgSection, sectionId: req.section.id }
+  );
+  // Completed AFTER the target month — a pale red cap on the target month, so
+  // late work is credited to the plan it belonged to and reads as a miss there
+  // rather than as throughput in the month it finally landed.
+  const monthlyLate = await query(
+    `SELECT MONTH(planned_end) AS month, COUNT(*) AS total
+     FROM requests
+     WHERE (@kpiOnly = 0 OR is_kpi = 1) AND status = 'COMPLETED' AND planned_end IS NOT NULL AND work_completed_at IS NOT NULL
+       AND work_completed_at >= DATEADD(MONTH, 1, DATEFROMPARTS(YEAR(planned_end), MONTH(planned_end), 1))
        AND YEAR(planned_end) = @chartYear
        AND section_id=@sectionId
        AND ((@mine=1 AND incharge_user_id=@userId) OR (@mine=0 AND (@requesterOrgSection IS NULL OR requester_user_id IN (SELECT id FROM users WHERE section=@requesterOrgSection))))
@@ -141,6 +163,7 @@ router.get("/summary", asyncHandler(async (req, res) => {
     monthlyTarget: monthlyTarget.recordset,
     monthlyActual: monthlyActual.recordset,
     monthlyEarly: monthlyEarly.recordset,
+    monthlyLate: monthlyLate.recordset,
     chartYear,
     chartYears: years.recordset.map(r => r.yr),
     overdue: overdue.recordset[0].total
@@ -148,13 +171,13 @@ router.get("/summary", asyncHandler(async (req, res) => {
 }));
 
 // Which requests make up one bar of the target-vs-actual chart. Clicking a bar
-// opens a dialog listing them, so "target 25 / actual 5" can be read as names
-// rather than a gap. Same scope / kpiFilter rules as /summary, and the three
-// flags mirror the three chart series exactly:
-//   inTarget  — alive (not on hold / rejected / cancelled) with a period end in
-//               this month = the blue bar
-//   inActual  — completed during this month = the solid green bar
-//   doneEarly — targeted at this month but finished before it = the faded cap
+// opens a dialog listing them, so "target 25 / done 2" can be read as names
+// rather than a gap. Same scope / kpiFilter rules as /summary.
+//
+// One population: everything committed to this month (the blue bar). The green
+// bar is the completed subset of it, and the two flags say which slice of that
+// subset a row belongs to — done_early (finished before the month) and
+// done_late (finished after it); completed with neither flag is on time.
 router.get("/monthly-detail", asyncHandler(async (req, res) => {
   const { scope = "all" } = req.query;
   const mine = scope === "mine" ? 1 : 0;
@@ -167,26 +190,24 @@ router.get("/monthly-detail", asyncHandler(async (req, res) => {
   }
   const targetWhere = `r.status NOT IN ('ON_HOLD','REJECTED','CANCELLED') AND r.planned_end IS NOT NULL
        AND YEAR(r.planned_end)=@chartYear AND MONTH(r.planned_end)=@month`;
-  const actualWhere = `r.status='COMPLETED' AND r.work_completed_at IS NOT NULL
-       AND YEAR(r.work_completed_at)=@chartYear AND MONTH(r.work_completed_at)=@month`;
-  const earlyWhere = `r.status='COMPLETED' AND r.planned_end IS NOT NULL AND r.work_completed_at IS NOT NULL
-       AND r.work_completed_at < DATEFROMPARTS(YEAR(r.planned_end), MONTH(r.planned_end), 1)
-       AND YEAR(r.planned_end)=@chartYear AND MONTH(r.planned_end)=@month`;
+  const earlyWhere = `r.status='COMPLETED' AND r.work_completed_at IS NOT NULL
+       AND r.work_completed_at < DATEFROMPARTS(YEAR(r.planned_end), MONTH(r.planned_end), 1)`;
+  const lateWhere = `r.status='COMPLETED' AND r.work_completed_at IS NOT NULL
+       AND r.work_completed_at >= DATEADD(MONTH, 1, DATEFROMPARTS(YEAR(r.planned_end), MONTH(r.planned_end), 1))`;
   const rows = (await query(
     `SELECT r.id, r.request_no, r.title, r.request_type, r.priority, r.status, r.is_kpi,
             r.planned_start, r.planned_end, r.work_completed_at, r.due_date,
             inch.display_name AS incharge_name,
             reqr.display_name AS requester_name,
-            CASE WHEN ${targetWhere} THEN 1 ELSE 0 END AS in_target,
-            CASE WHEN ${actualWhere} THEN 1 ELSE 0 END AS in_actual,
-            CASE WHEN ${earlyWhere} THEN 1 ELSE 0 END AS done_early
+            CASE WHEN ${earlyWhere} THEN 1 ELSE 0 END AS done_early,
+            CASE WHEN ${lateWhere} THEN 1 ELSE 0 END AS done_late
      FROM requests r
      LEFT JOIN users inch ON inch.id = r.incharge_user_id
      LEFT JOIN users reqr ON reqr.id = r.requester_user_id
      WHERE (@kpiOnly = 0 OR r.is_kpi = 1)
        AND r.section_id=@sectionId
        AND ((@mine=1 AND r.incharge_user_id=@userId) OR (@mine=0 AND (@requesterOrgSection IS NULL OR r.requester_user_id IN (SELECT id FROM users WHERE section=@requesterOrgSection))))
-       AND ((${targetWhere}) OR (${actualWhere}))
+       AND (${targetWhere})
      ORDER BY r.planned_end, r.request_no`,
     { mine, kpiOnly, chartYear, month, userId: req.user.id, requesterOrgSection, sectionId: req.section.id }
   )).recordset;
