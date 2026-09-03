@@ -147,6 +147,52 @@ router.get("/summary", asyncHandler(async (req, res) => {
   });
 }));
 
+// Which requests make up one bar of the target-vs-actual chart. Clicking a bar
+// opens a dialog listing them, so "target 25 / actual 5" can be read as names
+// rather than a gap. Same scope / kpiFilter rules as /summary, and the three
+// flags mirror the three chart series exactly:
+//   inTarget  — alive (not on hold / rejected / cancelled) with a period end in
+//               this month = the blue bar
+//   inActual  — completed during this month = the solid green bar
+//   doneEarly — targeted at this month but finished before it = the faded cap
+router.get("/monthly-detail", asyncHandler(async (req, res) => {
+  const { scope = "all" } = req.query;
+  const mine = scope === "mine" ? 1 : 0;
+  const { requesterOrgSection } = analyticsScope(req);
+  const kpiOnly = req.query.kpiFilter === "kpi" ? 1 : 0;
+  const chartYear = Number(req.query.chartYear) || new Date().getUTCFullYear();
+  const month = Number(req.query.month);
+  if (!(month >= 1 && month <= 12)) {
+    return res.status(400).json({ error: "month must be 1-12" });
+  }
+  const targetWhere = `r.status NOT IN ('ON_HOLD','REJECTED','CANCELLED') AND r.planned_end IS NOT NULL
+       AND YEAR(r.planned_end)=@chartYear AND MONTH(r.planned_end)=@month`;
+  const actualWhere = `r.status='COMPLETED' AND r.work_completed_at IS NOT NULL
+       AND YEAR(r.work_completed_at)=@chartYear AND MONTH(r.work_completed_at)=@month`;
+  const earlyWhere = `r.status='COMPLETED' AND r.planned_end IS NOT NULL AND r.work_completed_at IS NOT NULL
+       AND r.work_completed_at < DATEFROMPARTS(YEAR(r.planned_end), MONTH(r.planned_end), 1)
+       AND YEAR(r.planned_end)=@chartYear AND MONTH(r.planned_end)=@month`;
+  const rows = (await query(
+    `SELECT r.id, r.request_no, r.title, r.request_type, r.priority, r.status, r.is_kpi,
+            r.planned_start, r.planned_end, r.work_completed_at, r.due_date,
+            inch.display_name AS incharge_name,
+            reqr.display_name AS requester_name,
+            CASE WHEN ${targetWhere} THEN 1 ELSE 0 END AS in_target,
+            CASE WHEN ${actualWhere} THEN 1 ELSE 0 END AS in_actual,
+            CASE WHEN ${earlyWhere} THEN 1 ELSE 0 END AS done_early
+     FROM requests r
+     LEFT JOIN users inch ON inch.id = r.incharge_user_id
+     LEFT JOIN users reqr ON reqr.id = r.requester_user_id
+     WHERE (@kpiOnly = 0 OR r.is_kpi = 1)
+       AND r.section_id=@sectionId
+       AND ((@mine=1 AND r.incharge_user_id=@userId) OR (@mine=0 AND (@requesterOrgSection IS NULL OR r.requester_user_id IN (SELECT id FROM users WHERE section=@requesterOrgSection))))
+       AND ((${targetWhere}) OR (${actualWhere}))
+     ORDER BY r.planned_end, r.request_no`,
+    { mine, kpiOnly, chartYear, month, userId: req.user.id, requesterOrgSection, sectionId: req.section.id }
+  )).recordset;
+  res.json({ chartYear, month, data: rows });
+}));
+
 // Workload breakdown by support type (PLC, HMI, ...). Used by the Sup-type
 // Summary page to gauge load and inform hiring decisions.
 router.get("/sup-type-summary", asyncHandler(async (req, res) => {
