@@ -80,6 +80,23 @@ function presenceSnapshot() {
   return { users, pages, meeting: pages.meeting || {}, requests, todos, plan };
 }
 
+// Move a socket into the cursor room for the page and section it just
+// reported. One room per page per section keeps a moving mouse off the wire for
+// everyone who is not looking at the same thing; a socket with no page (the
+// Approval Inbox opts out of presence entirely) joins nothing.
+function joinCursorRoom(socket) {
+  const page = socket.data.page;
+  const section = `${socket.data.section || ""}`.trim().toUpperCase();
+  const next = page && section ? `cursor:${section}:${page}` : null;
+  if (next === socket.data.cursorRoom) return;
+  if (socket.data.cursorRoom) {
+    socket.broadcast.to(socket.data.cursorRoom).emit("cursor.gone", { id: socket.data.userId });
+    socket.leave(socket.data.cursorRoom);
+  }
+  socket.data.cursorRoom = next;
+  if (next) socket.join(next);
+}
+
 // Debounced fan-out so a burst of connects/disconnects costs one broadcast.
 let presenceTimer = null;
 function broadcastPresence() {
@@ -140,7 +157,49 @@ function registerRealtime(io) {
       socket.data.page =
         data && typeof data.page === "string" && data.page ? data.page.slice(0, 40) : null;
       socket.data.section = data && typeof data.section === "string" ? data.section : null;
+      // Live pointers are relayed per page per section, and the page is
+      // reported right here — so the cursor room is kept in step with it and
+      // the client never has to join or leave anything itself.
+      joinCursorRoom(socket);
       broadcastPresence();
+    });
+
+    // ── Live pointers ────────────────────────────────────────────────────────
+    //
+    // Deliberately NOT part of presenceSnapshot. Presence is a whole-section
+    // picture, rebuilt from every connected socket and broadcast on a 200 ms
+    // debounce; a moving mouse produces twenty events a second, and pushing
+    // those through the snapshot would rebuild and re-broadcast the entire
+    // section's presence twenty times a second per moving person.
+    //
+    // So this is a pure RELAY: one small message in, the same message out to
+    // the people looking at the same page of the same section, and nothing kept
+    // on the server. A cursor that stops arriving simply fades on the client,
+    // which is also what makes a dropped connection self-healing here.
+    socket.on("cursor.move", data => {
+      const room = socket.data.cursorRoom;
+      if (!room || !socket.data.userId) return;
+      // Fractions of the tracked surface, not pixels: the same grid is a
+      // different number of pixels wide on every screen it is open on.
+      const x = Number(data?.x);
+      const y = Number(data?.y);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+      if (x < -0.1 || x > 1.1 || y < -0.1 || y > 1.1) return;
+      const u = online.get(socket.data.userId);
+      socket.broadcast.to(room).emit("cursor.updated", {
+        id: socket.data.userId,
+        name: u?.name || `User #${socket.data.userId}`,
+        x,
+        y
+      });
+    });
+
+    // The pointer left the tracked surface (or the page). Sent so the other
+    // clients can drop it at once instead of waiting out the fade.
+    socket.on("cursor.gone", () => {
+      const room = socket.data.cursorRoom;
+      if (!room || !socket.data.userId) return;
+      socket.broadcast.to(room).emit("cursor.gone", { id: socket.data.userId });
     });
 
     // The client reports what it is focused on right now (open request-detail
@@ -159,6 +218,11 @@ function registerRealtime(io) {
     });
 
     socket.on("disconnect", () => {
+      // Tell the room the pointer is gone before the socket leaves it — after
+      // the disconnect completes there is no room left to broadcast into.
+      if (socket.data.cursorRoom && userId) {
+        socket.broadcast.to(socket.data.cursorRoom).emit("cursor.gone", { id: userId });
+      }
       if (!userId) return;
       const u = online.get(userId);
       if (u && --u.count <= 0) online.delete(userId);
