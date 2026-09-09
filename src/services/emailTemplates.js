@@ -1159,7 +1159,10 @@ function buildPersonalTodoReminderEmail({ greetingName, items }) {
       + `<strong>แจ้งเตือน</strong> บนการ์ดนั้น`
     ],
     extraHtml: cards,
-    primary: base ? { label: "เปิดกระดานงานส่วนตัว →", url: `${base}/` } : null,
+    // ?todo=1 opens the board itself, not just the app. The board is one per
+    // person and belongs to no section, so unlike every other deep link here
+    // there is no id and no section to carry — the flag is the whole link.
+    primary: base ? { label: "เปิดกระดานงานส่วนตัว →", url: `${base}/?todo=1` } : null,
     footerNote: "คุณได้รับอีเมลนี้เพราะคุณตั้งการแจ้งเตือนไว้บนการ์ดงานส่วนตัวของคุณเอง"
   };
   const plainLines = items.map(item => {
