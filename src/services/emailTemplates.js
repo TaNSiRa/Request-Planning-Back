@@ -1111,6 +1111,71 @@ async function buildImportantTodoDoneEmail(requestId, { greetingName, roleLabel,
   };
 }
 
+// ---------------------------------------------------------------------------
+// Personal to-do reminder — an alarm the person set on a card of their own
+// private Kanban board (see personalTodoReminderService.js). Nothing here is
+// tied to a request: the recipient is the only person who can see these cards,
+// so the email carries the card's own text and the column it sits in.
+// ---------------------------------------------------------------------------
+
+// The card's first line is its heading on the board, so it is the heading here
+// too; everything under it is the note.
+function splitTodoCard(content) {
+  const text = `${content ?? ""}`.trim();
+  const brk = text.indexOf("\n");
+  if (brk < 0) return { head: text, body: "" };
+  return { head: text.slice(0, brk).trim(), body: text.slice(brk + 1).trim() };
+}
+
+function buildPersonalTodoReminderEmail({ greetingName, items }) {
+  if (!items || !items.length) return null;
+
+  const cards = items.map(item => {
+    const { head, body } = splitTodoCard(item.content);
+    const time = `${item.remind_time ?? ""}`.trim();
+    let rows = "";
+    rows += kvRow("เวลาแจ้งเตือน",
+      `<strong style="color:${INK};">${esc(time)} น.</strong>`
+      + ` <span style="color:${FAINT};font-size:12px;">· ${esc(formatThaiDate(new Date()))}</span>`);
+    rows += kvRow("คอลัมน์", esc(item.column_title || "-"));
+    if (body) rows += kvRow("รายละเอียด", esc(body).replace(/\n/g, "<br>"));
+    return detailCard("งานของฉัน (MY TO-DO)", head || "(ไม่มีข้อความ)", rows);
+  }).join("");
+
+  const base = (env.frontendOrigin || "").replace(/\/+$/, "");
+  const headline = items.length === 1
+    ? "ถึงเวลาที่คุณตั้งเตือนไว้"
+    : `ถึงเวลาที่คุณตั้งเตือนไว้ ${items.length} รายการ`;
+  const opts = {
+    sectionName: "My to-do",
+    requestNo: items.length === 1 ? "การแจ้งเตือน" : `${items.length} รายการ`,
+    accent: ACCENTS.blue,
+    pillText: "แจ้งเตือนส่วนตัว · My to-do",
+    headline,
+    greetingName,
+    paragraphs: [
+      `นี่คือการแจ้งเตือนที่คุณตั้งไว้เองบน<strong>กระดานงานส่วนตัว (My to-do)</strong> `
+      + `ตามรายการด้านล่าง เปิดกระดานเพื่อดำเนินการต่อ หรือแก้ไข/ปิดการแจ้งเตือนได้จากเมนู `
+      + `<strong>แจ้งเตือน</strong> บนการ์ดนั้น`
+    ],
+    extraHtml: cards,
+    primary: base ? { label: "เปิดกระดานงานส่วนตัว →", url: `${base}/` } : null,
+    footerNote: "คุณได้รับอีเมลนี้เพราะคุณตั้งการแจ้งเตือนไว้บนการ์ดงานส่วนตัวของคุณเอง"
+  };
+  const plainLines = items.map(item => {
+    const { head } = splitTodoCard(item.content);
+    return `- ${item.remind_time} น. · ${head} (${item.column_title || "-"})`;
+  });
+  return {
+    subject: items.length === 1
+      ? `🔔 เตือนความจำ · ${splitTodoCard(items[0].content).head || "งานของฉัน"}`
+      : `🔔 เตือนความจำ · งานของฉัน ${items.length} รายการ`,
+    html: renderEmail(opts),
+    text: renderText({ ...opts, plainParagraphs: [headline, ...plainLines] }),
+    type: "PERSONAL_TODO_REMINDER"
+  };
+}
+
 module.exports = {
   buildDeeplink,
   loadRequestContext,
@@ -1124,5 +1189,6 @@ module.exports = {
   buildExtensionResultEmail,
   buildEndDateDigestEmail,
   buildTodoDueDigestEmail,
-  buildImportantTodoDoneEmail
+  buildImportantTodoDoneEmail,
+  buildPersonalTodoReminderEmail
 };
