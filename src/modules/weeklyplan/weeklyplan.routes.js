@@ -75,12 +75,12 @@ router.get("/", asyncHandler(async (req, res) => {
     }
   }
 
-  // Defaults seed the *current* week only; past/future weeks stay blank until
-  // saved. Seeding MERGES at the cell level rather than all-or-nothing: any cell
-  // the user already filled is kept, and only the still-blank cells receive the
-  // per-user default. This way pre-entering part of a week ahead of time no
+  // Defaults seed the current week and every past week; only *future* weeks stay
+  // blank until saved. Seeding MERGES at the cell level rather than all-or-nothing:
+  // any cell the user already filled is kept, and only the still-blank cells receive
+  // the per-user default. This way pre-entering part of a week ahead of time no
   // longer forfeits the defaults — the blanks are filled once the week is current.
-  if (weekStart === currentMonday()) {
+  if (weekStart <= currentMonday()) {
     // Default car rows are free-form template rows, so they are only seeded when
     // the week has no saved car rows yet (merging them would risk duplicates).
     if (cars.length === 0) {
