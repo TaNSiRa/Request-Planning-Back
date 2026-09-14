@@ -267,6 +267,87 @@ router.put("/meeting-group-order", audit("EDIT", "SETTING", () => "meeting.group
   res.json({ ok: true });
 }));
 
+// The meeting room's 3D seating plan, shared by the whole section. The Meeting
+// page can draw "Follow up projects" as the real room instead of a stack of
+// cards: each desk is one person, clicking them opens their projects.
+//
+// Read by any section member (everyone in the meeting sees the same room);
+// written by a section admin only, because it decides whose name sits on which
+// desk. Stored as one JSON row per section, app_settings key 'meeting.room':
+//   { enabled, pairs, heads, seats, genders, builds, hairs }
+// `seats` puts a name on a desk; `genders`/`builds`/`hairs` say which of the
+// rendered figures is drawn there (man or woman, slim/normal/heavy, one of
+// three haircuts).
+// Seat ids are positional and stable — L0..Ln / R0..Rn down the two facing
+// sides, H0/H1 at the head of the table — so changing the desk count never
+// re-shuffles the names already placed.
+router.get("/meeting-room", asyncHandler(async (req, res) => {
+  const row = (await query(
+    `SELECT setting_value FROM app_settings
+     WHERE section_id=@sectionId AND setting_key='meeting.room'`,
+    { sectionId: req.section.id }
+  )).recordset[0];
+  let config = null;
+  if (row) {
+    try {
+      const parsed = JSON.parse(row.setting_value);
+      if (parsed && typeof parsed === "object") config = parsed;
+    } catch {
+      // Malformed row — hand back null so the client falls back to its default
+      // layout rather than showing an error on a meeting screen.
+    }
+  }
+  res.json({ config });
+}));
+
+router.put("/meeting-room", requireSectionAdmin, audit("EDIT", "SETTING", () => "meeting.room"), asyncHandler(async (req, res) => {
+  const schema = z.object({
+    enabled: z.boolean(),
+    pairs: z.number().int().min(1).max(8),
+    heads: z.number().int().min(0).max(2),
+    // seatId -> display name; null/"" clears the desk.
+    seats: z.record(z.string().max(20), z.string().max(200).nullable()).default({}),
+    // seatId -> how that person is drawn. The three together name one of the
+    // eighteen rendered looks; anything unknown falls back to the default.
+    genders: z.record(z.string().max(20), z.string().max(10).nullable()).default({}),
+    builds: z.record(z.string().max(20), z.string().max(10).nullable()).default({}),
+    hairs: z.record(z.string().max(20), z.string().max(10).nullable()).default({})
+  });
+  const input = schema.parse(req.body);
+  const seats = {};
+  for (const [seatId, name] of Object.entries(input.seats)) {
+    if (name) seats[seatId] = `${name}`;
+  }
+  const genders = {};
+  for (const [seatId, gender] of Object.entries(input.genders)) {
+    genders[seatId] = gender === "w" ? "w" : "m";
+  }
+  const pick = (source, allowed, fallback) => {
+    const out = {};
+    for (const [seatId, value] of Object.entries(source)) {
+      out[seatId] = allowed.includes(value) ? value : fallback;
+    }
+    return out;
+  };
+  const builds = pick(input.builds, ["slim", "normal", "heavy"], "normal");
+  const hairs = pick(input.hairs, ["short", "crop", "swept"], "short");
+  const value = JSON.stringify({
+    enabled: input.enabled, pairs: input.pairs, heads: input.heads,
+    seats, genders, builds, hairs
+  });
+  await query(
+    `MERGE app_settings AS target
+     USING (SELECT @key AS setting_key, @sectionId AS section_id) AS source
+     ON target.setting_key = source.setting_key AND COALESCE(target.section_id, 0) = COALESCE(source.section_id, 0)
+     WHEN MATCHED THEN UPDATE SET setting_value=@value, updated_at=SYSUTCDATETIME()
+     WHEN NOT MATCHED THEN INSERT (section_id, setting_key, setting_value, value_type, is_public, description)
+       VALUES (@sectionId, @key, @value, 'json', 1, 'Meeting-mode 3D room seating plan');`,
+    { sectionId: req.section.id, key: "meeting.room", value }
+  );
+  emitSystem("settings.updated", { sectionId: req.section.id, key: "meeting.room" });
+  res.json({ ok: true });
+}));
+
 // Fixed display order of the section's users (JSON array of user ids, first =
 // top), edited with the arrows on the Meeting weekly plan. Like the meeting
 // group order, any section member may read AND update it — the meeting screen

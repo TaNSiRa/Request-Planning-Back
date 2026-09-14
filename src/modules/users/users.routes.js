@@ -562,6 +562,37 @@ router.put("/me/avatar", audit("EDIT_AVATAR", "USER", req => req.user.id), async
   res.json({ ok: true });
 }));
 
+// Where that picture sits on the employee badge: the offsets and scale the
+// Profile page's card was dragged to. "dx,dy,zoom", or null to put it back to
+// the centred default.
+//
+// Its own endpoint rather than a field on PATCH /users/me because it is not a
+// form the user submits — it is saved the moment a drag ends, and it must not
+// drag the identity fields (and their duplicate checks) along with it.
+router.put("/me/badge-photo", audit("EDIT_BADGE_PHOTO", "USER", req => req.user.id), asyncHandler(async (req, res) => {
+  const schema = z.object({
+    // Two offsets and a scale, nothing else — this string is written straight
+    // into a column and read back into a layout.
+    placement: z.string()
+      .regex(/^-?\d{1,4}(\.\d{1,2})?,-?\d{1,4}(\.\d{1,2})?,\d{1,2}(\.\d{1,3})?$/, "Placement must be \"dx,dy,zoom\"")
+      .nullable()
+  });
+  const input = schema.parse(req.body);
+  try {
+    await query("UPDATE users SET badge_photo_pos=@placement, updated_at=SYSUTCDATETIME() WHERE id=@id", {
+      id: req.user.id,
+      placement: input.placement
+    });
+  } catch (err) {
+    if (`${err.message}`.includes("Invalid column name")) {
+      return res.status(400).json({ message: "Badge photo placement is not installed yet — run database/patch_badge_photo_placement.sql" });
+    }
+    throw err;
+  }
+  emitSystem("users.updated", { id: req.user.id });
+  res.json({ ok: true });
+}));
+
 // Display-name → picture map for every active user that has one. Feeds the
 // frontend AvatarStore so DsAvatar swaps initials for photos everywhere
 // (same name-keyed pattern as presence). Returns empty until the avatar

@@ -472,6 +472,10 @@ function sanitizeUser(user) {
     // render "Name (ABBR)" without the positions master list.
     positionAbbr: user.position_abbr ?? null,
     avatar: user.avatar ?? null,
+    // Where that avatar was dragged to on the employee badge ("dx,dy,zoom").
+    // Undefined until patch_badge_photo_placement.sql is applied, which reads
+    // as null — i.e. the centred default.
+    badgePhotoPos: user.badge_photo_pos ?? null,
     branch: user.branch,
     department: user.department,
     section: user.section,
