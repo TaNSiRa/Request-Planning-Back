@@ -11,7 +11,8 @@ const { requireSectionAdmin, resolveSection, isAdmin, isViewer, canManageTargetR
 const { blockViewerWrites } = require("../../middleware/viewerGuard");
 const { rejectWeakPassword } = require("../../services/passwordPolicy");
 const { bumpTokenVersion, forgetAccount, setMustChangePassword } = require("../../services/accountState");
-const { currentLocks, recordSuccess: clearLoginLockout } = require("../../services/loginLockout");
+const { currentLocks } = require("../../services/loginLockout");
+const { releaseAccount } = require("../../services/loginIpBlocks");
 const { VIEWER_PAGE_KEYS, getViewerOverrides, setViewerOverrides, sectionCanEdit } = require("../../services/viewerService");
 const { routeStepUserCondition } = require("../../services/approverService");
 const { getUserDisplayOrder, sortUsersByDisplayOrder } = require("../../services/settingsService");
@@ -366,7 +367,9 @@ router.post("/:id(\\d+)/reset-password", requireSectionAdmin, audit("RESET_PASSW
   // …and it is also how someone locked out by failed sign-ins gets back in, so
   // hand them an account that is actually open. Without this the new password
   // would be refused until the lock timed out on its own.
-  await clearLoginLockout(Number(req.params.id));
+  // The IPs whose failures caused that lock are released with it (see
+  // services/loginIpBlocks.js), or the new password still meets a 429.
+  await releaseAccount(Number(req.params.id));
   res.json({ ok: true });
 }));
 
@@ -381,7 +384,9 @@ router.post("/:id(\\d+)/unlock", requireSectionAdmin, audit("UNLOCK_ACCOUNT", "U
   if (!await actorOwnsUserHomeSection(req, targetId)) {
     return res.status(403).json({ message: "This account belongs to another section" });
   }
-  await clearLoginLockout(targetId);
+  // Account lock AND the IPs that failed against it — one without the other
+  // still leaves the person refused.
+  await releaseAccount(targetId);
   emitSystem("users.updated", { id: targetId });
   res.json({ ok: true });
 }));

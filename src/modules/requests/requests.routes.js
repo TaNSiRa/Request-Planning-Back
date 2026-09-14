@@ -548,7 +548,11 @@ router.patch("/:id/details", audit("EDIT", "REQUEST", req => req.params.id), asy
     systemArea: z.string().trim().min(1).max(100),
     dueDate: z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/, "dueDate must be yyyy-mm-dd").optional(),
     description: z.string().trim().min(1).max(TEXT_MAX),
-    businessImpact: z.string().trim().min(1).max(TEXT_MAX)
+    businessImpact: z.string().trim().min(1).max(TEXT_MAX),
+    // The request's files as they should be after the save: existing ones by id
+    // (left out = removed) plus new ones as data URLs. Left out entirely = the
+    // files are not touched, so an older client cannot wipe them.
+    attachments: attachmentSchema({ defaultEmpty: false })
   }).parse(req.body);
   const row = (await query(
     "SELECT * FROM requests WHERE id=@id AND (section_id=@sectionId OR requester_section_id=@sectionId)",
@@ -583,6 +587,15 @@ router.patch("/:id/details", audit("EDIT", "REQUEST", req => req.params.id), asy
     description: input.description,
     businessImpact: input.businessImpact
   };
+  // Check the file cap before anything is written, so an over-limit save changes nothing.
+  const replaceFiles = Array.isArray(input.attachments);
+  let maxAttachments = 0;
+  let filesBefore = [];
+  if (replaceFiles) {
+    maxAttachments = await getMaxAttachments(row.section_id, "request");
+    assertAttachmentLimit(input.attachments, maxAttachments);
+    filesBefore = await getAttachments(id);
+  }
   // The approval route was picked from the type at submit time; changing the
   // type afterwards corrects the record, it does not re-route the request.
   await query(
@@ -602,6 +615,17 @@ router.patch("/:id/details", audit("EDIT", "REQUEST", req => req.params.id), asy
     ["description", row.description, values.description],
     ["business_impact", row.business_impact, values.businessImpact]
   ].filter(([, before, after]) => `${before ?? ""}` !== after);
+  if (replaceFiles) {
+    await replaceRequestAttachments(id, input.attachments, maxAttachments);
+    // Files are recorded by name, one per line; the change is judged by the set
+    // of ids so re-adding a file with the same name still shows up.
+    const filesAfter = await getAttachments(id);
+    const ids = list => list.map(f => Number(f.id)).join(",");
+    if (ids(filesBefore) !== ids(filesAfter)) {
+      const names = list => list.length ? list.map(f => f.fileName).join("\n") : null;
+      changes.push(["attachments", names(filesBefore), names(filesAfter) ?? "-"]);
+    }
+  }
   if (changes.length) {
     // One statement on purpose: SYSUTCDATETIME() inside the Thai-time DATEADD is
     // evaluated once per statement, so every row of this edit shares an edited_at and the popup can
@@ -1332,6 +1356,41 @@ async function saveTodoAttachments(requestId, todoId, attachments = [], maxAttac
       }
     );
   }
+}
+
+// Same as replaceTodoAttachments, for the request's own files ("Edit detail"):
+// existing rows whose id is not in the list are deleted (file + row), new data
+// URLs are stored.
+async function replaceRequestAttachments(requestId, attachments = [], maxAttachments = 5) {
+  const existing = (await query(
+    `SELECT id, storage_path
+     FROM request_attachments
+     WHERE request_id=@requestId`,
+    { requestId }
+  )).recordset;
+  const existingIds = new Set(existing.map(row => Number(row.id)));
+  const keepIds = new Set(
+    attachments
+      .map(attachment => Number(attachment.id))
+      .filter(id => Number.isInteger(id) && existingIds.has(id))
+  );
+  const removed = existing.filter(row => !keepIds.has(Number(row.id)));
+  for (const attachment of removed) {
+    await deleteStoredAttachment(attachment.storage_path);
+  }
+  if (removed.length) {
+    const params = { requestId };
+    const ids = removed.map((row, index) => {
+      params[`id${index}`] = row.id;
+      return `@id${index}`;
+    });
+    await query(
+      `DELETE FROM request_attachments
+       WHERE request_id=@requestId AND id IN (${ids.join(",")})`,
+      params
+    );
+  }
+  await saveAttachments(requestId, attachments, maxAttachments);
 }
 
 async function getTodoAttachmentBucket(requestId, todoId) {

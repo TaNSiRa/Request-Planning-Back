@@ -71,8 +71,7 @@ describe("attachment whitelist", () => {
     assert.doesNotThrow(() => assertAllowedAttachment("spec.pdf", "application/pdf"));
     assert.doesNotThrow(() => assertAllowedAttachment("photo.JPG", "image/jpeg"));
     assert.doesNotThrow(() => assertAllowedAttachment(
-      "plan.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"));
-  });
+      "plan.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"));  });
 
   it("tolerates a browser that reports no useful content type", () => {
     assert.doesNotThrow(() => assertAllowedAttachment("report.docx", ""));
