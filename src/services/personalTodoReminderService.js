@@ -217,8 +217,8 @@ async function stampOccurrence(id, key, sent) {
   await query(
     `UPDATE personal_todo_reminders
      SET last_sent_key = @key,
-         last_sent_at = ${sent ? "SYSUTCDATETIME()" : "last_sent_at"},
-         updated_at = SYSUTCDATETIME()
+         last_sent_at = ${sent ? "DATEADD(HOUR, 7, SYSUTCDATETIME())" : "last_sent_at"},
+         updated_at = DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHERE id = @id`,
     { id, key }
   );

@@ -224,10 +224,10 @@ router.put("/", resolveSection, blockViewerWrites("orgChart"), requireSectionAdm
     `MERGE org_charts AS target
      USING (SELECT @sectionId AS section_id) AS source
      ON target.section_id = source.section_id
-     WHEN MATCHED THEN UPDATE SET chart=@chart, updated_by=@userId, updated_at=SYSUTCDATETIME()
+     WHEN MATCHED THEN UPDATE SET chart=@chart, updated_by=@userId, updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHEN NOT MATCHED THEN
        INSERT (section_id, chart, updated_by, updated_at)
-       VALUES (@sectionId, @chart, @userId, SYSUTCDATETIME());`,
+       VALUES (@sectionId, @chart, @userId, DATEADD(HOUR, 7, SYSUTCDATETIME()));`,
     { sectionId: req.section.id, chart: chartJson, userId: req.user.id }
   );
   emitSystem("orgchart.updated", { sectionId: req.section.id });

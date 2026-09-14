@@ -254,7 +254,7 @@ router.put("/meeting-group-order", audit("EDIT", "SETTING", () => "meeting.group
     `MERGE app_settings AS target
      USING (SELECT @key AS setting_key, @sectionId AS section_id) AS source
      ON target.setting_key = source.setting_key AND COALESCE(target.section_id, 0) = COALESCE(source.section_id, 0)
-     WHEN MATCHED THEN UPDATE SET setting_value=@value, updated_at=SYSUTCDATETIME()
+     WHEN MATCHED THEN UPDATE SET setting_value=@value, updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHEN NOT MATCHED THEN INSERT (section_id, setting_key, setting_value, value_type, is_public)
        VALUES (@sectionId, @key, @value, 'json', 1);`,
     {
@@ -339,7 +339,7 @@ router.put("/meeting-room", requireSectionAdmin, audit("EDIT", "SETTING", () => 
     `MERGE app_settings AS target
      USING (SELECT @key AS setting_key, @sectionId AS section_id) AS source
      ON target.setting_key = source.setting_key AND COALESCE(target.section_id, 0) = COALESCE(source.section_id, 0)
-     WHEN MATCHED THEN UPDATE SET setting_value=@value, updated_at=SYSUTCDATETIME()
+     WHEN MATCHED THEN UPDATE SET setting_value=@value, updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHEN NOT MATCHED THEN INSERT (section_id, setting_key, setting_value, value_type, is_public, description)
        VALUES (@sectionId, @key, @value, 'json', 1, 'Meeting-mode 3D room seating plan');`,
     { sectionId: req.section.id, key: "meeting.room", value }
@@ -364,7 +364,7 @@ router.put("/user-order", audit("EDIT", "SETTING", () => "users.displayOrder"), 
     `MERGE app_settings AS target
      USING (SELECT @key AS setting_key, @sectionId AS section_id) AS source
      ON target.setting_key = source.setting_key AND COALESCE(target.section_id, 0) = COALESCE(source.section_id, 0)
-     WHEN MATCHED THEN UPDATE SET setting_value=@value, updated_at=SYSUTCDATETIME()
+     WHEN MATCHED THEN UPDATE SET setting_value=@value, updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHEN NOT MATCHED THEN INSERT (section_id, setting_key, setting_value, value_type, is_public, description)
        VALUES (@sectionId, @key, @value, 'json', 1, 'Fixed user display order (user ids, first = top)');`,
     {
@@ -388,7 +388,7 @@ router.put("/:key", requireSectionAdmin, audit("EDIT", "SETTING", req => req.par
     `MERGE app_settings AS target
      USING (SELECT @key AS setting_key, @sectionId AS section_id) AS source
      ON target.setting_key = source.setting_key AND COALESCE(target.section_id, 0) = COALESCE(source.section_id, 0)
-     WHEN MATCHED THEN UPDATE SET setting_value=@value, value_type=@valueType, is_public=@isPublic, updated_at=SYSUTCDATETIME()
+     WHEN MATCHED THEN UPDATE SET setting_value=@value, value_type=@valueType, is_public=@isPublic, updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHEN NOT MATCHED THEN INSERT (section_id, setting_key, setting_value, value_type, is_public)
        VALUES (@sectionId, @key, @value, @valueType, @isPublic);`,
     { sectionId, key: req.params.key, value: input.value, valueType: input.valueType, isPublic: input.isPublic }

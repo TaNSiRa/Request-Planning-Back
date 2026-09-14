@@ -96,7 +96,7 @@ async function setSkillLevel(userId, body, res, sectionId) {
     if (!level.recordset.length) return res.status(404).json({ message: "Level not found" });
     await query(
       `INSERT INTO user_skill_levels (user_id, item_id, level_id, updated_at)
-       VALUES (@userId, @itemId, @levelId, SYSUTCDATETIME())`,
+       VALUES (@userId, @itemId, @levelId, DATEADD(HOUR, 7, SYSUTCDATETIME()))`,
       { userId, itemId, levelId }
     );
   }

@@ -99,7 +99,7 @@ async function setViewerOverrides(userId, input, { allowPages = true, allowedSec
       if (view && !edit) continue;
       await query(
         `INSERT INTO viewer_page_permissions (user_id, page_key, can_view, can_edit, updated_at)
-         VALUES (@userId, @pageKey, @view, @edit, SYSUTCDATETIME())`,
+         VALUES (@userId, @pageKey, @view, @edit, DATEADD(HOUR, 7, SYSUTCDATETIME()))`,
         { userId, pageKey: p.pageKey, view, edit }
       );
     }
@@ -121,7 +121,7 @@ async function setViewerOverrides(userId, input, { allowPages = true, allowedSec
     if (view && !edit) continue;
     await query(
       `INSERT INTO viewer_section_permissions (user_id, section_id, can_view, can_edit, updated_at)
-       VALUES (@userId, @sectionId, @view, @edit, SYSUTCDATETIME())`,
+       VALUES (@userId, @sectionId, @view, @edit, DATEADD(HOUR, 7, SYSUTCDATETIME()))`,
       { userId, sectionId, view, edit }
     );
   }

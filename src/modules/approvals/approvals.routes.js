@@ -205,7 +205,7 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
   // Stamp the user who actually decided — with co-approvers any candidate may
   // act, so the step's approver becomes whoever approved it.
   await query(
-    `UPDATE approval_steps SET status='APPROVED', approver_user_id=@actorId, decision_comment=@comment, decided_at=SYSUTCDATETIME(), updated_at=SYSUTCDATETIME()
+    `UPDATE approval_steps SET status='APPROVED', approver_user_id=@actorId, decision_comment=@comment, decided_at=DATEADD(HOUR, 7, SYSUTCDATETIME()), updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHERE id=@stepId`,
     { stepId: Number(req.params.stepId), comment: values.comment, actorId: req.user.id }
   );
@@ -213,7 +213,7 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
   if (canAssign) {
     await query(
       `UPDATE requests SET incharge_user_id=@inchargeUserId, planned_start=@plannedStart, planned_end=@plannedEnd, is_kpi=@isKpi,
-       status='PENDING_APPROVAL', updated_at=SYSUTCDATETIME() WHERE id=@requestId`,
+       status='PENDING_APPROVAL', updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id=@requestId`,
       { ...values, requestId: step.request_id }
     );
     // Multi-support list (also mirrors the first into the legacy column).
@@ -235,7 +235,7 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
   )).recordset[0];
 
   if (next) {
-    await query("UPDATE approval_steps SET status='PENDING', updated_at=SYSUTCDATETIME() WHERE id=@id", { id: next.id });
+    await query("UPDATE approval_steps SET status='PENDING', updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id=@id", { id: next.id });
     const title = isCloseApproval ? "Close request needs approval" : "Request needs approval";
     // Every candidate on the next step gets pinged; any one of them may act.
     for (const approver of await stepCandidates(next.id)) {
@@ -250,14 +250,14 @@ router.post("/:stepId/approve", audit("APPROVE", "APPROVAL_STEP", req => req.par
     emitSystem("request.updated", { id: step.request_id, status: "PENDING_APPROVAL" });
   } else {
     if (isCloseApproval) {
-      await query("UPDATE requests SET status='COMPLETED', closed_by=@userId, closed_at=SYSUTCDATETIME(), updated_at=SYSUTCDATETIME() WHERE id=@id", {
+      await query("UPDATE requests SET status='COMPLETED', closed_by=@userId, closed_at=DATEADD(HOUR, 7, SYSUTCDATETIME()), updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id=@id", {
         id: step.request_id,
         userId: req.user.id
       });
       await notifyRequestParticipants(step.request_id, "COMPLETE", "Request completed", `${step.request_no} has been closed as complete`);
       emitSystem("request.updated", { id: step.request_id, status: "COMPLETED" });
     } else {
-      await query("UPDATE requests SET status='IN_PROGRESS', approved_at=SYSUTCDATETIME(), updated_at=SYSUTCDATETIME() WHERE id=@id", { id: step.request_id });
+      await query("UPDATE requests SET status='IN_PROGRESS', approved_at=DATEADD(HOUR, 7, SYSUTCDATETIME()), updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id=@id", { id: step.request_id });
       const info = (await query(
         "SELECT request_no, requester_user_id, incharge_user_id, support_user_id FROM requests WHERE id=@id",
         { id: step.request_id }
@@ -282,22 +282,22 @@ router.post("/:stepId/reject", audit("REJECT", "APPROVAL_STEP", req => req.param
   if (!step) return res.status(404).json({ message: "Approval step not found" });
 
   await query(
-    `UPDATE approval_steps SET status='REJECTED', approver_user_id=@actorId, decision_comment=@comment, decided_at=SYSUTCDATETIME(), updated_at=SYSUTCDATETIME()
+    `UPDATE approval_steps SET status='REJECTED', approver_user_id=@actorId, decision_comment=@comment, decided_at=DATEADD(HOUR, 7, SYSUTCDATETIME()), updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHERE id=@stepId`,
     { stepId: Number(req.params.stepId), comment: input.comment, actorId: req.user.id }
   );
   if (step.sequence_no >= 100) {
-    await query("UPDATE requests SET status='IN_PROGRESS', reject_reason=@comment, updated_at=SYSUTCDATETIME() WHERE id=@id", {
+    await query("UPDATE requests SET status='IN_PROGRESS', reject_reason=@comment, updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id=@id", {
       id: step.request_id,
       comment: input.comment
     });
-    await query("UPDATE approval_steps SET status='SKIPPED', updated_at=SYSUTCDATETIME() WHERE request_id=@id AND sequence_no >= 100 AND status='WAITING'", {
+    await query("UPDATE approval_steps SET status='SKIPPED', updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE request_id=@id AND sequence_no >= 100 AND status='WAITING'", {
       id: step.request_id
     });
     await notifyRequestParticipants(step.request_id, "CLOSE_REJECT", "Close approval rejected", `${step.request_no}: ${input.comment}`, input.comment);
     emitSystem("request.updated", { id: step.request_id, status: "IN_PROGRESS" });
   } else {
-    await query("UPDATE requests SET status='REJECTED', reject_reason=@comment, updated_at=SYSUTCDATETIME() WHERE id=@id", {
+    await query("UPDATE requests SET status='REJECTED', reject_reason=@comment, updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id=@id", {
       id: step.request_id,
       comment: input.comment
     });
@@ -317,7 +317,7 @@ router.post("/extension/:extensionId/approve", audit("APPROVE", "EXTENSION_REQUE
   if (!step) return res.status(404).json({ message: "Extension approval step not found" });
   await query(
     `UPDATE schedule_extension_approval_steps
-     SET status='APPROVED', approver_user_id=@actorId, decided_at=SYSUTCDATETIME(), updated_at=SYSUTCDATETIME()
+     SET status='APPROVED', approver_user_id=@actorId, decided_at=DATEADD(HOUR, 7, SYSUTCDATETIME()), updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHERE id=@stepId`,
     { stepId: step.id, actorId: req.user.id }
   );
@@ -329,7 +329,7 @@ router.post("/extension/:extensionId/approve", audit("APPROVE", "EXTENSION_REQUE
     { extensionId: step.extension_id }
   )).recordset[0];
   if (next) {
-    await query("UPDATE schedule_extension_approval_steps SET status='PENDING', updated_at=SYSUTCDATETIME() WHERE id=@id", { id: next.id });
+    await query("UPDATE schedule_extension_approval_steps SET status='PENDING', updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id=@id", { id: next.id });
     for (const approver of await extensionStepCandidates(next.id)) {
       await notify({
         userId: approver.id,
@@ -348,7 +348,7 @@ router.post("/extension/:extensionId/approve", audit("APPROVE", "EXTENSION_REQUE
     // The end date moves; nothing to reset for the reminder job — its log is
     // keyed by due date, so the new deadline is a fresh schedule by itself.
     await query(
-      `UPDATE requests SET planned_start=@start, planned_end=@end, updated_at=SYSUTCDATETIME()
+      `UPDATE requests SET planned_start=@start, planned_end=@end, updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
        WHERE id=@requestId`,
       {
         requestId: step.request_id,
@@ -372,19 +372,19 @@ router.post("/extension/:extensionId/reject", audit("REJECT", "EXTENSION_REQUEST
   if (!step) return res.status(404).json({ message: "Extension approval step not found" });
   await query(
     `UPDATE schedule_extension_approval_steps
-     SET status='REJECTED', approver_user_id=@actorId, decided_at=SYSUTCDATETIME(), updated_at=SYSUTCDATETIME()
+     SET status='REJECTED', approver_user_id=@actorId, decided_at=DATEADD(HOUR, 7, SYSUTCDATETIME()), updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHERE id=@stepId`,
     { stepId: step.id, actorId: req.user.id }
   );
   await query(
     `UPDATE schedule_extension_requests
-     SET status='REJECTED', rejected_by=@userId, rejected_at=SYSUTCDATETIME()
+     SET status='REJECTED', rejected_by=@userId, rejected_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHERE id=@extensionId AND status='PENDING_APPROVAL'`,
     { extensionId: step.extension_id, userId: req.user.id }
   );
   await query(
     `UPDATE schedule_extension_approval_steps
-     SET status='SKIPPED', updated_at=SYSUTCDATETIME()
+     SET status='SKIPPED', updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHERE extension_id=@extensionId AND status='WAITING'`,
     { extensionId: step.extension_id }
   );

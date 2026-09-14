@@ -470,7 +470,7 @@ router.patch("/:id/cancel", audit("CANCEL", "REQUEST"), asyncHandler(async (req,
   if (row.requester_user_id !== req.user.id && !isAdmin(req.user)) {
     return res.status(403).json({ message: "Only requester can cancel this request" });
   }
-  await query("UPDATE requests SET status='CANCELLED', cancel_reason=@reason, cancelled_at=SYSUTCDATETIME(), updated_at=SYSUTCDATETIME() WHERE id=@id", {
+  await query("UPDATE requests SET status='CANCELLED', cancel_reason=@reason, cancelled_at=DATEADD(HOUR, 7, SYSUTCDATETIME()), updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id=@id", {
     id,
     reason: req.body.reason || null
   });
@@ -478,11 +478,11 @@ router.patch("/:id/cancel", audit("CANCEL", "REQUEST"), asyncHandler(async (req,
   // approvers' inboxes: pending/waiting approval steps and any open schedule
   // extension request + its approval steps.
   await query(
-    "UPDATE approval_steps SET status='SKIPPED', updated_at=SYSUTCDATETIME() WHERE request_id=@id AND status IN ('PENDING','WAITING')",
+    "UPDATE approval_steps SET status='SKIPPED', updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE request_id=@id AND status IN ('PENDING','WAITING')",
     { id }
   );
   await query(
-    `UPDATE schedule_extension_approval_steps SET status='SKIPPED', updated_at=SYSUTCDATETIME()
+    `UPDATE schedule_extension_approval_steps SET status='SKIPPED', updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHERE status IN ('PENDING','WAITING')
        AND extension_id IN (SELECT id FROM schedule_extension_requests WHERE request_id=@id)`,
     { id }
@@ -525,7 +525,7 @@ router.patch("/:id/kpi", audit("EDIT", "REQUEST", req => req.params.id), asyncHa
   if (!allowed) {
     return res.status(403).json({ message: "Only a system admin or an approver can change KPI" });
   }
-  await query("UPDATE requests SET is_kpi=@isKpi, updated_at=SYSUTCDATETIME() WHERE id=@id", { id, isKpi });
+  await query("UPDATE requests SET is_kpi=@isKpi, updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id=@id", { id, isKpi });
   emitSystem("request.updated", { id, isKpi });
   res.json({ ok: true });
 }));
@@ -588,7 +588,7 @@ router.patch("/:id/details", audit("EDIT", "REQUEST", req => req.params.id), asy
   await query(
     `UPDATE requests
      SET title=@title, request_type=@requestType, system_area=@systemArea, due_date=@dueDate,
-         description=@description, business_impact=@businessImpact, updated_at=SYSUTCDATETIME()
+         description=@description, business_impact=@businessImpact, updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHERE id=@id`,
     { id, ...values }
   );
@@ -603,8 +603,8 @@ router.patch("/:id/details", audit("EDIT", "REQUEST", req => req.params.id), asy
     ["business_impact", row.business_impact, values.businessImpact]
   ].filter(([, before, after]) => `${before ?? ""}` !== after);
   if (changes.length) {
-    // One statement on purpose: SYSUTCDATETIME() is evaluated once per
-    // statement, so every row of this edit shares an edited_at and the popup can
+    // One statement on purpose: SYSUTCDATETIME() inside the Thai-time DATEADD is
+    // evaluated once per statement, so every row of this edit shares an edited_at and the popup can
     // group them back into a single entry.
     const params = { id, userId: req.user.id };
     changes.forEach(([field, before, after], i) => {
@@ -614,7 +614,7 @@ router.patch("/:id/details", audit("EDIT", "REQUEST", req => req.params.id), asy
     });
     await query(
       `INSERT INTO request_detail_edits (request_id, edited_by, field, old_value, new_value, edited_at)
-       VALUES ${changes.map((_, i) => `(@id, @userId, @field${i}, @oldValue${i}, @newValue${i}, SYSUTCDATETIME())`).join(", ")}`,
+       VALUES ${changes.map((_, i) => `(@id, @userId, @field${i}, @oldValue${i}, @newValue${i}, DATEADD(HOUR, 7, SYSUTCDATETIME()))`).join(", ")}`,
       params
     );
   }
@@ -753,7 +753,7 @@ router.patch("/:id/assignment", audit("EDIT", "REQUEST_ASSIGNMENT", req => req.p
   await query(
     `UPDATE requests
      SET incharge_user_id=@inchargeUserId, planned_start=@plannedStart, planned_end=@plannedEnd,
-         is_kpi=@isKpi, updated_at=SYSUTCDATETIME()
+         is_kpi=@isKpi, updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHERE id=@id`,
     {
       id,
@@ -797,7 +797,7 @@ router.patch("/:id/assignment", audit("EDIT", "REQUEST_ASSIGNMENT", req => req.p
     });
     await query(
       `INSERT INTO request_detail_edits (request_id, edited_by, field, old_value, new_value, edited_at)
-       VALUES ${changes.map((_, i) => `(@id, @userId, @field${i}, @oldValue${i}, @newValue${i}, SYSUTCDATETIME())`).join(", ")}`,
+       VALUES ${changes.map((_, i) => `(@id, @userId, @field${i}, @oldValue${i}, @newValue${i}, DATEADD(HOUR, 7, SYSUTCDATETIME()))`).join(", ")}`,
       params
     );
   }
@@ -916,10 +916,10 @@ router.patch("/:id/todos/:todoId", audit("EDIT", "TODO", req => req.params.todoI
   await query(
     `UPDATE request_todos SET title=@title, description=@description, planned_start=@plannedStart, planned_end=@plannedEnd,
       is_done=@isDone, is_important=COALESCE(@isImportant, is_important),
-      completed_at=CASE WHEN @isDone=1 THEN SYSUTCDATETIME() ELSE NULL END,
+      completed_at=CASE WHEN @isDone=1 THEN DATEADD(HOUR, 7, SYSUTCDATETIME()) ELSE NULL END,
       -- Moving planned_end needs no reminder bookkeeping: due_reminder_log is
       -- keyed by due date, so a new deadline re-arms the whole schedule.
-      updated_at=SYSUTCDATETIME()
+      updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHERE id=@todoId AND request_id=@id`,
     { ...values, todoId: Number(req.params.todoId), id: Number(req.params.id) }
   );
@@ -969,7 +969,7 @@ router.post("/:id/complete-work", audit("COMPLETE_WORK", "REQUEST"), asyncHandle
   }
   const pending = (await query("SELECT COUNT(*) AS count FROM request_todos WHERE request_id=@id AND is_done=0", { id })).recordset[0].count;
   if (pending > 0) return res.status(400).json({ message: "All todo items must be completed first" });
-  await query("UPDATE requests SET status='WAITING_CLOSE', work_completed_at=SYSUTCDATETIME(), updated_at=SYSUTCDATETIME() WHERE id=@id", { id });
+  await query("UPDATE requests SET status='WAITING_CLOSE', work_completed_at=DATEADD(HOUR, 7, SYSUTCDATETIME()), updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id=@id", { id });
   await createCloseApprovalSteps(id, req.section.id);
   await notifyFirstCloseApprover(id);
   await notifyRequestParticipants(id, "WAITING_CLOSE", "Work submitted for close", "Waiting for approver to close this request");
@@ -995,7 +995,7 @@ router.post("/:id/hold", audit("HOLD", "REQUEST"), asyncHandler(async (req, res)
     return res.status(400).json({ message: "Only in-progress requests can be put on hold" });
   }
   const next = request.status === "ON_HOLD" ? "IN_PROGRESS" : "ON_HOLD";
-  await query("UPDATE requests SET status=@next, updated_at=SYSUTCDATETIME() WHERE id=@id", { id, next });
+  await query("UPDATE requests SET status=@next, updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id=@id", { id, next });
   await notifyRequestParticipants(
     id,
     next,

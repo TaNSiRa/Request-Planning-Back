@@ -18,6 +18,7 @@ const {
   MAX_FAILURES, LOCK_MINUTES, lockedUntil, recordFailure, recordSuccess
 } = require("../../services/loginLockout");
 const { planFromUserRow } = require("../../services/reminderPlan");
+const { thaiWallNow } = require("../../services/thaiTime");
 const { env } = require("../../config/env");
 
 const router = express.Router();
@@ -96,7 +97,7 @@ router.post("/login", loginLimiter, asyncHandler(async (req, res) => {
   //     exist or which ones they have managed to lock.
   const locked = user ? lockedUntil(user) : null;
   if (locked && passwordOk) {
-    const minutes = Math.max(1, Math.ceil((locked.getTime() - Date.now()) / 60000));
+    const minutes = Math.max(1, Math.ceil((locked.getTime() - thaiWallNow().getTime()) / 60000));
     await writeAudit({
       actorId: user.id,
       action: "LOGIN_BLOCKED",
@@ -307,11 +308,11 @@ router.post("/pdpa-consent", requireAuth, asyncHandler(async (req, res) => {
   await query(
     `UPDATE users
      SET pdpa_consent_accepted = 1,
-         pdpa_consent_at = SYSUTCDATETIME(),
+         pdpa_consent_at = DATEADD(HOUR, 7, SYSUTCDATETIME()),
          pdpa_consent_ip = @ip,
          pdpa_consent_user_agent = @userAgent,
          pdpa_policy_version = @policyVersion,
-         updated_at = SYSUTCDATETIME()
+         updated_at = DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHERE id = @id`,
     {
       id: req.user.id,
@@ -377,7 +378,7 @@ router.post("/first-password", requireAuth, asyncHandler(async (req, res) => {
     return res.status(400).json({ message: "Choose a password different from the one you were given" });
   }
   const passwordHash = await bcrypt.hash(input.newPassword, env.bcryptRounds);
-  await query("UPDATE users SET password_hash=@passwordHash, updated_at=SYSUTCDATETIME() WHERE id=@id",
+  await query("UPDATE users SET password_hash=@passwordHash, updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id=@id",
     { id: req.user.id, passwordHash });
   await setMustChangePassword(req.user.id, false);
   await writeAudit({
@@ -435,7 +436,7 @@ async function findActiveUserByIdentifier(identifier) {
   const value = `${identifier || ""}`.trim();
   const result = await query(
     `${USER_SELECT}
-     WHERE (LOWER(u.email) = LOWER(@identifier) OR u.employee_no = @identifier)
+     WHERE (LOWER(u.email) = LOWER(@identifier) OR LTRIM(RTRIM(u.employee_no)) = @identifier)
        AND u.is_active = 1
      ORDER BY CASE WHEN LOWER(u.email) = LOWER(@identifier) THEN 0 ELSE 1 END, u.id`,
     { identifier: value }
@@ -444,7 +445,7 @@ async function findActiveUserByIdentifier(identifier) {
 }
 
 async function completeLogin(req, user) {
-  await query("UPDATE users SET last_login_at = SYSUTCDATETIME() WHERE id = @id", { id: user.id });
+  await query("UPDATE users SET last_login_at = DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id = @id", { id: user.id });
   // New session id for the new sign-in: whatever the browser arrived with is
   // discarded rather than adopted (session fixation), which is also what makes
   // the CSRF exemption on the login endpoints safe.

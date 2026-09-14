@@ -325,9 +325,9 @@ router.put("/", asyncHandler(async (req, res) => {
       const list = survivingUids.map(u => `'${u}'`).join(",");
       await run(
         list
-          ? `UPDATE personal_todo_reminders SET orphaned_at = SYSUTCDATETIME()
+          ? `UPDATE personal_todo_reminders SET orphaned_at = DATEADD(HOUR, 7, SYSUTCDATETIME())
              WHERE user_id = @userId AND orphaned_at IS NULL AND item_uid NOT IN (${list})`
-          : `UPDATE personal_todo_reminders SET orphaned_at = SYSUTCDATETIME()
+          : `UPDATE personal_todo_reminders SET orphaned_at = DATEADD(HOUR, 7, SYSUTCDATETIME())
              WHERE user_id = @userId AND orphaned_at IS NULL`,
         { userId: req.user.id }
       );
@@ -341,7 +341,7 @@ router.put("/", asyncHandler(async (req, res) => {
       await run(
         `DELETE FROM personal_todo_reminders
          WHERE user_id = @userId AND orphaned_at IS NOT NULL
-           AND orphaned_at < DATEADD(day, -${ORPHAN_KEEP_DAYS}, SYSUTCDATETIME())`,
+           AND orphaned_at < DATEADD(day, -${ORPHAN_KEEP_DAYS}, DATEADD(HOUR, 7, SYSUTCDATETIME()))`,
         { userId: req.user.id }
       );
     }
@@ -487,7 +487,7 @@ router.put("/items/:uid/reminders", asyncHandler(async (req, res) => {
              repeat_unit = @repeatUnit, weekdays = @weekdays, until_date = @untilDate,
              -- Editing a card's reminders is proof the card is back.
              orphaned_at = NULL,
-             ${same ? "" : "last_sent_key = NULL,"} updated_at = SYSUTCDATETIME()
+             ${same ? "" : "last_sent_key = NULL,"} updated_at = DATEADD(HOUR, 7, SYSUTCDATETIME())
          WHERE id = @id AND user_id = @userId`,
         { ...params, id: current.id }
       );

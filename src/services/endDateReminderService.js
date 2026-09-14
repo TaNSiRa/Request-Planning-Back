@@ -74,7 +74,7 @@ async function setLastRunDate(ymd) {
     `MERGE app_settings AS target
      USING (SELECT @key AS setting_key) AS source
      ON target.setting_key = source.setting_key AND target.section_id IS NULL
-     WHEN MATCHED THEN UPDATE SET setting_value=@value, updated_at=SYSUTCDATETIME()
+     WHEN MATCHED THEN UPDATE SET setting_value=@value, updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHEN NOT MATCHED THEN
        INSERT (section_id, setting_key, setting_value, value_type, is_public, description)
        VALUES (NULL, @key, @value, 'string', 0, 'Last date the end-date reminder job ran (YYYY-MM-DD)');`,

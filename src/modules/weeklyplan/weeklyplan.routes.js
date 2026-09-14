@@ -482,7 +482,7 @@ router.put("/leave-types", requireSectionAdmin,
     `MERGE app_settings AS target
      USING (SELECT @key AS setting_key, @sectionId AS section_id) AS source
      ON target.setting_key = source.setting_key AND COALESCE(target.section_id, 0) = COALESCE(source.section_id, 0)
-     WHEN MATCHED THEN UPDATE SET setting_value=@value, updated_at=SYSUTCDATETIME()
+     WHEN MATCHED THEN UPDATE SET setting_value=@value, updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHEN NOT MATCHED THEN INSERT (section_id, setting_key, setting_value, value_type, is_public, description)
        VALUES (@sectionId, @key, @value, 'json', 1, 'Weekly plan leave types (day-cell picker)');`,
     { sectionId: req.section.id, key: LEAVE_TYPES_KEY, value: JSON.stringify(list) }

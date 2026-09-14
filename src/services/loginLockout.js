@@ -1,4 +1,5 @@
 const { query } = require("../db/pool");
+const { thaiWallNow } = require("./thaiTime");
 
 // Per-ACCOUNT brute-force lockout (Control 3, R3.3), sitting behind the
 // per-IP rate limiter rather than replacing it. The two catch different things:
@@ -25,8 +26,8 @@ function lockedUntil(userRow) {
   if (!value) return null;
   const until = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(until.getTime())) return null;
-  // The column is written with SYSUTCDATETIME(), so compare in UTC.
-  return until.getTime() > Date.now() ? until : null;
+  // The column holds Thai wall-clock time, so compare against the Thai clock.
+  return until.getTime() > thaiWallNow().getTime() ? until : null;
 }
 
 // One more wrong password. Returns { locked, until } describing the state the
@@ -39,7 +40,7 @@ async function recordFailure(userId) {
        SET failed_login_count = ISNULL(failed_login_count, 0) + 1,
            login_locked_until = CASE
              WHEN ISNULL(failed_login_count, 0) + 1 >= @maxFailures
-               THEN DATEADD(MINUTE, @lockMinutes, SYSUTCDATETIME())
+               THEN DATEADD(MINUTE, @lockMinutes, DATEADD(HOUR, 7, SYSUTCDATETIME()))
              ELSE login_locked_until
            END
        OUTPUT INSERTED.failed_login_count AS failures, INSERTED.login_locked_until AS until
@@ -73,9 +74,27 @@ async function recordSuccess(userId) {
   }
 }
 
+// Every account whose lock has not lifted yet, as id -> Date. Feeds Manage
+// Users, where an admin needs to SEE a lock to release it: the person behind it
+// is told their password is wrong-or-locked and usually just says "wrong".
+async function currentLocks() {
+  const locks = new Map();
+  if (columnsMissing) return locks;
+  try {
+    const rows = (await query(
+      "SELECT id, login_locked_until FROM users WHERE login_locked_until > DATEADD(HOUR, 7, SYSUTCDATETIME())"
+    )).recordset;
+    for (const row of rows) locks.set(Number(row.id), row.login_locked_until);
+  } catch (err) {
+    if (!isMissingColumn(err)) throw err;
+    columnsMissing = true;
+  }
+  return locks;
+}
+
 // Tests only.
 function resetLockoutState() {
   columnsMissing = false;
 }
 
-module.exports = { MAX_FAILURES, LOCK_MINUTES, lockedUntil, recordFailure, recordSuccess, resetLockoutState };
+module.exports = { MAX_FAILURES, LOCK_MINUTES, currentLocks, lockedUntil, recordFailure, recordSuccess, resetLockoutState };

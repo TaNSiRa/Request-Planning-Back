@@ -2,6 +2,7 @@ const crypto = require("crypto");
 const fs = require("fs/promises");
 const path = require("path");
 const { env } = require("../config/env");
+const { thaiWallNow } = require("./thaiTime");
 
 const attachmentRoot = path.resolve(env.attachmentRoot);
 const legacyAttachmentRoot = path.resolve(__dirname, "../../assets/attachments");
@@ -152,10 +153,12 @@ function safePathSegment(value, fallback) {
 }
 
 function storageFolderParts(context = {}) {
-  const createdAt = context.createdAt ? new Date(context.createdAt) : new Date();
-  const validDate = Number.isNaN(createdAt.getTime()) ? new Date() : createdAt;
-  const year = `${validDate.getFullYear()}`;
-  const month = `${validDate.getMonth() + 1}`.padStart(2, "0");
+  // created_at is Thai wall-clock time, read back with its UTC fields holding
+  // the Thai clock — so read UTC fields, and shift "now" the same way.
+  const createdAt = context.createdAt ? new Date(context.createdAt) : thaiWallNow();
+  const validDate = Number.isNaN(createdAt.getTime()) ? thaiWallNow() : createdAt;
+  const year = `${validDate.getUTCFullYear()}`;
+  const month = `${validDate.getUTCMonth() + 1}`.padStart(2, "0");
   return [
     safePathSegment(context.section, "Unknown Section"),
     safePathSegment(context.branch, "Unknown Branch"),

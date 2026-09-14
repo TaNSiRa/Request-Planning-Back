@@ -29,7 +29,7 @@ router.get("/", asyncHandler(async (req, res) => {
 router.patch("/:id/read", asyncHandler(async (req, res) => {
   await query(
     `UPDATE notifications
-     SET read_at=SYSUTCDATETIME()
+     SET read_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHERE id=@id AND user_id=@userId AND section_id=@sectionId`,
     { id: Number(req.params.id), userId: req.user.id, sectionId: req.section.id }
   );
@@ -39,7 +39,7 @@ router.patch("/:id/read", asyncHandler(async (req, res) => {
 router.patch("/read-all", asyncHandler(async (req, res) => {
   await query(
     `UPDATE notifications
-     SET read_at=SYSUTCDATETIME()
+     SET read_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHERE user_id=@userId AND section_id=@sectionId AND read_at IS NULL`,
     { userId: req.user.id, sectionId: req.section.id }
   );

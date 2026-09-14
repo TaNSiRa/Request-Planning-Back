@@ -11,7 +11,7 @@ const { requireSectionAdmin, resolveSection, isAdmin, isViewer, canManageTargetR
 const { blockViewerWrites } = require("../../middleware/viewerGuard");
 const { rejectWeakPassword } = require("../../services/passwordPolicy");
 const { bumpTokenVersion, forgetAccount, setMustChangePassword } = require("../../services/accountState");
-const { recordSuccess: clearLoginLockout } = require("../../services/loginLockout");
+const { currentLocks, recordSuccess: clearLoginLockout } = require("../../services/loginLockout");
 const { VIEWER_PAGE_KEYS, getViewerOverrides, setViewerOverrides, sectionCanEdit } = require("../../services/viewerService");
 const { routeStepUserCondition } = require("../../services/approverService");
 const { getUserDisplayOrder, sortUsersByDisplayOrder } = require("../../services/settingsService");
@@ -81,6 +81,8 @@ router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
     row.position_sort === null || row.position_sort === undefined
       ? Number.MAX_SAFE_INTEGER
       : Number(row.position_sort);
+  // Failed-sign-in locks still in force, so the row can show it and offer Unlock.
+  const locks = await currentLocks();
   const rows = ordered
     .map((row, index) => ({ row, index }))
     .sort(
@@ -93,6 +95,7 @@ router.get("/", requireSectionAdmin, asyncHandler(async (req, res) => {
       const { memberships_json, approver_sections_json, position_sort, ...rest } = row;
       return {
         ...rest,
+        login_locked_until: locks.get(Number(row.id)) || null,
         memberships: memberships_json ? JSON.parse(memberships_json) : [],
         approver_sections: approver_sections_json
           ? JSON.parse(approver_sections_json).map(s => s.name)
@@ -158,7 +161,8 @@ async function getAssigneeSkills(userIds, sectionId) {
 
 router.post("/", requireSectionAdmin, audit("CREATE", "USER", req => req.body.email), asyncHandler(async (req, res) => {
   const schema = z.object({
-    employeeNo: z.string().min(1).max(50),
+    // Trimmed: login trims what is typed, so a stored " 1234" could never match.
+    employeeNo: z.string().trim().min(1).max(50),
     email: z.string().email().max(255),
     displayName: z.string().min(2).max(150),
     fullName: z.string().max(200).optional().nullable(),
@@ -185,6 +189,7 @@ router.post("/", requireSectionAdmin, audit("CREATE", "USER", req => req.body.em
   if (!await actorOwnsSectionLabel(req, input.section)) {
     return res.status(403).json({ message: "You can only create users in a section you administer" });
   }
+  if (await rejectIdentityClash(res, 0, input)) return;
   // Exclude non-column fields (arrays/flags) from the INSERT params — passing an
   // array to mssql throws "Invalid string".
   const { memberships, canRequest, canWork, ...userInput } = input;
@@ -219,7 +224,7 @@ router.post("/", requireSectionAdmin, audit("CREATE", "USER", req => req.body.em
 
 router.patch("/:id(\\d+)", requireSectionAdmin, audit("EDIT", "USER", req => req.params.id), asyncHandler(async (req, res) => {
   const schema = z.object({
-    employeeNo: z.string().min(1).max(50),
+    employeeNo: z.string().trim().min(1).max(50),
     email: z.string().email().max(255),
     displayName: z.string().min(2).max(150),
     fullName: z.string().max(200).optional().nullable(),
@@ -282,10 +287,11 @@ router.patch("/:id(\\d+)", requireSectionAdmin, audit("EDIT", "USER", req => req
       }
     }
   }
+  if (await rejectIdentityClash(res, targetId, input)) return;
   await query(
     `UPDATE users
      SET employee_no=@employeeNo, email=@email, display_name=@displayName, full_name=@fullName, name_prefix=@namePrefix, position_id=@positionId, role_id=@roleId,
-         branch=@branch, department=@department, section=@section, phone=@phone, is_active=@isActive, updated_at=SYSUTCDATETIME()
+         branch=@branch, department=@department, section=@section, phone=@phone, is_active=@isActive, updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHERE id=@id`,
     {
       id: Number(req.params.id),
@@ -350,7 +356,7 @@ router.post("/:id(\\d+)/reset-password", requireSectionAdmin, audit("RESET_PASSW
     return res.status(403).json({ message: "This account belongs to another section" });
   }
   const passwordHash = await bcrypt.hash(input.password, env.bcryptRounds);
-  await query("UPDATE users SET password_hash=@passwordHash, must_change_password=1, updated_at=SYSUTCDATETIME() WHERE id=@id", {
+  await query("UPDATE users SET password_hash=@passwordHash, must_change_password=1, updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id=@id", {
     id: Number(req.params.id),
     passwordHash
   });
@@ -361,6 +367,22 @@ router.post("/:id(\\d+)/reset-password", requireSectionAdmin, audit("RESET_PASSW
   // hand them an account that is actually open. Without this the new password
   // would be refused until the lock timed out on its own.
   await clearLoginLockout(Number(req.params.id));
+  res.json({ ok: true });
+}));
+
+// Release a failed-sign-in lock without touching the password. The owner still
+// has the right password; the lock is usually a colleague's typos (it counts per
+// ACCOUNT) and the owner was simply told "incorrect". Same authority as a reset.
+router.post("/:id(\\d+)/unlock", requireSectionAdmin, audit("UNLOCK_ACCOUNT", "USER", req => req.params.id), asyncHandler(async (req, res) => {
+  const targetId = Number(req.params.id);
+  if (!canManageTargetRole(req.user, await targetRoleCode(targetId))) {
+    return res.status(403).json({ message: "You cannot manage this user" });
+  }
+  if (!await actorOwnsUserHomeSection(req, targetId)) {
+    return res.status(403).json({ message: "This account belongs to another section" });
+  }
+  await clearLoginLockout(targetId);
+  emitSystem("users.updated", { id: targetId });
   res.json({ ok: true });
 }));
 
@@ -407,7 +429,7 @@ router.patch("/me", audit("EDIT_PROFILE", "USER", req => req.user.id), asyncHand
   await query(
     `UPDATE users SET employee_no=@employeeNo, email=@email, display_name=@displayName, full_name=@fullName, name_prefix=@namePrefix, position_id=@positionId, phone=@phone, branch=@branch, department=@department, section=@section,
          end_date_notify_days=COALESCE(@endDateNotifyDays, end_date_notify_days),
-         todo_notify_days=COALESCE(@todoNotifyDays, todo_notify_days), updated_at=SYSUTCDATETIME()
+         todo_notify_days=COALESCE(@todoNotifyDays, todo_notify_days), updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHERE id=@id`,
     { ...values, id: req.user.id }
   );
@@ -450,6 +472,27 @@ async function findIdentityClash(userId, { email, employeeNo, displayName }) {
     }
   )).recordset[0];
   return row ? row.reason : null;
+}
+
+const CLASH_MESSAGES = {
+  EMAIL_TAKEN: "This email is already used by another account",
+  EMPLOYEE_NO_TAKEN: "This employee no is already used by another account",
+  DISPLAY_NAME_TAKEN: "This display name is already used by another account"
+};
+
+// Manage Users' create/edit. A duplicate employee no is not cosmetic: login
+// resolves it to ONE account, so the other person is told "incorrect" forever
+// and their attempts lock the account they were resolved to. Answers 409 and
+// returns true when the request was refused.
+async function rejectIdentityClash(res, userId, input) {
+  const clash = await findIdentityClash(userId, {
+    email: input.email,
+    employeeNo: input.employeeNo,
+    displayName: input.displayName
+  });
+  if (!clash) return false;
+  res.status(409).json({ message: CLASH_MESSAGES[clash] || clash });
+  return true;
 }
 
 // Live "is this free?" check for the Profile page, so the three identity fields
@@ -499,7 +542,7 @@ router.patch("/me/reminders", audit("EDIT_REMINDERS", "USER", req => req.user.id
     `UPDATE users SET
        project_notify_before=@projectBefore, project_notify_on_due=@projectOnDue, project_notify_after=@projectAfter,
        todo_notify_before=@todoBefore, todo_notify_on_due=@todoOnDue, todo_notify_after=@todoAfter,
-       reminder_pause_on_hold=@pauseOnHold, reminder_preset=@preset, updated_at=SYSUTCDATETIME()
+       reminder_pause_on_hold=@pauseOnHold, reminder_preset=@preset, updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHERE id=@id`,
     {
       // formatOffsetList de-duplicates, sorts and drops out-of-range values, so
@@ -548,7 +591,7 @@ router.put("/me/avatar", audit("EDIT_AVATAR", "USER", req => req.user.id), async
     assertMagicByte(`avatar${ext}`, buffer);
   }
   try {
-    await query("UPDATE users SET avatar=@avatar, updated_at=SYSUTCDATETIME() WHERE id=@id", {
+    await query("UPDATE users SET avatar=@avatar, updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id=@id", {
       id: req.user.id,
       avatar: input.avatar
     });
@@ -579,7 +622,7 @@ router.put("/me/badge-photo", audit("EDIT_BADGE_PHOTO", "USER", req => req.user.
   });
   const input = schema.parse(req.body);
   try {
-    await query("UPDATE users SET badge_photo_pos=@placement, updated_at=SYSUTCDATETIME() WHERE id=@id", {
+    await query("UPDATE users SET badge_photo_pos=@placement, updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id=@id", {
       id: req.user.id,
       placement: input.placement
     });
@@ -623,7 +666,7 @@ router.patch("/me/password", audit("CHANGE_PASSWORD", "USER", req => req.user.id
     return res.status(400).json({ message: "New password must be different from the current one" });
   }
   const passwordHash = await bcrypt.hash(input.newPassword, env.bcryptRounds);
-  await query("UPDATE users SET password_hash=@passwordHash, updated_at=SYSUTCDATETIME() WHERE id=@id", { id: req.user.id, passwordHash });
+  await query("UPDATE users SET password_hash=@passwordHash, updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id=@id", { id: req.user.id, passwordHash });
   // The password is now one only its owner has typed, so the first-sign-in
   // dialog has served its purpose and must let go.
   await setMustChangePassword(req.user.id, false);

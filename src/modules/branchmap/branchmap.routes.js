@@ -64,7 +64,7 @@ async function setOrgBranches(names) {
   );
   if (existing && existing.length) {
     await query(
-      "UPDATE app_settings SET setting_value=@value, value_type='csv', updated_at=SYSUTCDATETIME() WHERE setting_key='org.branches' AND section_id IS NULL",
+      "UPDATE app_settings SET setting_value=@value, value_type='csv', updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE setting_key='org.branches' AND section_id IS NULL",
       { value }
     );
   } else {
@@ -413,7 +413,7 @@ router.put("/:branch", requireAdmin, audit("EDIT", "BRANCH_MAP", req => req.para
       `UPDATE branch_maps
        SET areas=@areas,
            ${imageProvided ? "image_data=@image," : ""}
-           updated_by=@userId, updated_at=SYSUTCDATETIME()
+           updated_by=@userId, updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
        WHERE UPPER(branch) = @branch`,
       imageProvided
         ? { branch, areas: areasJson, image: imageValue, userId: req.user.id }
@@ -422,7 +422,7 @@ router.put("/:branch", requireAdmin, audit("EDIT", "BRANCH_MAP", req => req.para
   } else {
     await query(
       `INSERT INTO branch_maps (branch, image_data, areas, updated_by, updated_at)
-       VALUES (@branch, @image, @areas, @userId, SYSUTCDATETIME())`,
+       VALUES (@branch, @image, @areas, @userId, DATEADD(HOUR, 7, SYSUTCDATETIME()))`,
       { branch, image: imageValue, areas: areasJson, userId: req.user.id }
     );
   }

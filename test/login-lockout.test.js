@@ -17,6 +17,7 @@ const assert = require("node:assert/strict");
 const supertest = require("supertest");
 const { createApp, closePool, fixtureContext, query, PASSWORD } = require("./helpers/setup");
 const { MAX_FAILURES } = require("../src/services/loginLockout");
+const { thaiWallNow } = require("../src/services/thaiTime");
 
 const ctx = fixtureContext("LOCK");
 
@@ -75,7 +76,7 @@ describe("account lockout after repeated failed sign-ins", () => {
 
     const locked = await lockState(email);
     assert.ok(locked.until, "the account is locked after the last failure");
-    const minutesOut = (new Date(locked.until).getTime() - Date.now()) / 60000;
+    const minutesOut = (new Date(locked.until).getTime() - thaiWallNow().getTime()) / 60000;
     assert.ok(minutesOut > 13 && minutesOut <= 15, `lock should run ~15 minutes, got ${minutesOut.toFixed(1)}`);
   });
 
@@ -113,7 +114,7 @@ describe("account lockout after repeated failed sign-ins", () => {
     const email = ctx.testEmail("approver2");
     await query(
       `UPDATE users SET failed_login_count = @failures,
-                        login_locked_until = DATEADD(MINUTE, -1, SYSUTCDATETIME())
+                        login_locked_until = DATEADD(MINUTE, -1, DATEADD(HOUR, 7, SYSUTCDATETIME()))
        WHERE email = @email`,
       { failures: MAX_FAILURES, email }
     );
@@ -160,6 +161,78 @@ describe("account lockout after repeated failed sign-ins", () => {
         roleId: previousRole,
         email: ctx.testEmail("approver1")
       });
+    }
+  });
+
+  // Runs fn with approver1 temporarily promoted to global admin.
+  async function asAdmin(fn) {
+    const app = createApp();
+    const adminRoleId = (await query("SELECT id FROM roles WHERE code = 'ADMIN'")).recordset[0].id;
+    const email = ctx.testEmail("approver1");
+    const previousRole = (await query("SELECT role_id FROM users WHERE email = @email", { email })).recordset[0].role_id;
+    await query("UPDATE users SET role_id = @roleId WHERE email = @email", { roleId: adminRoleId, email });
+    try {
+      await fn(await ctx.login(app, "approver1"));
+    } finally {
+      await query("UPDATE users SET role_id = @roleId WHERE email = @email", { roleId: previousRole, email });
+    }
+  }
+
+  it("Unlock releases the lock and keeps the password, and the list shows it", async () => {
+    // approver2, not member: the reset case above has already changed member's password.
+    const email = ctx.testEmail("approver2");
+    for (let i = 0; i < MAX_FAILURES; i++) await freshLogin(email, WRONG);
+
+    await asAdmin(async admin => {
+      const list = await admin.get("/api/users");
+      assert.equal(list.status, 200, JSON.stringify(list.body));
+      const row = list.body.data.find(u => u.id === fixture.users.approver2);
+      assert.ok(row && row.login_locked_until, "a locked account is flagged in Manage Users");
+
+      const unlock = await admin.post(`/api/users/${fixture.users.approver2}/unlock`).send({});
+      assert.equal(unlock.status, 200, JSON.stringify(unlock.body));
+    });
+
+    const state = await lockState(email);
+    assert.equal(state.until, null);
+    assert.equal(state.failures, 0);
+    assert.equal((await freshLogin(email, PASSWORD)).status, 200, "the same password works again");
+  });
+
+  it("login by employee no ignores stray spaces stored on the account", async () => {
+    const empNo = `LK${Date.now() % 1000000}`;
+    await query("UPDATE users SET employee_no = @emp WHERE id = @id", { emp: ` ${empNo} `, id: fixture.users.approver2 });
+    try {
+      assert.equal((await freshLogin(empNo, PASSWORD)).status, 200);
+    } finally {
+      await query("UPDATE users SET employee_no = NULL WHERE id = @id", { id: fixture.users.approver2 });
+    }
+  });
+
+  it("Manage Users refuses an employee no another account already uses", async () => {
+    const empNo = `DUP${Date.now() % 1000000}`;
+    await query("UPDATE users SET employee_no = @emp WHERE id = @id", { emp: empNo, id: fixture.users.approver2 });
+    try {
+      await asAdmin(async admin => {
+        const row = (await query(
+          "SELECT email, display_name, role_id, branch, department, section FROM users WHERE id = @id",
+          { id: fixture.users.member }
+        )).recordset[0];
+        const res = await admin.patch(`/api/users/${fixture.users.member}`).send({
+          employeeNo: empNo,
+          email: row.email,
+          displayName: row.display_name,
+          roleId: row.role_id,
+          branch: row.branch || "TPK",
+          department: row.department || "Dept",
+          section: row.section || "Section",
+          isActive: true
+        });
+        assert.equal(res.status, 409, JSON.stringify(res.body));
+        assert.match(res.body.message, /employee no is already used/);
+      });
+    } finally {
+      await query("UPDATE users SET employee_no = NULL WHERE id = @id", { id: fixture.users.approver2 });
     }
   });
 });

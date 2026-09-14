@@ -91,7 +91,7 @@ async function sendMail({ to, subject, html, text, requestId, type, sectionId, i
       text: text || undefined
     });
     await query(
-      "UPDATE email_outbox SET status='sent', sent_at=SYSUTCDATETIME(), error_message=NULL WHERE id=@id",
+      "UPDATE email_outbox SET status='sent', sent_at=DATEADD(HOUR, 7, SYSUTCDATETIME()), error_message=NULL WHERE id=@id",
       { id: outboxId }
     );
     return { sent: true, messageId: info.messageId };

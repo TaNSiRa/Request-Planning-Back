@@ -316,7 +316,7 @@ describe("personal to-do reminder API", () => {
 
     // Older than the keep window — the next board save clears it out for good.
     await query(
-      "UPDATE personal_todo_reminders SET orphaned_at = DATEADD(day, -30, SYSUTCDATETIME()) WHERE id=@id",
+      "UPDATE personal_todo_reminders SET orphaned_at = DATEADD(day, -30, DATEADD(HOUR, 7, SYSUTCDATETIME())) WHERE id=@id",
       { id });
     await session.put("/api/personal-todo").send({
       columns: [{ title: "Today", color: "#2f6bed", items: [{ content: "Call the supplier", uid: UID_B }] }]
