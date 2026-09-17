@@ -157,6 +157,7 @@ function fixtureContext(tag) {
         `DELETE FROM schedule_extension_requests WHERE request_id IN ${inRequests}`,
         `DELETE FROM approval_step_approvers WHERE step_id IN (SELECT id FROM approval_steps WHERE request_id IN ${inRequests})`,
         `DELETE FROM approval_steps WHERE request_id IN ${inRequests}`,
+        `DELETE FROM request_drafts WHERE section_id=@sid`,
         `DELETE FROM requests WHERE section_id=@sid OR requester_section_id=@sid`,
         `DELETE FROM approval_route_step_approvers WHERE step_id IN (SELECT id FROM approval_route_steps WHERE route_id IN (SELECT id FROM approval_routes WHERE section_id=@sid OR requester_section_id=@sid))`,
         `DELETE FROM approval_route_steps WHERE route_id IN (SELECT id FROM approval_routes WHERE section_id=@sid OR requester_section_id=@sid)`,
@@ -181,6 +182,7 @@ function fixtureContext(tag) {
         `DELETE FROM notifications WHERE user_id IN ${inUsers}`,
         `DELETE FROM audit_logs WHERE actor_user_id IN ${inUsers}`,
         `DELETE FROM user_skill_levels WHERE user_id IN ${inUsers}`,
+        `DELETE FROM request_drafts WHERE user_id IN ${inUsers}`,
         // Personal to-do board (items reference columns → items first).
         `DELETE FROM personal_todo_reminders WHERE user_id IN ${inUsers}`,
         `DELETE FROM personal_todo_items WHERE user_id IN ${inUsers}`,

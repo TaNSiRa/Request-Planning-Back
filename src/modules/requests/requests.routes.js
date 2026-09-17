@@ -32,6 +32,7 @@ const {
   extensionStepCandidates,
   requestStepCandidateMap
 } = require("../../services/approverService");
+const { draftRoutes, deleteDraft } = require("./drafts.routes");
 
 const router = express.Router();
 router.use(requireAuth);
@@ -68,9 +69,15 @@ router.get("/:id/section", asyncHandler(async (req, res) => {
 }));
 
 router.use(resolveSection);
-// Raising a NEW request belongs to the Create Request page; every other write
-// here (cancel, todos, complete, hold, extension) belongs to the Request List.
-router.use(blockViewerWrites(req => (req.method === "POST" && req.path === "/" ? "create" : "list")));
+// Raising a NEW request (and keeping drafts of one) belongs to the Create
+// Request page; every other write here (cancel, todos, complete, hold,
+// extension) belongs to the Request List.
+router.use(blockViewerWrites(req =>
+  (req.method === "POST" && req.path === "/") || req.path === "/drafts" || req.path.startsWith("/drafts/")
+    ? "create"
+    : "list"));
+// Before /:id, which would otherwise swallow /drafts.
+router.use("/drafts", draftRoutes);
 
 router.get("/", asyncHandler(async (req, res) => {
   const { status, q, type, from, to } = req.query;
@@ -428,10 +435,13 @@ router.post("/", audit("CREATE", "REQUEST", req => req.body.title), asyncHandler
     dueDate: z.string().max(40),
     description: z.string().min(1).max(TEXT_MAX),
     businessImpact: z.string().min(1).max(TEXT_MAX),
-    attachments: attachmentSchema()
+    attachments: attachmentSchema(),
+    // Set when the form was opened from a saved draft; that draft is deleted
+    // once the request exists.
+    draftId: z.number().int().positive().optional().nullable()
   });
   const input = schema.parse(req.body);
-  const { attachments, ...requestInput } = input;
+  const { attachments, draftId, ...requestInput } = input;
   const values = {
     ...requestInput,
     systemArea: input.systemArea ?? null,
@@ -456,6 +466,8 @@ router.post("/", audit("CREATE", "REQUEST", req => req.body.title), asyncHandler
   await notifyRequestParticipants(requestId, "CREATE", "Request submitted", number);
   await notifyFirstApprover(requestId, number);
   emitSystem("request.created", { id: requestId, requestNo: number, status: "PENDING_APPROVAL" });
+  // The request is already safe; a failed draft cleanup must not turn that into an error.
+  if (draftId) await deleteDraft(draftId, req.user.id, req.section.id).catch(() => {});
   res.status(201).json({ id: requestId, requestNo: number });
 }));
 
