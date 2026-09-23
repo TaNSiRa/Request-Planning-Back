@@ -35,7 +35,12 @@ let layoutColumnsReady = null;
 // reminders. Same one-query-then-cache check.
 let reminderTablesReady = null;
 
-const MAX_REMINDERS_PER_CARD = 20;
+// A card's due date (patch_personal_todo_due_date.sql) — optional the same way.
+let dueDateColumnReady = null;
+
+// A one-off on several days is one row per day (the editor folds them back
+// into one entry), so this counts DAYS as much as reminders.
+const MAX_REMINDERS_PER_CARD = 120;
 
 // How long a deleted card's reminders are kept, orphaned, before they are
 // really removed. It only has to outlive the board's Undo — a week is generous
@@ -73,6 +78,28 @@ async function hasReminderTables() {
     reminderTablesReady = false;
   }
   return reminderTablesReady;
+}
+
+async function hasDueDateColumn() {
+  if (dueDateColumnReady !== null) return dueDateColumnReady;
+  try {
+    const row = (await query(
+      `SELECT COUNT(*) AS n FROM sys.columns
+       WHERE object_id = OBJECT_ID('personal_todo_items') AND name = 'due_date'`
+    )).recordset[0];
+    dueDateColumnReady = Number(row?.n ?? 0) >= 1;
+  } catch {
+    dueDateColumnReady = false;
+  }
+  return dueDateColumnReady;
+}
+
+// 'YYYY-MM-DD' or nothing — a due date is a calendar day, never a moment.
+function normaliseDueDate(value) {
+  const text = `${value ?? ""}`.trim().slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
+  const d = new Date(`${text}T00:00:00Z`);
+  return Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== text ? null : text;
 }
 
 // Clamp an incoming width to something a board can actually show; null/invalid
@@ -129,13 +156,14 @@ async function loadReminders(userId) {
 async function loadBoard(userId) {
   const withLayout = await hasLayoutColumns();
   const withReminders = await hasReminderTables();
+  const withDue = await hasDueDateColumn();
   const columns = (await query(
     `SELECT id, title, color, sort_order${withLayout ? ", width" : ""} FROM personal_todo_columns
      WHERE user_id = @userId ORDER BY sort_order, id`,
     { userId }
   )).recordset;
   const items = (await query(
-    `SELECT id, column_id, content, sort_order${withReminders ? ", uid, reminder_enabled" : ""}
+    `SELECT id, column_id, content, sort_order${withReminders ? ", uid, reminder_enabled" : ""}${withDue ? ", due_date" : ""}
      FROM personal_todo_items
      WHERE user_id = @userId ORDER BY sort_order, id`,
     { userId }
@@ -150,6 +178,7 @@ async function loadBoard(userId) {
       uid: withReminders ? (it.uid ?? null) : null,
       // Defaults on: a card the user has never touched is simply "not silenced".
       reminderEnabled: withReminders ? it.reminder_enabled !== false && it.reminder_enabled !== 0 : true,
+      dueDate: withDue ? normaliseDueDate(it.due_date) : null,
       reminders: (withReminders && it.uid ? remindersByUid.get(it.uid) : null) ?? []
     });
   }
@@ -233,13 +262,15 @@ router.put("/", asyncHandler(async (req, res) => {
       items: z.array(z.object({
         content: z.string().optional().nullable(),
         uid: z.string().max(40).optional().nullable(),
-        reminderEnabled: z.boolean().optional()
+        reminderEnabled: z.boolean().optional(),
+        dueDate: z.string().max(20).optional().nullable()
       })).optional().default([])
     })).max(50).optional().default([])
   });
   const input = schema.parse(req.body);
   const withLayout = await hasLayoutColumns();
   const withReminders = await hasReminderTables();
+  const withDue = await hasDueDateColumn();
 
   // Every uid that survives this save. Reminders belonging to anything else are
   // deleted at the end — deleting a card takes its alarms with it.
@@ -295,15 +326,22 @@ router.put("/", asyncHandler(async (req, res) => {
         const uid = normaliseUid(item.uid);
         if (uid) survivingUids.push(uid);
         const reminderEnabled = item.reminderEnabled === false ? 0 : 1;
+        const cols = ["user_id", "column_id", "content", "sort_order"];
+        const vals = ["@userId", "@columnId", "@content", "@sortOrder"];
+        const params = { userId: req.user.id, columnId, content, sortOrder: itemOrder++ };
+        if (withReminders) {
+          cols.push("uid", "reminder_enabled");
+          vals.push("@uid", "@reminderEnabled");
+          Object.assign(params, { uid, reminderEnabled });
+        }
+        if (withDue) {
+          cols.push("due_date");
+          vals.push("@dueDate");
+          params.dueDate = normaliseDueDate(item.dueDate);
+        }
         await run(
-          withReminders
-            ? `INSERT INTO personal_todo_items (user_id, column_id, content, sort_order, uid, reminder_enabled)
-               VALUES (@userId, @columnId, @content, @sortOrder, @uid, @reminderEnabled)`
-            : `INSERT INTO personal_todo_items (user_id, column_id, content, sort_order)
-               VALUES (@userId, @columnId, @content, @sortOrder)`,
-          withReminders
-            ? { userId: req.user.id, columnId, content, sortOrder: itemOrder++, uid, reminderEnabled }
-            : { userId: req.user.id, columnId, content, sortOrder: itemOrder++ }
+          `INSERT INTO personal_todo_items (${cols.join(", ")}) VALUES (${vals.join(", ")})`,
+          params
         );
       }
     }

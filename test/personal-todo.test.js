@@ -116,6 +116,27 @@ describe("personal to-do board", () => {
     assert.equal(reread.body.defaultWidth, 340);
   });
 
+  it("keeps a card's due date, dropping anything that is not a real day", async () => {
+    const session = await ctx.login(app, "approver1");
+    const res = await session.put("/api/personal-todo").send({
+      columns: [
+        {
+          title: "Due", color: "#2f6bed", items: [
+            { content: "With date", dueDate: "2026-10-05" },
+            { content: "No date" },
+            { content: "Bad date", dueDate: "2026-02-30" },
+            { content: "Junk", dueDate: "tomorrow" }
+          ]
+        }
+      ]
+    });
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.body.columns[0].items.map(i => i.dueDate), ["2026-10-05", null, null, null]);
+
+    const reread = await session.get("/api/personal-todo");
+    assert.deepEqual(reread.body.columns[0].items.map(i => i.dueDate), ["2026-10-05", null, null, null]);
+  });
+
   it("keeps each user's board private", async () => {
     // member's board (set above) must not leak into approver2's freshly seeded one.
     const session = await ctx.login(app, "approver2");
