@@ -1057,6 +1057,11 @@ router.post("/:id/extension-requests", audit("CREATE", "EXTENSION_REQUEST"), asy
   if (!request.planned_start || !request.planned_end) {
     return res.status(400).json({ message: "Project period has not been assigned yet" });
   }
+  // One open extension at a time: it must be fully approved, rejected or
+  // cancelled before another can be raised.
+  if (await pendingExtensionId(requestId)) {
+    return res.status(409).json({ message: "An extension request is already waiting for approval" });
+  }
   const result = await query(
     `INSERT INTO schedule_extension_requests (request_id, requested_by, previous_start, previous_end, requested_start, requested_end, reason, status)
      OUTPUT INSERTED.id VALUES (@id, @userId, @previousStart, @previousEnd, @requestedStart, @requestedEnd, @reason, 'PENDING_APPROVAL')`,
@@ -1073,6 +1078,44 @@ router.post("/:id/extension-requests", audit("CREATE", "EXTENSION_REQUEST"), asy
   emitSystem("request.updated", { id: requestId, part: "extension" });
   res.status(201).json({ id: result.recordset[0].id });
 }));
+
+// Withdraws the open extension request. No approval needed — the steps still
+// waiting are skipped so they drop out of the approvers' inboxes.
+router.post("/:id/extension-requests/cancel", audit("CANCEL", "EXTENSION_REQUEST"), asyncHandler(async (req, res) => {
+  const requestId = Number(req.params.id);
+  await assertCanManageRequestWork(requestId, req.user, req.sectionAccess, req.section.id, {
+    allowSectionMember: req.query.meeting === "1"
+  });
+  const exists = (await query("SELECT id FROM requests WHERE id=@id AND section_id=@sectionId", {
+    id: requestId,
+    sectionId: req.section.id
+  })).recordset[0];
+  if (!exists) return res.status(404).json({ message: "Request not found" });
+  const extensionId = await pendingExtensionId(requestId);
+  if (!extensionId) return res.status(409).json({ message: "No extension request is waiting for approval" });
+  const updated = await query(
+    "UPDATE schedule_extension_requests SET status='CANCELLED' WHERE id=@extensionId AND status='PENDING_APPROVAL'",
+    { extensionId }
+  );
+  if (!updated.rowsAffected[0]) {
+    return res.status(409).json({ message: "The extension request was already decided" });
+  }
+  await query(
+    `UPDATE schedule_extension_approval_steps SET status='SKIPPED', updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
+     WHERE extension_id=@extensionId AND status IN ('PENDING','WAITING')`,
+    { extensionId }
+  );
+  emitSystem("request.updated", { id: requestId, part: "extension" });
+  res.json({ ok: true, id: extensionId });
+}));
+
+async function pendingExtensionId(requestId) {
+  const row = (await query(
+    "SELECT TOP 1 id FROM schedule_extension_requests WHERE request_id=@requestId AND status='PENDING_APPROVAL' ORDER BY id DESC",
+    { requestId }
+  )).recordset[0];
+  return row ? row.id : null;
+}
 
 // Maps the requester's profile section text (e.g. "Maintenance") to a
 // request_sections id. Returns null when it can't be resolved or resolves to the

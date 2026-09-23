@@ -2,6 +2,15 @@
 // tripped by the SAME five wrong passwords, so they have to be seen and
 // released together. Runs with the production limiter (5 per IP) — one limiter
 // for the whole process — so both guards are really in play.
+//
+// The wrong passwords come from a made-up address of this suite's own. Releasing
+// an IP unlocks EVERY account that failed from it, and the lockout suite runs in
+// parallel from the same loopback address — sharing it let one of our releases
+// reset that suite's count mid-loop. Set BEFORE helpers/setup loads env, so
+// X-Forwarded-For is trusted for this process only.
+process.env.TRUST_PROXY_HOPS = "1";
+const SUITE_IP = "203.0.113.77";
+
 const { describe, it, before, after, beforeEach } = require("node:test");
 const assert = require("node:assert/strict");
 const supertest = require("supertest");
@@ -34,7 +43,7 @@ describe("login blocks: IP and account released together", () => {
     );
     // The limiter is created once when auth.routes loads, so a new app does NOT
     // bring a new one — free the loopback address the previous case used up.
-    for (const ip of [...listBlockedIps().map(b => b.ip), "::ffff:127.0.0.1", "127.0.0.1", "::1"]) {
+    for (const ip of [...listBlockedIps().map(b => b.ip), SUITE_IP, "::ffff:127.0.0.1", "127.0.0.1", "::1"]) {
       await releaseIp(ip);
     }
   });
@@ -57,7 +66,7 @@ describe("login blocks: IP and account released together", () => {
 
   async function failFiveTimes(app, email) {
     for (let i = 0; i < MAX_FAILURES; i++) {
-      const res = await supertest(app).post("/api/auth/login").send({ email, password: WRONG });
+      const res = await supertest(app).post("/api/auth/login").set("X-Forwarded-For", SUITE_IP).send({ email, password: WRONG });
       assert.equal(res.status, 401);
     }
   }
@@ -84,11 +93,13 @@ describe("login blocks: IP and account released together", () => {
       const unlock = await admin.post(`/api/auth/login-blocks/accounts/${fixture.users.requester}/unlock`).send({});
       assert.equal(unlock.status, 200, JSON.stringify(unlock.body));
 
-      const back = await supertest(app).post("/api/auth/login").send({ email, password: PASSWORD });
+      const back = await supertest(app).post("/api/auth/login").set("X-Forwarded-For", SUITE_IP).send({ email, password: PASSWORD });
       assert.equal(back.status, 200, `neither 429 (IP) nor 401 (account): ${JSON.stringify(back.body)}`);
       const after = await admin.get("/api/auth/login-blocks");
       assert.equal(after.body.data.length, 0);
-      assert.equal(after.body.accounts.length, 0);
+      // Only our own accounts: the lockout suite's locks show here too while it runs.
+      const ours = new Set(Object.values(fixture.users));
+      assert.equal(after.body.accounts.filter(a => ours.has(a.id)).length, 0);
     });
   });
 
@@ -101,7 +112,7 @@ describe("login blocks: IP and account released together", () => {
       const release = await admin.del(`/api/auth/login-blocks/${encodeURIComponent(ip)}`);
       assert.equal(release.status, 200, JSON.stringify(release.body));
 
-      const back = await supertest(app).post("/api/auth/login").send({ email, password: PASSWORD });
+      const back = await supertest(app).post("/api/auth/login").set("X-Forwarded-For", SUITE_IP).send({ email, password: PASSWORD });
       assert.equal(back.status, 200, JSON.stringify(back.body));
     });
   });
@@ -114,7 +125,7 @@ describe("login blocks: IP and account released together", () => {
       const unlock = await admin.post(`/api/users/${fixture.users.requester}/unlock`).send({});
       assert.equal(unlock.status, 200, JSON.stringify(unlock.body));
 
-      const back = await supertest(app).post("/api/auth/login").send({ email, password: PASSWORD });
+      const back = await supertest(app).post("/api/auth/login").set("X-Forwarded-For", SUITE_IP).send({ email, password: PASSWORD });
       assert.equal(back.status, 200, JSON.stringify(back.body));
     });
   });

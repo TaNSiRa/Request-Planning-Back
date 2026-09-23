@@ -115,4 +115,43 @@ describe("schedule extension flow", () => {
     assert.equal(await pendingExtensionFor(approver1, id), null);
     assert.equal(await pendingExtensionFor(approver2, id), null);
   });
+
+  it("only one extension may be open at a time", async () => {
+    const id = await inProgressRequest();
+    const first = await incharge.post(`/api/requests/${id}/extension-requests`).send(extensionPayload());
+    assert.equal(first.status, 201);
+    const second = await incharge.post(`/api/requests/${id}/extension-requests`).send(extensionPayload());
+    assert.equal(second.status, 409);
+
+    // Once decided, a new one can be raised.
+    const rejected = await approver1.post(`/api/approvals/extension/${first.body.id}/reject`).send({});
+    assert.equal(rejected.status, 200);
+    const third = await incharge.post(`/api/requests/${id}/extension-requests`).send(extensionPayload());
+    assert.equal(third.status, 201);
+  });
+
+  it("the worker can cancel an open extension without approval", async () => {
+    const id = await inProgressRequest();
+    const created = await incharge.post(`/api/requests/${id}/extension-requests`).send(extensionPayload());
+    assert.equal(created.status, 201);
+    const extensionId = created.body.id;
+
+    // Not the worker → forbidden.
+    const denied = await requester.post(`/api/requests/${id}/extension-requests/cancel`).send({});
+    assert.equal(denied.status, 403);
+
+    const res = await incharge.post(`/api/requests/${id}/extension-requests/cancel`).send({});
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+
+    const detail = await getRequest(requester, id);
+    assert.ok(`${detail.planned_end}`.startsWith(PROJECT_END));
+    assert.equal(detail.extensionHistory.find(ext => ext.id === extensionId).status, "CANCELLED");
+    assert.equal(await pendingExtensionFor(approver1, id), null);
+    // The approver can no longer act on it.
+    const late = await approver1.post(`/api/approvals/extension/${extensionId}/approve`).send({});
+    assert.equal(late.status, 404);
+    // Nothing left to cancel; a fresh request is allowed again.
+    assert.equal((await incharge.post(`/api/requests/${id}/extension-requests/cancel`).send({})).status, 409);
+    assert.equal((await incharge.post(`/api/requests/${id}/extension-requests`).send(extensionPayload())).status, 201);
+  });
 });
