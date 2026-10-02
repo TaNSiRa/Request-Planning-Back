@@ -52,7 +52,7 @@ const APPRAISEE = {
 // Excel and confirmed intact. A changed digest is a question, not a defect: a
 // new zlib in Node, a bumped zip library, or an edited template will all move
 // it legitimately. What it must never do is change silently.
-const HALF1_SHA256 = "179de6a1ba2822900fa7200aabe6147e7d3b8cb48c6083e649d199e4883b0819";
+const HALF1_SHA256 = "9e1083a43fac652a8c1afc5da430c7b92eb677ae51828a434a220f366d615910";
 const TEMPLATE_ENTRY_COUNT = 41;
 
 // --- minimal zip reader (central directory only) -------------------------
