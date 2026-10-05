@@ -221,7 +221,8 @@ async function dispatchReminders({ targetType, scope, rows, idOf, todayYmd, holi
           // first one so the mail is still traceable from a request.
           requestId: requestIdOf(items[0]),
           sectionId: null,
-          type: mail.type
+          type: mail.type,
+          waitForDelivery: true
         });
         if (!result.sent) continue;
         sent++;

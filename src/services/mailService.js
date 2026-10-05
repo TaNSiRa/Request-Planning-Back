@@ -7,12 +7,16 @@ function isMailConfigured() {
   return Boolean(env.smtp.host && env.smtp.from);
 }
 
-// Lazily-built, reused SMTP transporter (module-level singleton).
+// Lazily-built, reused SMTP transporter (module-level singleton). Pooled so
+// consecutive messages reuse one authenticated connection instead of paying the
+// TCP + STARTTLS + AUTH handshake to the SMTP host for every single email.
 let transporter = null;
 function getTransporter() {
   if (transporter) return transporter;
   if (!isMailConfigured()) return null;
   transporter = nodemailer.createTransport({
+    pool: true,
+    maxConnections: 2,
     host: env.smtp.host,
     port: env.smtp.port || 587,
     // secure=true only for implicit TLS (port 465). Port 587 uses STARTTLS,
@@ -49,7 +53,12 @@ async function resolveSectionId(requestId, sectionId) {
   return result.recordset[0]?.section_id || null;
 }
 
-async function sendMail({ to, subject, html, text, requestId, type, sectionId, ignoreEnabledFlag = false }) {
+// Records the message in the outbox, then delivers it. Delivery runs in the
+// background by default: a button click (complete work, extension, approve…)
+// must not wait seconds per recipient on the SMTP server. Callers that act on
+// the outcome (the settings test send, reminder jobs that stamp only after a
+// real delivery) pass waitForDelivery: true.
+async function sendMail({ to, subject, html, text, requestId, type, sectionId, ignoreEnabledFlag = false, waitForDelivery = false }) {
   const resolvedSectionId = await resolveSectionId(requestId, sectionId);
   // 'mail.enabled' is the on/off switch OF THE OWNING SECTION — each section
   // decides for itself whether the system emails its people. When off, we still
@@ -82,6 +91,16 @@ async function sendMail({ to, subject, html, text, requestId, type, sectionId, i
   const tx = getTransporter();
   if (!tx) return { sent: false, reason: "SMTP config is blank" };
 
+  const delivery = deliver(tx, outboxId, { to, subject, html, text });
+  if (waitForDelivery) return delivery;
+  delivery.catch(err => {
+    // eslint-disable-next-line no-console
+    console.error(`[mail] background delivery to ${to} failed: ${err.message}`);
+  });
+  return { sent: false, queued: true };
+}
+
+async function deliver(tx, outboxId, { to, subject, html, text }) {
   try {
     const info = await tx.sendMail({
       from: env.smtp.from,

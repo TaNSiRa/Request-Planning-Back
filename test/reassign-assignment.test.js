@@ -164,7 +164,9 @@ describe("reassignment: PATCH /requests/:id/assignment", () => {
     assert.equal((await getRequest(requester, id)).detailEdits.length, 0);
   });
 
-  it("refuses a project period that would strand an existing to-do", async () => {
+  // Todos are not bound to the project period, so shrinking the period past an
+  // existing to-do is allowed; only a reversed period is refused.
+  it("allows a project period that no longer covers an existing to-do", async () => {
     const id = await inProgressRequest();
     const todo = await incharge.post(`/api/requests/${id}/todos`).send({
       title: "late todo",
@@ -176,11 +178,13 @@ describe("reassignment: PATCH /requests/:id/assignment", () => {
     const shrunk = await approver2
       .patch(`/api/requests/${id}/assignment`)
       .send(reassignPayload(fixture.users.member, { plannedEnd: "2026-08-10" }));
-    assert.equal(shrunk.status, 400);
-    assert.match(shrunk.body.message, /late todo/);
+    assert.equal(shrunk.status, 200, JSON.stringify(shrunk.body));
+    assert.match(`${(await getRequest(requester, id)).planned_end}`, /2026-08-10/);
 
-    // Nothing was written: the period is still the original one.
-    assert.match(`${(await getRequest(requester, id)).planned_end}`, /2026-08-21/);
+    const reversed = await approver2
+      .patch(`/api/requests/${id}/assignment`)
+      .send(reassignPayload(fixture.users.member, { plannedStart: "2026-08-15", plannedEnd: "2026-08-10" }));
+    assert.equal(reversed.status, 400);
   });
 
   it("refuses someone who cannot be given work in this section", async () => {

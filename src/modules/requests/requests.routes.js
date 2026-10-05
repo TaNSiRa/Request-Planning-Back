@@ -754,18 +754,8 @@ router.patch("/:id/assignment", audit("EDIT", "REQUEST_ASSIGNMENT", req => req.p
   if (!startDay || !endDay || startDay > endDay) {
     return res.status(400).json({ message: "Project start must be before project end" });
   }
-  // Todos must sit inside the project period (see assertTodoWithinProject), so a
-  // shrunken period that would strand an existing todo is refused rather than
-  // silently breaking that rule.
-  const strandedTodo = (await query(
-    "SELECT title, planned_start, planned_end FROM request_todos WHERE request_id=@id ORDER BY sort_order, id",
-    { id }
-  )).recordset.find(todo => dateOnly(todo.planned_start) < startDay || dateOnly(todo.planned_end) > endDay);
-  if (strandedTodo) {
-    return res.status(400).json({
-      message: `The project period must still cover every to-do — "${strandedTodo.title}" falls outside it`
-    });
-  }
+  // Todos are not bound to the project period (see assertTodoWindow), so a
+  // period change never has to cover the existing todos.
 
   // Skill-matrix gate: when the picked support types carry a required level,
   // every required skill must be covered by the incharge and supports pooled
@@ -1817,29 +1807,21 @@ async function notifyRequestParticipants(requestId, type, title, body, comment) 
   }
 }
 
+// A todo's period is free — it is NOT bound to the project period the approver
+// set (users schedule todos dynamically). Only its own start/end order is
+// checked. The sectionId/requestId arguments are kept so callers stay unchanged.
 async function assertTodoWindow(requestId, sectionId, plannedStart, plannedEnd) {
-  const row = (await query(
-    "SELECT planned_start, planned_end FROM requests WHERE id=@requestId AND section_id=@sectionId",
-    { requestId, sectionId }
-  )).recordset[0];
-  if (!row?.planned_start || !row?.planned_end) return;
-  // Compare at day granularity. The frontend already constrains todo dates to the
-  // project period at the date level; the stored timestamps carry a time-of-day
-  // (and mssql reads DATE/DATETIME columns back as UTC midnight), so a full
-  // timestamp comparison spuriously rejected a boundary-day todo whenever the
-  // server ran off UTC (e.g. Asia/Bangkok +07).
+  // Compare at day granularity: the stored timestamps carry a time-of-day (and
+  // mssql reads DATE/DATETIME columns back as UTC midnight), so a full timestamp
+  // comparison could spuriously reject a one-day todo off UTC.
   const dayOf = (value) => {
     if (value instanceof Date) return value.toISOString().slice(0, 10);
     const s = `${value}`;
     const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
     return m ? m[1] : new Date(s).toISOString().slice(0, 10);
   };
-  const todoStart = dayOf(plannedStart);
-  const todoEnd = dayOf(plannedEnd);
-  const projectStart = dayOf(row.planned_start);
-  const projectEnd = dayOf(row.planned_end);
-  if (todoStart < projectStart || todoEnd > projectEnd || todoStart > todoEnd) {
-    const err = new Error("Todo period must be inside assigned project period");
+  if (dayOf(plannedStart) > dayOf(plannedEnd)) {
+    const err = new Error("Todo start must be on or before its end");
     err.status = 400;
     throw err;
   }

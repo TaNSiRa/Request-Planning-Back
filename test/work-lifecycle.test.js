@@ -90,17 +90,24 @@ describe("work lifecycle: todos, hold, close, KPI", () => {
     assert.deepEqual(detail.todos.map(t => t.title), ["third", "first", "second"]);
   });
 
-  it("keeps todo dates inside the assigned project period", async () => {
+  // Todos are scheduled freely — not bound to the assigned project period —
+  // but a todo's own start must not come after its end.
+  it("lets todo dates leave the project period but keeps start <= end", async () => {
     const id = await inProgressRequest();
-    const res = await incharge.post(`/api/requests/${id}/todos`).send(
+    const after = await incharge.post(`/api/requests/${id}/todos`).send(
       todoPayload({ plannedEnd: "2026-12-01" }) // past project end
     );
-    assert.equal(res.status, 400);
+    assert.equal(after.status, 201, JSON.stringify(after.body));
 
     const before = await incharge.post(`/api/requests/${id}/todos`).send(
       todoPayload({ plannedStart: "2026-01-01" }) // before project start
     );
-    assert.equal(before.status, 400);
+    assert.equal(before.status, 201, JSON.stringify(before.body));
+
+    const reversed = await incharge.post(`/api/requests/${id}/todos`).send(
+      todoPayload({ plannedStart: "2026-08-10", plannedEnd: "2026-08-05" })
+    );
+    assert.equal(reversed.status, 400);
   });
 
   it("blocks complete-work while a todo is unfinished, allows it once all are done", async () => {

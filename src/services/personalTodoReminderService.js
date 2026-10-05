@@ -268,7 +268,8 @@ async function runPersonalTodoReminders(now = new Date()) {
         text: mail.text,
         requestId: null,
         sectionId: await mailSectionFor(group.id),
-        type: mail.type
+        type: mail.type,
+        waitForDelivery: true
       });
       if (!result.sent) continue; // unstamped — the next tick tries again
       sent++;
