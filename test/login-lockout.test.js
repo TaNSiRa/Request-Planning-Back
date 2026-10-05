@@ -110,6 +110,25 @@ describe("account lockout after repeated failed sign-ins", () => {
     assert.equal(state.until, null);
   });
 
+  it("emails the owner once when the account locks, not on every guess after", async () => {
+    const email = ctx.testEmail("requester");
+    const lockMails = async () => (await query(
+      "SELECT COUNT(*) AS n FROM email_outbox WHERE to_email = @email AND mail_type = 'ACCOUNT_LOCKED'",
+      { email }
+    )).recordset[0].n;
+    const before = await lockMails();
+
+    for (let i = 0; i < MAX_FAILURES - 1; i++) await freshLogin(email, WRONG);
+    assert.equal(await lockMails(), before, "no mail before the account is actually locked");
+
+    await freshLogin(email, WRONG);
+    assert.equal(await lockMails(), before + 1, "the failure that locks the account sends one alert");
+
+    // Further wrong guesses extend the lock but must not flood the inbox.
+    for (let i = 0; i < 3; i++) await freshLogin(email, WRONG);
+    assert.equal(await lockMails(), before + 1);
+  });
+
   it("an expired lock lets the account back in on its own", async () => {
     const email = ctx.testEmail("approver2");
     await query(

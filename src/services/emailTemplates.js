@@ -1179,8 +1179,70 @@ function buildPersonalTodoReminderEmail({ greetingName, items }) {
   };
 }
 
+// Security alert to the OWNER of an account that has just been locked by
+// repeated wrong passwords. It goes to the address on file, never anywhere the
+// login form could steer it, and it only ever says what already happened —
+// nothing in it unlocks the account, so a guesser who triggers it gains nothing.
+// `lockedUntil` is a Thai wall-clock Date (its UTC fields are the Thai clock).
+function buildAccountLockedEmail({ greetingName, lockedUntil, lockMinutes, failures, ip, userAgent }) {
+  const until = lockedUntil instanceof Date ? lockedUntil : new Date(lockedUntil);
+  const hasUntil = !Number.isNaN(until.getTime());
+  const hm = hasUntil
+    ? `${String(until.getUTCHours()).padStart(2, "0")}:${String(until.getUTCMinutes()).padStart(2, "0")} น.`
+    : null;
+  const untilText = hasUntil ? `${hm} · ${formatThaiDate(until)}` : `${lockMinutes} นาที`;
+  const device = `${userAgent || ""}`.trim().slice(0, 200);
+
+  let rows = "";
+  rows += kvRow("จำนวนครั้งที่ผิด", `<strong style="color:${INK};">${esc(failures)} ครั้งติดต่อกัน</strong>`);
+  rows += kvRow("ล็อกถึง", `<strong style="color:${INK};">${esc(untilText)}</strong>`
+    + ` <span style="color:${FAINT};font-size:12px;">· ${esc(lockMinutes)} นาที</span>`);
+  rows += kvRow("IP ที่พยายามเข้าสู่ระบบ", esc(ip || "-"));
+  if (device) rows += kvRow("อุปกรณ์ / เบราว์เซอร์", esc(device));
+
+  const base = (env.frontendOrigin || "").replace(/\/+$/, "");
+  const headline = "บัญชีของคุณถูกล็อกชั่วคราว";
+  const opts = {
+    sectionName: "Account security",
+    requestNo: "แจ้งเตือนความปลอดภัย",
+    accent: ACCENTS.red,
+    pillText: "ความปลอดภัยบัญชี · Account locked",
+    headline,
+    greetingName,
+    paragraphs: [
+      `มีการกรอกรหัสผ่านผิด <strong>${esc(failures)} ครั้งติดต่อกัน</strong> สำหรับบัญชีของคุณ `
+      + `ระบบจึงล็อกการเข้าสู่ระบบไว้ชั่วคราว <strong>${esc(lockMinutes)} นาที</strong> เพื่อป้องกันการเดารหัสผ่าน`,
+      `<strong>ถ้าเป็นคุณเอง</strong> — รอจนครบเวลาแล้วเข้าสู่ระบบใหม่ได้ตามปกติ หรือติดต่อผู้ดูแลระบบเพื่อปลดล็อกทันที`,
+      `<strong>ถ้าไม่ใช่คุณ</strong> — อาจมีผู้อื่นพยายามเข้าบัญชีของคุณ กรุณาเปลี่ยนรหัสผ่านทันทีหลังปลดล็อก `
+      + `และแจ้งผู้ดูแลระบบพร้อมข้อมูลด้านล่าง`
+    ],
+    extraHtml: detailCard("รายละเอียดการล็อก", "การเข้าสู่ระบบล้มเหลวหลายครั้ง", rows),
+    primary: base ? { label: "ไปที่หน้าเข้าสู่ระบบ →", url: `${base}/` } : null,
+    footerNote: "คุณได้รับอีเมลนี้เพราะบัญชีของคุณถูกล็อกจากการกรอกรหัสผ่านผิดหลายครั้ง"
+  };
+  return {
+    subject: `⚠️ บัญชีของคุณถูกล็อกชั่วคราว ${lockMinutes} นาที · Request & Planning`,
+    html: renderEmail(opts),
+    text: renderText({
+      ...opts,
+      plainParagraphs: [
+        `มีการกรอกรหัสผ่านผิด ${failures} ครั้งติดต่อกัน ระบบจึงล็อกบัญชีไว้ชั่วคราว ${lockMinutes} นาที`,
+        "ถ้าเป็นคุณเอง รอจนครบเวลาแล้วเข้าสู่ระบบใหม่ หรือติดต่อผู้ดูแลระบบเพื่อปลดล็อก",
+        "ถ้าไม่ใช่คุณ กรุณาเปลี่ยนรหัสผ่านทันทีหลังปลดล็อก และแจ้งผู้ดูแลระบบ"
+      ],
+      plainRows: [
+        ["ล็อกถึง", untilText],
+        ["IP", ip || "-"],
+        ["อุปกรณ์", device || "-"]
+      ]
+    }),
+    type: "ACCOUNT_LOCKED"
+  };
+}
+
 module.exports = {
   buildDeeplink,
+  buildAccountLockedEmail,
   loadRequestContext,
   buildRequesterCreatedEmail,
   buildApproverEmail,

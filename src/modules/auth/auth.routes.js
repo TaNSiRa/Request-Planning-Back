@@ -17,6 +17,9 @@ const { POLICY_VERSION, hasCurrentConsent } = require("../../services/pdpa");
 const {
   MAX_FAILURES, LOCK_MINUTES, lockedUntil, recordFailure, recordSuccess
 } = require("../../services/loginLockout");
+const { sendMail } = require("../../services/mailService");
+const { buildAccountLockedEmail } = require("../../services/emailTemplates");
+const { mailSectionFor } = require("../../services/personalTodoReminderService");
 const { planFromUserRow } = require("../../services/reminderPlan");
 const { thaiWallNow } = require("../../services/thaiTime");
 const { env } = require("../../config/env");
@@ -134,6 +137,11 @@ router.post("/login", loginLimiter, asyncHandler(async (req, res) => {
           ip: req.ip,
           userAgent: req.headers["user-agent"]
         });
+        // Tell the owner — but only when THIS failure is the one that closed
+        // the account. Every further wrong guess while it is locked pushes the
+        // lock out again and reports locked too; mailing on each of those would
+        // let anyone flood a person's inbox just by typing their address.
+        if (!locked) await notifyAccountLocked(user, state.until, req);
       }
     }
     noteIfExhausted(req);
@@ -432,6 +440,39 @@ async function findActiveUserById(id) {
     { id }
   );
   return result.recordset[0] || null;
+}
+
+// Security alert to the locked account's own address. Best effort: the sign-in
+// has already been refused and audited, so a missing address, a mail switch
+// that is off, or an SMTP outage must never turn that 401 into a 500.
+// The account belongs to no single section, so — like personal reminders — the
+// mail is filed against the first section of theirs with email switched on;
+// none means sendMail records it in the outbox as 'disabled' and sends nothing.
+async function notifyAccountLocked(user, until, req) {
+  const to = `${user.email || ""}`.trim();
+  if (!to) return;
+  try {
+    const mail = buildAccountLockedEmail({
+      greetingName: user.display_name || user.full_name || to,
+      lockedUntil: until,
+      lockMinutes: LOCK_MINUTES,
+      failures: MAX_FAILURES,
+      ip: req.ip,
+      userAgent: req.headers["user-agent"]
+    });
+    await sendMail({
+      to,
+      subject: mail.subject,
+      html: mail.html,
+      text: mail.text,
+      requestId: null,
+      sectionId: await mailSectionFor(user.id),
+      type: mail.type
+    });
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error(`[auth] account-locked mail for user ${user.id} failed: ${err.message}`);
+  }
 }
 
 async function findActiveUserByIdentifier(identifier) {
