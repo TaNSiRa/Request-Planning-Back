@@ -24,6 +24,7 @@ const skillMatrixRoutes = require("./modules/skillmatrix/skillmatrix.routes");
 const orgChartRoutes = require("./modules/orgchart/orgchart.routes");
 const weeklyPlanRoutes = require("./modules/weeklyplan/weeklyplan.routes");
 const personalTodoRoutes = require("./modules/personaltodo/personaltodo.routes");
+const otRoutes = require("./modules/ot/ot.routes");
 const healthRoutes = require("./modules/health/health.routes");
 
 function createApp() {
@@ -134,7 +135,8 @@ function createApp() {
     ["/api/skill-matrix", skillMatrixRoutes],
     ["/api/org-chart", orgChartRoutes],
     ["/api/weekly-plan", weeklyPlanRoutes],
-    ["/api/personal-todo", personalTodoRoutes]
+    ["/api/personal-todo", personalTodoRoutes],
+    ["/api/ot", otRoutes]
   ];
   for (const [path, router] of guarded) app.use(path, requireAuth, requirePdpaConsent, router);
 
