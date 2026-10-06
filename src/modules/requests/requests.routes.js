@@ -1020,8 +1020,10 @@ router.post("/:id/complete-work", audit("COMPLETE_WORK", "REQUEST"), asyncHandle
   res.json({ ok: true });
 }));
 
-// Toggle a request between IN_PROGRESS and ON_HOLD. The assigned incharge or an
-// admin may pause/resume work; in Meeting mode (?meeting=1) any section member may.
+// Toggle a request between IN_PROGRESS and ON_HOLD. The assigned incharge, a
+// section admin of this section or a system admin may pause/resume work; in
+// Meeting mode (?meeting=1) any section member may. Each toggle lands in
+// request_detail_edits so the "Edit history" popup shows who did it.
 router.post("/:id/hold", audit("HOLD", "REQUEST"), asyncHandler(async (req, res) => {
   const id = Number(req.params.id);
   const request = (await query(
@@ -1031,14 +1033,22 @@ router.post("/:id/hold", audit("HOLD", "REQUEST"), asyncHandler(async (req, res)
   if (!request) return res.status(404).json({ message: "Request not found" });
   const isIncharge = request.incharge_user_id === req.user.id;
   const fromMeeting = req.query.meeting === "1";
-  if (!isIncharge && !req.sectionAccess?.isAdmin && !fromMeeting) {
-    return res.status(403).json({ message: "Only the assigned incharge can hold this request" });
+  const isAdminHere = isAdmin(req.user) || req.sectionAccess?.isSectionAdmin === true;
+  if (!isIncharge && !isAdminHere && !fromMeeting) {
+    return res.status(403).json({
+      message: "Only the assigned incharge, a section admin, or a system admin can hold this request"
+    });
   }
   if (request.status !== "IN_PROGRESS" && request.status !== "ON_HOLD") {
     return res.status(400).json({ message: "Only in-progress requests can be put on hold" });
   }
   const next = request.status === "ON_HOLD" ? "IN_PROGRESS" : "ON_HOLD";
   await query("UPDATE requests SET status=@next, updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id=@id", { id, next });
+  await query(
+    `INSERT INTO request_detail_edits (request_id, edited_by, field, old_value, new_value, edited_at)
+     VALUES (@id, @userId, 'status', @oldStatus, @next, DATEADD(HOUR, 7, SYSUTCDATETIME()))`,
+    { id, userId: req.user.id, oldStatus: request.status, next }
+  );
   await notifyRequestParticipants(
     id,
     next,

@@ -314,6 +314,29 @@ describe("reassignment: PATCH /requests/:id/assignment", () => {
     assert.equal(statusEdit.edited_by, sectionAdminId);
   });
 
+  it("lets a system admin and this section's admin hold/resume, and records who did", async () => {
+    const id = await inProgressRequest();
+    const userId = async name => (await query(
+      "SELECT id FROM users WHERE email=@email", { email: ctx.testEmail(name) }
+    )).recordset[0].id;
+
+    assert.equal((await othersectionadmin.post(`/api/requests/${id}/hold`).send({})).status, 403);
+
+    const hold = await sectionadmin.post(`/api/requests/${id}/hold`).send({});
+    assert.equal(hold.status, 200, JSON.stringify(hold.body));
+    const resume = await sysadmin.post(`/api/requests/${id}/hold`).send({});
+    assert.equal(resume.status, 200, JSON.stringify(resume.body));
+
+    const detail = await getRequest(requester, id);
+    assert.equal(detail.status, "IN_PROGRESS");
+    // Newest first: the resume, then the hold.
+    const [resumed, held] = detail.detailEdits.filter(e => e.field === "status");
+    assert.deepEqual([held.old_value, held.new_value, held.edited_by],
+      ["IN_PROGRESS", "ON_HOLD", await userId("sectionadmin")]);
+    assert.deepEqual([resumed.old_value, resumed.new_value, resumed.edited_by],
+      ["ON_HOLD", "IN_PROGRESS", await userId("sysadmin")]);
+  });
+
   it("lets a co-approver on the last step reassign too", async () => {
     await query(
       `IF NOT EXISTS (SELECT 1 FROM approval_route_step_approvers WHERE step_id=@stepId AND user_id=@userId)
