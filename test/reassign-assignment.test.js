@@ -294,6 +294,26 @@ describe("reassignment: PATCH /requests/:id/assignment", () => {
     assert.equal(denied.status, 403);
   });
 
+  it("lets this section's admin cancel someone else's request, and records who did", async () => {
+    const id = await inProgressRequest();
+    const sectionAdminId = (await query(
+      "SELECT id FROM users WHERE email=@email", { email: ctx.testEmail("sectionadmin") }
+    )).recordset[0].id;
+
+    // Not the requester, not an admin of this section, not just the incharge.
+    assert.equal((await othersectionadmin.patch(`/api/requests/${id}/cancel`).send({})).status, 403);
+    assert.equal((await incharge.patch(`/api/requests/${id}/cancel`).send({})).status, 403);
+
+    const res = await sectionadmin.patch(`/api/requests/${id}/cancel`).send({});
+    assert.equal(res.status, 200, JSON.stringify(res.body));
+    const detail = await getRequest(requester, id);
+    assert.equal(detail.status, "CANCELLED");
+    const statusEdit = detail.detailEdits.find(e => e.field === "status");
+    assert.equal(statusEdit.old_value, "IN_PROGRESS");
+    assert.equal(statusEdit.new_value, "CANCELLED");
+    assert.equal(statusEdit.edited_by, sectionAdminId);
+  });
+
   it("lets a co-approver on the last step reassign too", async () => {
     await query(
       `IF NOT EXISTS (SELECT 1 FROM approval_route_step_approvers WHERE step_id=@stepId AND user_id=@userId)

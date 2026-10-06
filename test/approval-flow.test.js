@@ -191,6 +191,15 @@ describe("request approval flow", () => {
     assert.equal(detail.status, "CANCELLED");
     // Cancelling clears the pending step from the approver's inbox.
     assert.equal(await pendingStepFor(approver1, id), null);
+    // Who cancelled it is on the edit history.
+    const statusEdit = detail.detailEdits.find(e => e.field === "status");
+    assert.equal(statusEdit.old_value, "PENDING_APPROVAL");
+    assert.equal(statusEdit.new_value, "CANCELLED");
+    assert.equal(statusEdit.edited_by, fixture.users.requester);
+    assert.equal(detail.detailEdits.find(e => e.field === "cancel_reason").new_value, "changed my mind");
+
+    // A closed request cannot be cancelled again.
+    assert.equal((await requester.patch(`/api/requests/${id}/cancel`).send({})).status, 400);
   });
 
   // PATCH /requests/:id/details — the requester, or an approver on the request's

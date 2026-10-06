@@ -479,13 +479,30 @@ router.patch("/:id/cancel", audit("CANCEL", "REQUEST"), asyncHandler(async (req,
     sectionId: req.section.id
   })).recordset[0];
   if (!row) return res.status(404).json({ message: "Request not found" });
-  if (row.requester_user_id !== req.user.id && !isAdmin(req.user)) {
-    return res.status(403).json({ message: "Only requester can cancel this request" });
+  // The requester who raised it, a section admin of this section, or a system admin.
+  if (row.requester_user_id !== req.user.id && !isAdmin(req.user) && req.sectionAccess?.isSectionAdmin !== true) {
+    return res.status(403).json({
+      message: "Only the requester, a section admin, or a system admin can cancel this request"
+    });
   }
+  if (["COMPLETED", "CANCELLED", "REJECTED"].includes(row.status)) {
+    return res.status(400).json({ message: "This request is already closed and cannot be cancelled" });
+  }
+  const reason = typeof req.body.reason === "string" && req.body.reason.trim() ? req.body.reason.trim() : null;
   await query("UPDATE requests SET status='CANCELLED', cancel_reason=@reason, cancelled_at=DATEADD(HOUR, 7, SYSUTCDATETIME()), updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME()) WHERE id=@id", {
     id,
-    reason: req.body.reason || null
+    reason
   });
+  // Who cancelled it goes on the request's "Edit history" — the requester is not
+  // the only one who can, so the trail has to say which of them did. One
+  // statement, so both rows share an edited_at and the popup shows one entry.
+  await query(
+    `INSERT INTO request_detail_edits (request_id, edited_by, field, old_value, new_value, edited_at)
+     VALUES ${reason
+       ? "(@id, @userId, 'status', @oldStatus, 'CANCELLED', DATEADD(HOUR, 7, SYSUTCDATETIME())), (@id, @userId, 'cancel_reason', NULL, @reason, DATEADD(HOUR, 7, SYSUTCDATETIME()))"
+       : "(@id, @userId, 'status', @oldStatus, 'CANCELLED', DATEADD(HOUR, 7, SYSUTCDATETIME()))"}`,
+    { id, userId: req.user.id, oldStatus: row.status, reason }
+  );
   // Clear anything that was still waiting on this request so it doesn't linger in
   // approvers' inboxes: pending/waiting approval steps and any open schedule
   // extension request + its approval steps.
