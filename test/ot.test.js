@@ -44,7 +44,10 @@ describe("personal OT log", () => {
     assert.equal(list.body.entries.length, 1);
     assert.deepEqual(
       { ...list.body.entries[0] },
-      { date: "2026-10-05", startTime: "18:00", endTime: "19:00", reason: "Retest", signMode: "ESIGN", minutes: 60 }
+      {
+        date: "2026-10-05", startTime: "18:00", endTime: "19:00", reason: "Retest", signMode: "ESIGN",
+        otType: "NORMAL", holiday: false, minutes: 60
+      }
     );
 
     const del = await s.del("/api/ot/2026-10-05");
@@ -57,6 +60,20 @@ describe("personal OT log", () => {
     const s = await ctx.login(app, "member");
     const res = await s.put("/api/ot/2026-10-06").send({ startTime: "22:00", endTime: "01:30", reason: "Night shutdown" });
     assert.equal(res.body.entry.minutes, 210);
+  });
+
+  it("takes breaks off a normal OT, not a special one, and counts holidays in half hours", async () => {
+    const s = await ctx.login(app, "coapprover");
+    // Sat 10 Oct 2026 — known as a holiday from the weekday alone.
+    const sat = await s.put("/api/ot/2026-10-10").send({ startTime: "08:31", endTime: "13:00", reason: "Install" });
+    assert.equal(sat.body.entry.holiday, true);
+    assert.equal(sat.body.entry.minutes, 180); // 09:00-13:00 less 10:00-10:10 and 12:00-12:50
+    const special = await s.put("/api/ot/2026-10-10")
+      .send({ startTime: "08:31", endTime: "13:00", reason: "Install", otType: "SPECIAL" });
+    assert.equal(special.body.entry.minutes, 269); // as worked: 08:31-13:00
+    // A weekday the calendar marked as a company holiday.
+    const hol = await s.put("/api/ot/2026-10-13").send({ startTime: "08:30", endTime: "11:00", reason: "x", holiday: true });
+    assert.equal(hol.body.entry.minutes, 140);
   });
 
   it("rejects bad input", async () => {

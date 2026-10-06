@@ -5,6 +5,7 @@ const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
 const { buildOtWorkbook, findSignature, ensureSignatureDir } = require("../../services/otExport");
 const { resolveSection } = require("../../services/sectionService");
+const { countOt } = require("../../services/otHours");
 
 // Personal OT log behind the Personal calendar page. Like the personal to-do
 // board it belongs to the person, not a section: every route works on the
@@ -26,34 +27,30 @@ function isYmd(value) {
 
 const hm = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, "Time must be HH:mm");
 
-function minutesOf(value) {
-  const [h, m] = value.split(":").map(Number);
-  return h * 60 + m;
-}
-
-// An end at or before the start runs past midnight into the next day.
-function durationMinutes(start, end) {
-  return (minutesOf(end) - minutesOf(start) + 1440) % 1440;
-}
+const OT_COLUMNS = "ot_date, start_time, end_time, reason, sign_mode, ot_type, is_holiday";
 
 function toEntry(row) {
+  const otType = row.ot_type === "SPECIAL" ? "SPECIAL" : "NORMAL";
+  const holiday = row.is_holiday === true || row.is_holiday === 1;
   return {
     date: row.ot_date,
     startTime: row.start_time,
     endTime: row.end_time,
     reason: row.reason,
     signMode: row.sign_mode,
-    minutes: durationMinutes(row.start_time, row.end_time)
+    otType,
+    holiday,
+    minutes: countOt(row.start_time, row.end_time, { holiday, special: otType === "SPECIAL" }).minutes
   };
 }
 
-// Until patch_personal_ot.sql is applied the table is missing (SQL error 208);
-// say so plainly instead of a generic 500.
+// Until patch_personal_ot.sql is applied the table (SQL error 208) or its later
+// columns (207) are missing; say so plainly instead of a generic 500.
 async function otQuery(text, params) {
   try {
     return await query(text, params);
   } catch (err) {
-    if (err?.number === 208) {
+    if (err?.number === 208 || err?.number === 207) {
       const e = new Error("OT is not set up on this server yet (database patch_personal_ot.sql)");
       e.status = 503;
       throw e;
@@ -75,7 +72,7 @@ router.get("/", asyncHandler(async (req, res) => {
   const { from, to } = req.query;
   if (!isYmd(from) || !isYmd(to)) return res.status(400).json({ message: "from/to must be YYYY-MM-DD" });
   const rows = (await otQuery(
-    `SELECT ot_date, start_time, end_time, reason, sign_mode FROM personal_ot
+    `SELECT ${OT_COLUMNS} FROM personal_ot
      WHERE user_id=@userId AND ot_date BETWEEN @from AND @to ORDER BY ot_date`,
     { userId: req.user.id, from, to }
   )).recordset;
@@ -96,30 +93,37 @@ router.put("/:date", asyncHandler(async (req, res) => {
     startTime: hm,
     endTime: hm,
     reason: z.string().trim().min(1, "Reason is required").max(200),
-    signMode: z.enum(["SELF", "ESIGN"]).optional().default("SELF")
+    signMode: z.enum(["SELF", "ESIGN"]).optional().default("SELF"),
+    otType: z.enum(["NORMAL", "SPECIAL"]).optional().default("NORMAL"),
+    // Sat / Sun / company holiday, as the calendar saw the day. Without it only
+    // a weekend is known to be one.
+    holiday: z.boolean().optional()
   }).parse(req.body);
+  const weekday = new Date(`${date}T00:00:00Z`).getUTCDay();
+  const holiday = input.holiday ?? (weekday === 0 || weekday === 6);
   if (input.startTime === input.endTime) {
     return res.status(400).json({ message: "Start and end time can't be the same" });
   }
-  const params = { userId: req.user.id, date, ...input };
+  const params = { userId: req.user.id, date, ...input, holiday };
   const updated = await otQuery(
     `UPDATE personal_ot
      SET start_time=@startTime, end_time=@endTime, reason=@reason, sign_mode=@signMode,
+         ot_type=@otType, is_holiday=@holiday,
          updated_at=DATEADD(HOUR, 7, SYSUTCDATETIME())
      WHERE user_id=@userId AND ot_date=@date`,
     params
   );
   if (!updated.rowsAffected[0]) {
     await otQuery(
-      `INSERT INTO personal_ot (user_id, ot_date, start_time, end_time, reason, sign_mode)
-       VALUES (@userId, @date, @startTime, @endTime, @reason, @signMode)`,
+      `INSERT INTO personal_ot (user_id, ot_date, start_time, end_time, reason, sign_mode, ot_type, is_holiday)
+       VALUES (@userId, @date, @startTime, @endTime, @reason, @signMode, @otType, @holiday)`,
       params
     );
   }
   res.json({
     entry: toEntry({
       ot_date: date, start_time: input.startTime, end_time: input.endTime,
-      reason: input.reason, sign_mode: input.signMode
+      reason: input.reason, sign_mode: input.signMode, ot_type: input.otType, is_holiday: holiday
     })
   });
 }));
@@ -179,7 +183,7 @@ async function loadDepartmentOt(req, res) {
     }))
     .sort((a, b) => a.employeeNo.localeCompare(b.employeeNo, undefined, { numeric: true }));
   const rows = (await otQuery(
-    `SELECT r.employee_no, o.ot_date, o.start_time, o.end_time, o.reason, o.sign_mode
+    `SELECT r.employee_no, o.ot_date, o.start_time, o.end_time, o.reason, o.sign_mode, o.ot_type, o.is_holiday
      FROM personal_ot o
      JOIN (${ROSTER_SQL}) r ON r.id = o.user_id
      WHERE o.ot_date BETWEEN @from AND @to
