@@ -5,7 +5,6 @@ const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
 const { buildOffsiteWorkbook } = require("../../services/offsiteExport");
 const { findSignature, ensureSignatureDir } = require("../../services/xlsxKit");
-const { xlsxToPdf } = require("../../services/pdfConvert");
 
 // Personal off-site work log ("ทำงานนอกสถานที่") behind the Personal calendar
 // page, and the person's own monthly Clocking In-Out Confirmation form. Like
@@ -47,6 +46,7 @@ async function offsiteQuery(text, params) {
     if (err?.number === 208) {
       const e = new Error("Off-site work is not set up on this server yet (database patch_personal_offsite.sql)");
       e.status = 503;
+      e.publicMessage = true;
       throw e;
     }
     throw err;
@@ -121,14 +121,13 @@ router.delete("/:date", asyncHandler(async (req, res) => {
   res.json({ ok: true });
 }));
 
-// GET /api/offsite/export?month=YYYY-MM&sign=SELF|ESIGN&format=xlsx|pdf — the
+// GET /api/offsite/export?month=YYYY-MM&sign=SELF|ESIGN — the
 // caller's Clocking In-Out Confirmation form for the month: one line per
 // off-site day, signed with their e-signature or left for signing by hand.
 router.get("/export", asyncHandler(async (req, res) => {
   const m = /^(\d{4})-(\d{2})$/.exec(`${req.query.month ?? ""}`);
   const month = m ? Number(m[2]) : NaN;
   if (!m || month < 1 || month > 12) return res.status(400).json({ message: "month must be YYYY-MM" });
-  const pdf = req.query.format === "pdf";
   const ym = `${m[1]}-${m[2]}`;
   const rows = (await offsiteQuery(
     `SELECT ${COLUMNS} FROM personal_offsite
@@ -144,14 +143,9 @@ router.get("/export", asyncHandler(async (req, res) => {
     signature: req.query.sign === "ESIGN" ? findSignature(employeeNo) : null,
     exportedBy: fullName
   });
-  // e.g. "Off-site October 2026 1650574 Sirawit Kaewchoo.pdf"
+  // e.g. "Off-site October 2026 1650574 Sirawit Kaewchoo.xlsx"
   const name = ["Off-site", MONTH_NAMES[month - 1], m[1], employeeNo, fullName]
     .filter(v => `${v}`.trim() !== "").join(" ");
-  if (pdf) {
-    const buffer = await xlsxToPdf(xlsx);
-    res.header("Content-Type", "application/pdf");
-    return res.attachment(`${name}.pdf`).send(buffer);
-  }
   res.header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
   res.attachment(`${name}.xlsx`).send(xlsx);
 }));

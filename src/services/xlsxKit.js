@@ -73,9 +73,11 @@ function xmlEscape(value) {
     .replace(/"/g, "&quot;");
 }
 
+// An error whose message is meant for the user (see errorHandler.js).
 function httpError(status, message) {
   const err = new Error(message);
   err.status = status;
+  err.publicMessage = true;
   return err;
 }
 

@@ -7,7 +7,6 @@ const { buildOtWorkbook } = require("../../services/otExport");
 const { findSignature, ensureSignatureDir } = require("../../services/xlsxKit");
 const { resolveSection } = require("../../services/sectionService");
 const { countOt } = require("../../services/otHours");
-const { xlsxToPdf } = require("../../services/pdfConvert");
 
 // Personal OT log behind the Personal calendar page. Like the personal to-do
 // board it belongs to the person, not a section: every route works on the
@@ -55,6 +54,7 @@ async function otQuery(text, params) {
     if (err?.number === 208 || err?.number === 207) {
       const e = new Error("OT is not set up on this server yet (database patch_personal_ot.sql)");
       e.status = 503;
+      e.publicMessage = true;
       throw e;
     }
     throw err;
@@ -227,7 +227,6 @@ router.get("/export-people", resolveSection, asyncHandler(async (req, res) => {
 // anyone on the roster has OT, each listing the whole roster with that day's
 // OT filled in. esign, when given, is the exporter's per-person choice: the
 // listed employee numbers get their e-signature, everyone else signs by hand.
-// format=pdf returns the same form as a PDF (needs Excel on the server).
 router.get(["/export", "/export.xlsx"], resolveSection, asyncHandler(async (req, res) => {
   const data = await loadDepartmentOt(req, res);
   if (!data) return;
@@ -246,11 +245,6 @@ router.get(["/export", "/export.xlsx"], resolveSection, asyncHandler(async (req,
   });
   // e.g. "OT October 2026.xlsx"
   const name = `OT ${MONTH_NAMES[data.month - 1]} ${data.year}`;
-  if (req.query.format === "pdf") {
-    const pdf = await xlsxToPdf(buffer);
-    res.header("Content-Type", "application/pdf");
-    return res.attachment(`${name}.pdf`).send(pdf);
-  }
   res.header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
   res.attachment(`${name}.xlsx`).send(buffer);
 }));

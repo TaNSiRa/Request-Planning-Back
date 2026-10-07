@@ -21,7 +21,11 @@ function errorHandler(err, req, res, next) {
   // raw parser text ("Expected property name or '}' in JSON at position 1"),
   // which is noise to the user and detail we would rather not echo. Those carry
   // `expose`; ours never do, so that flag is what separates the two.
-  const isIntentional = status >= 400 && status < 500 && err.expose !== true;
+  //
+  // A 5xx we raise on purpose ("PDF export isn't available on this server",
+  // "OT is not set up on this server yet") marks itself `publicMessage`: its
+  // text is written for the user and says what to do, so it passes too.
+  const isIntentional = (status >= 400 && status < 500 && err.expose !== true) || err.publicMessage === true;
   res.status(status).json({
     message: isIntentional && err.message ? err.message : messageFor(status)
   });
