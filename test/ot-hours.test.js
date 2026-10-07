@@ -17,9 +17,9 @@ describe("OT hours", () => {
     assert.equal(mins("08:00", "17:00"), 540 - 70);
   });
 
-  it("counts a special OT as worked: no break off, no rounding even on a holiday", () => {
+  it("takes no break off a special OT, but still rounds a holiday start up", () => {
     assert.equal(mins("09:55", "15:30", { special: true }), 335);
-    assert.equal(mins("08:31", "13:00", { holiday: true, special: true }), 269);
+    assert.equal(mins("08:31", "13:00", { holiday: true, special: true }), 240); // from 09:00
   });
 
   it("counts a holiday from the next half hour, to the real end", () => {

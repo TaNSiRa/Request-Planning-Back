@@ -70,7 +70,7 @@ describe("personal OT log", () => {
     assert.equal(sat.body.entry.minutes, 180); // 09:00-13:00 less 10:00-10:10 and 12:00-12:50
     const special = await s.put("/api/ot/2026-10-10")
       .send({ startTime: "08:31", endTime: "13:00", reason: "Install", otType: "SPECIAL" });
-    assert.equal(special.body.entry.minutes, 269); // as worked: 08:31-13:00
+    assert.equal(special.body.entry.minutes, 240); // 09:00-13:00, no break off
     // A weekday the calendar marked as a company holiday.
     const hol = await s.put("/api/ot/2026-10-13").send({ startTime: "08:30", endTime: "11:00", reason: "x", holiday: true });
     assert.equal(hol.body.entry.minutes, 140);

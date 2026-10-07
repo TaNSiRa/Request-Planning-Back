@@ -3,9 +3,11 @@ const { z } = require("zod");
 const { query } = require("../../db/pool");
 const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
-const { buildOtWorkbook, findSignature, ensureSignatureDir } = require("../../services/otExport");
+const { buildOtWorkbook } = require("../../services/otExport");
+const { findSignature, ensureSignatureDir } = require("../../services/xlsxKit");
 const { resolveSection } = require("../../services/sectionService");
 const { countOt } = require("../../services/otHours");
+const { xlsxToPdf } = require("../../services/pdfConvert");
 
 // Personal OT log behind the Personal calendar page. Like the personal to-do
 // board it belongs to the person, not a section: every route works on the
@@ -225,7 +227,8 @@ router.get("/export-people", resolveSection, asyncHandler(async (req, res) => {
 // anyone on the roster has OT, each listing the whole roster with that day's
 // OT filled in. esign, when given, is the exporter's per-person choice: the
 // listed employee numbers get their e-signature, everyone else signs by hand.
-router.get("/export.xlsx", resolveSection, asyncHandler(async (req, res) => {
+// format=pdf returns the same form as a PDF (needs Excel on the server).
+router.get(["/export", "/export.xlsx"], resolveSection, asyncHandler(async (req, res) => {
   const data = await loadDepartmentOt(req, res);
   if (!data) return;
   let { entries } = data;
@@ -241,9 +244,15 @@ router.get("/export.xlsx", resolveSection, asyncHandler(async (req, res) => {
     people: data.people,
     entries
   });
-  res.header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
   // e.g. "OT October 2026.xlsx"
-  res.attachment(`OT ${MONTH_NAMES[data.month - 1]} ${data.year}.xlsx`).send(buffer);
+  const name = `OT ${MONTH_NAMES[data.month - 1]} ${data.year}`;
+  if (req.query.format === "pdf") {
+    const pdf = await xlsxToPdf(buffer);
+    res.header("Content-Type", "application/pdf");
+    return res.attachment(`${name}.pdf`).send(pdf);
+  }
+  res.header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+  res.attachment(`${name}.xlsx`).send(buffer);
 }));
 
 module.exports = router;
