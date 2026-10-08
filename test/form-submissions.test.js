@@ -90,6 +90,17 @@ describe("form submissions", () => {
     assert.equal((await member.get("/api/form-submissions/settings")).body.canSubmit, true);
   });
 
+  it("flags the section for its form approvers, so they reach the inbox", async () => {
+    const flag = async name => {
+      const s = await ctx.login(app, name);
+      const res = await s.get("/api/auth/sections");
+      return res.body.data.find(x => x.id === fixture.sectionId)?.isFormApprover;
+    };
+    assert.equal(await flag("approver1"), true); // Chief + Department Mgr.
+    assert.equal(await flag("approver2"), true); // Manager
+    assert.equal(await flag("member"), false); // only a document custodian
+  });
+
   it("previews the month and sends both forms, mailing the first approvers", async () => {
     const requester = await ctx.login(app, "requester");
     const approver2 = await ctx.login(app, "approver2");
@@ -187,12 +198,47 @@ describe("form submissions", () => {
     const res = await approver1.get(`/api/form-submissions/${item.submissionId}/download`).buffer(true)
       .parse((r, cb) => { const c = []; r.on("data", d => c.push(d)); r.on("end", () => cb(null, Buffer.concat(c))); });
     assert.equal(res.headers["content-type"], "application/zip");
+    // The same forms for the inbox's in-app preview, as data URLs.
+    const preview = await approver1.get(`/api/form-submissions/${item.submissionId}/files`);
+    assert.equal(preview.status, 200);
+    assert.equal(preview.body.files.length, 2);
+    assert.match(preview.body.files[0].fileName, /^Off-site November 2026 /);
+    assert.ok(preview.body.files[0].dataUrl.startsWith("data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,UEsDB"));
     const files = new AdmZip(res.body).getEntries();
     assert.equal(files.length, 2);
     const form = new AdmZip(files[0].getData()).readAsText("xl/drawings/drawing1.xml");
     // Department Mgr. signature + its date (no employee e-sign was chosen this time).
     assert.equal([...form.matchAll(/name="E-Signature \d+"/g)].length, 1);
     assert.equal([...form.matchAll(/name="E-Sign Date \d+"/g)].length, 1);
+  });
+
+  it("puts the month's approver signatures into a plain export too", async () => {
+    const requester = await ctx.login(app, "requester");
+    const drawingOf = async url => {
+      const res = await requester.get(url).buffer(true)
+        .parse((r, cb) => { const c = []; r.on("data", d => c.push(d)); r.on("end", () => cb(null, Buffer.concat(c))); });
+      assert.equal(res.status, 200);
+      const zip = new AdmZip(res.body);
+      return zip.getEntry("xl/drawings/drawing1.xml") ? zip.readAsText("xl/drawings/drawing1.xml") : "";
+    };
+    const count = (xml, name) => [...xml.matchAll(new RegExp(`name="${name} \\d+"`, "g"))].length;
+
+    // November's OT form is approved: Chief/Asst.Mgr. and Manager sign (K, L),
+    // the employee signs by hand this time.
+    const ot = await drawingOf("/api/ot/export.xlsx?month=2026-11&esign=");
+    assert.equal(count(ot, "E-Signature"), 2);
+    for (const col of [10, 11]) assert.match(ot, new RegExp(`<xdr:from><xdr:col>${col}</xdr:col>`));
+
+    // November's off-site form (sent again, then approved): the Department
+    // Mgr.'s signature and date, beside the employee's own.
+    const offsite = await drawingOf("/api/offsite/export?month=2026-11&sign=ESIGN");
+    assert.equal(count(offsite, "E-Signature"), 2);
+    assert.equal(count(offsite, "E-Sign Date"), 2);
+
+    // Another month carries no one's approval.
+    await requester.put("/api/offsite/2026-10-06").send({ startTime: "08:30", endTime: "17:10", place: "Site", reason: "Install" });
+    const october = await drawingOf("/api/offsite/export?month=2026-10&sign=ESIGN");
+    assert.equal(count(october, "E-Signature"), 1);
   });
 
   it("lets someone who is both OT approvers sign once for both", async () => {

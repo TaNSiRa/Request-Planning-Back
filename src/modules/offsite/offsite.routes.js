@@ -6,6 +6,7 @@ const { requireAuth } = require("../../middleware/auth");
 const { buildOffsiteWorkbook } = require("../../services/offsiteExport");
 const { findSignature, ensureSignatureDir } = require("../../services/xlsxKit");
 const { offsiteEntryFromRow } = require("../../services/monthForms");
+const { monthApprovals } = require("../../services/formApprovals");
 
 // Personal off-site work log ("ทำงานนอกสถานที่") behind the Personal calendar
 // page, and the person's own monthly Clocking In-Out Confirmation form. Like
@@ -130,11 +131,18 @@ router.get("/export", asyncHandler(async (req, res) => {
   const me = await loadMe(req.user.id);
   const fullName = `${me.full_name || me.display_name || ""}`.trim();
   const employeeNo = `${me.employee_no ?? ""}`.trim();
+  // Once this month's form has been sent and the Department Mgr. approved it,
+  // their signature and date go in too, as on the file they signed.
+  const sent = employeeNo ? await monthApprovals({ kind: "OFFSITE", ym, employeeNo }) : { approvals: {} };
+  const deptMgr = sent.approvals.DEPT_MGR;
+  const deptMgrImage = deptMgr ? findSignature(deptMgr.employeeNo) : null;
   const xlsx = buildOffsiteWorkbook({
     person: { employeeNo, fullName, department: `${me.section ?? ""}`.trim() },
     entries: rows.map(toEntry),
     signature: req.query.sign === "ESIGN" ? findSignature(employeeNo) : null,
-    exportedBy: fullName
+    signedOn: sent.sentOn || undefined,
+    exportedBy: fullName,
+    deptMgr: deptMgrImage ? { image: deptMgrImage, signedOn: deptMgr.decidedOn } : null
   });
   // e.g. "Off-site October 2026 1650574 Sirawit Kaewchoo.xlsx"
   const name = ["Off-site", MONTH_NAMES[month - 1], m[1], employeeNo, fullName]

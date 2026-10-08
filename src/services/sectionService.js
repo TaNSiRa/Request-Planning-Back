@@ -71,6 +71,7 @@ async function getUserSections(user) {
       isSectionAdminRole: isSectionAdminRole(user) ? 1 : 0
     }
   );
+  const formApproverSections = viewer ? new Set() : await formApproverSectionIds(user.id);
   return result.recordset
     // A viewer only lists sections its overrides let it view.
     .filter(section => !viewer || sectionCanView(overrides, section.id))
@@ -89,11 +90,39 @@ async function getUserSections(user) {
       // Approver on one of the section's OWN routes (not a cross-section stage-1
       // route) — grants section-manager tools like the skill matrix.
       isInternalApprover: viewer ? false : section.is_internal_approver === true || section.is_internal_approver === 1,
+      // An approver of the section's monthly OT / off-site forms (Settings ›
+      // OT & off-site forms) — reaches the Approval Inbox for those even when
+      // on no request route.
+      isFormApprover: formApproverSections.has(section.id),
       // Read-only account flags consumed by the frontend to render read-only UI.
       isViewer: viewer,
       viewerCanEdit: viewer ? sectionCanEdit(overrides, section.id) : false,
       unreadCount: section.unread_count || 0
     }));
+}
+
+// Sections whose OT / off-site form approvers (app_settings 'forms.approvers')
+// include this user, in any of the three approving roles.
+async function formApproverSectionIds(userId) {
+  const ids = new Set();
+  let rows = [];
+  try {
+    rows = (await query(
+      "SELECT section_id, setting_value FROM app_settings WHERE setting_key = 'forms.approvers' AND section_id IS NOT NULL"
+    )).recordset;
+  } catch {
+    return ids;
+  }
+  for (const row of rows) {
+    try {
+      const v = JSON.parse(row.setting_value || "{}") || {};
+      const roles = [v.otChief, v.otManager, v.offsiteDeptMgr].flatMap(list => (Array.isArray(list) ? list : []));
+      if (roles.map(Number).includes(Number(userId))) ids.add(row.section_id);
+    } catch {
+      // A malformed value gives no access.
+    }
+  }
+  return ids;
 }
 
 async function resolveSection(req, res, next) {

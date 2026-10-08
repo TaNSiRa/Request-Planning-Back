@@ -14,6 +14,7 @@ const { getSectionSetting } = require("../../services/settingsService");
 const { findSignature } = require("../../services/xlsxKit");
 const { otUnitFor, loadOtMonth, loadOffsiteMonth, loadSectionWorkers } = require("../../services/monthForms");
 const { buildSubmissionFiles, bundleFiles, monthLabel } = require("../../services/formSubmissionFiles");
+const { approvalsOf, thaiToday } = require("../../services/formApprovals");
 
 // Monthly OT / off-site form submissions (/api/form-submissions).
 //
@@ -64,11 +65,6 @@ async function formsQuery(text, params) {
     }
     throw err;
   }
-}
-
-// Today in Thailand as DD/MM/YYYY — the dates written on the forms.
-function thaiToday() {
-  return new Date().toLocaleDateString("en-GB", { timeZone: "Asia/Bangkok" });
 }
 
 async function loadSettings(sectionId) {
@@ -239,18 +235,6 @@ async function loadSubmission(id) {
   return { ...sub, snapshot: JSON.parse(sub.snapshot_json), steps, senderName: `${sub.sender_name || sub.sender_display || ""}`.trim() };
 }
 
-function approvalsOf(steps) {
-  const out = {};
-  for (const st of steps) {
-    if (st.status !== "APPROVED") continue;
-    out[st.role] = {
-      employeeNo: st.approver_employee_no,
-      decidedOn: st.decided_at ? new Date(st.decided_at).toLocaleDateString("en-GB", { timeZone: "UTC" }) : thaiToday()
-    };
-  }
-  return out;
-}
-
 function filesOf(sub) {
   return buildSubmissionFiles(sub.kind, sub.snapshot, approvalsOf(sub.steps));
 }
@@ -359,13 +343,8 @@ router.post("/submit", audit("SUBMIT", "FORM_SUBMISSION", req => req.section?.id
 
 // ── Approving ───────────────────────────────────────────────────────────────
 
-function seesWholeInbox(req) {
-  return isAdmin(req.user) || req.sectionAccess?.isSectionAdmin === true;
-}
-
-// GET /api/form-submissions/pending — steps waiting for the caller (or, for
-// admins / section admins, every waiting step of the section, view only unless
-// they are a candidate; a global admin may act on any).
+// GET /api/form-submissions/pending — steps waiting for the caller: those it
+// is an approver of (a global admin may act on any, so sees them all).
 router.get("/pending", asyncHandler(async (req, res) => {
   const rows = (await formsQuery(
     `SELECT st.id AS step_id, st.role, st.step_no, s.id AS submission_id, s.kind, s.form_month, s.submitted_at,
@@ -381,8 +360,9 @@ router.get("/pending", asyncHandler(async (req, res) => {
     { sectionId: req.section.id, userId: req.user.id }
   )).recordset;
   const admin = isAdmin(req.user);
-  const whole = seesWholeInbox(req);
-  const data = rows.filter(r => r.is_candidate || whole).map(r => {
+  // Only what the caller can sign: a step's approvers (and a global admin,
+  // who may act on any). Others — section admins included — don't see it.
+  const data = rows.filter(r => r.is_candidate || admin).map(r => {
     const snap = JSON.parse(r.snapshot_json);
     const people = r.kind === "OT"
       ? new Set(snap.ot.entries.map(e => e.employeeNo)).size
@@ -421,6 +401,21 @@ router.get("/:id/download", asyncHandler(async (req, res) => {
     ? "application/zip"
     : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
   res.attachment(bundle.filename).send(bundle.content);
+}));
+
+// GET /api/form-submissions/:id/files — the forms as they stand, as data URLs
+// for the inbox's in-app Excel preview (each also downloadable from there).
+router.get("/:id/files", asyncHandler(async (req, res) => {
+  const sub = await loadSubmission(Number(req.params.id));
+  if (!sub || sub.section_id !== req.section.id) throw httpError(404, "Submission not found");
+  const type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+  res.json({
+    files: filesOf(sub).map(f => ({
+      fileName: f.filename,
+      contentType: type,
+      dataUrl: `data:${type};base64,${f.content.toString("base64")}`
+    }))
+  });
 }));
 
 // The step the caller may act on, or an error.

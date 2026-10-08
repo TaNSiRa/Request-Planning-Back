@@ -7,6 +7,7 @@ const { buildOtWorkbook } = require("../../services/otExport");
 const { findSignature, ensureSignatureDir } = require("../../services/xlsxKit");
 const { resolveSection } = require("../../services/sectionService");
 const { otUnitFor, otEntryFromRow, loadOtMonth } = require("../../services/monthForms");
+const { monthApprovals } = require("../../services/formApprovals");
 
 // Personal OT log behind the Personal calendar page. Like the personal to-do
 // board it belongs to the person, not a section: every route works on the
@@ -174,6 +175,8 @@ router.get("/export-people", resolveSection, asyncHandler(async (req, res) => {
 // anyone on the roster has OT, each listing the whole roster with that day's
 // OT filled in. esign, when given, is the exporter's per-person choice: the
 // listed employee numbers get their e-signature, everyone else signs by hand.
+// Once the month's form has been sent and approved (in part), the approvers'
+// signatures go in too, as on the files they signed.
 router.get(["/export", "/export.xlsx"], resolveSection, asyncHandler(async (req, res) => {
   const data = await loadDepartmentOt(req, res);
   if (!data) return;
@@ -183,12 +186,16 @@ router.get(["/export", "/export.xlsx"], resolveSection, asyncHandler(async (req,
     entries = entries.map(e => ({ ...e, signMode: esign.has(e.employeeNo) ? "ESIGN" : "SELF" }));
   }
   const me = await loadMe(req.user.id);
+  const ym = `${data.year}-${String(data.month).padStart(2, "0")}`;
+  const { approvals } = await monthApprovals({ kind: "OT", ym, sectionId: req.section.id });
+  const signatureOf = role => (approvals[role] ? findSignature(approvals[role].employeeNo) : null);
   const { buffer } = buildOtWorkbook({
     year: data.year,
     month: data.month,
     exportedBy: `${me.full_name || me.display_name || ""}`.trim(),
     people: data.people,
-    entries
+    entries,
+    approvals: { chief: signatureOf("CHIEF"), manager: signatureOf("MANAGER") }
   });
   // e.g. "OT October 2026.xlsx"
   const name = `OT ${MONTH_NAMES[data.month - 1]} ${data.year}`;
