@@ -491,6 +491,33 @@ router.put("/leave-types", requireSectionAdmin,
   res.json({ ok: true, leaveTypes: list });
 }));
 
+// The caller's own saved cells between two dates, as { 'YYYY-MM-DD': text } —
+// one query for a whole year, so the Personal calendar can total a year's leave
+// without fetching every week. Only what was saved: the per-user defaults that
+// GET / seeds into a week are never leave, so they are not needed here.
+router.get("/my-days", asyncHandler(async (req, res) => {
+  const from = weekStartSchema.parse(req.query.from);
+  const to = weekStartSchema.parse(req.query.to);
+  const rows = (await query(
+    `SELECT week_start, ${DAYS.join(", ")} FROM weekly_plan_rows
+     WHERE section_id = @sectionId AND row_type = 'USER' AND user_id = @userId
+       AND week_start BETWEEN DATEADD(DAY, -6, @from) AND @to`,
+    { sectionId: req.section.id, userId: req.user.id, from, to }
+  )).recordset;
+  const days = {};
+  for (const row of rows) {
+    const monday = new Date(row.week_start);
+    DAYS.forEach((col, i) => {
+      const text = `${row[col] ?? ""}`.trim();
+      if (!text) return;
+      const day = new Date(Date.UTC(monday.getUTCFullYear(), monday.getUTCMonth(), monday.getUTCDate() + i))
+        .toISOString().slice(0, 10);
+      if (day >= from && day <= to) days[day] = text;
+    });
+  }
+  res.json({ days });
+}));
+
 // Company holidays (from the external SAR DB) within the given week, so the
 // grid can grey those days. Never fails — returns configured:false if unset.
 router.get("/holidays", asyncHandler(async (req, res) => {

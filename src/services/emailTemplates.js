@@ -1240,7 +1240,85 @@ function buildAccountLockedEmail({ greetingName, lockedUntil, lockMinutes, failu
   };
 }
 
+// Monthly OT / off-site form submission mails (form-submissions routes).
+//   stage "APPROVE"  — to the approvers of the step now waiting, forms attached
+//   stage "APPROVED" — to the sender (cc the section), signed forms attached
+//   stage "REJECTED" — to the sender, with the reason
+// The link opens the approval inbox of the section (?view=forms).
+function buildFormSubmissionEmail({
+  stage, kindLabel, monthLabel, sectionName, sectionCode, senderName, greetingName,
+  roleLabel, approverName, rejectReason, fileCount = 0
+}) {
+  const base = (env.frontendOrigin || "").replace(/\/+$/, "");
+  const params = new URLSearchParams({ view: "forms" });
+  if (sectionCode) params.set("section", `${sectionCode}`);
+  const link = base ? `${base}/?${params.toString()}` : null;
+  const title = `${kindLabel} · ${monthLabel}`;
+  let rows = kvRow("แบบฟอร์ม", esc(kindLabel)) + kvRow("ประจำเดือน", esc(monthLabel)) + kvRow("ผู้ส่ง", esc(senderName || "-"));
+  if (fileCount) rows += kvRow("ไฟล์แนบ", `${fileCount} ไฟล์ (Excel)`);
+
+  let opts;
+  let subject;
+  let plain;
+  if (stage === "APPROVE") {
+    subject = `🔔 รอคุณอนุมัติ · ${title}`;
+    plain = `${senderName || "-"} ส่งแบบฟอร์ม ${kindLabel} ประจำเดือน ${monthLabel} มาให้คุณอนุมัติในฐานะ ${roleLabel}`;
+    opts = {
+      accent: ACCENTS.amber,
+      pillText: `ต้องดำเนินการ · รออนุมัติ (${roleLabel})`,
+      headline: `มีแบบฟอร์ม ${kindLabel} รอการอนุมัติจากคุณ`,
+      paragraphs: [
+        `<strong>${esc(senderName || "-")}</strong> ส่งแบบฟอร์ม <strong>${esc(kindLabel)}</strong> ประจำเดือน `
+        + `<strong>${esc(monthLabel)}</strong> มาให้คุณอนุมัติในฐานะ <strong>${esc(roleLabel)}</strong> `
+        + `ไฟล์ Excel แนบมากับอีเมลนี้ เมื่ออนุมัติในระบบ ลายเซ็นของคุณจะถูกใส่ลงในแบบฟอร์มให้`
+      ],
+      primary: link ? { label: "ตรวจสอบ & อนุมัติ →", url: link, bg: "#15803d" } : null
+    };
+  } else if (stage === "APPROVED") {
+    subject = `✅ อนุมัติแล้ว · ${title}`;
+    plain = `แบบฟอร์ม ${kindLabel} ประจำเดือน ${monthLabel} ได้รับการอนุมัติครบแล้ว แบบฟอร์มที่ลงนามแล้วแนบมากับอีเมลนี้`;
+    opts = {
+      accent: ACCENTS.green,
+      pillText: "อนุมัติครบแล้ว",
+      headline: `แบบฟอร์ม ${kindLabel} อนุมัติแล้ว`,
+      paragraphs: [
+        `แบบฟอร์ม <strong>${esc(kindLabel)}</strong> ประจำเดือน <strong>${esc(monthLabel)}</strong> `
+        + `ได้รับการอนุมัติครบแล้ว แบบฟอร์มที่ลงนามแล้วแนบมากับอีเมลนี้`
+      ],
+      primary: link ? { label: "เปิดระบบ →", url: link } : null
+    };
+  } else {
+    subject = `❌ ไม่อนุมัติ · ${title}`;
+    plain = `แบบฟอร์ม ${kindLabel} ประจำเดือน ${monthLabel} ไม่ได้รับการอนุมัติจาก ${approverName || "-"}: ${rejectReason || "-"}`;
+    rows += kvRow("ผู้พิจารณา", esc(approverName || "-")) + kvRow("เหตุผล", esc(rejectReason || "-"));
+    opts = {
+      accent: ACCENTS.red,
+      pillText: "ไม่อนุมัติ",
+      headline: `แบบฟอร์ม ${kindLabel} ไม่ได้รับการอนุมัติ`,
+      paragraphs: [
+        `แบบฟอร์ม <strong>${esc(kindLabel)}</strong> ประจำเดือน <strong>${esc(monthLabel)}</strong> `
+        + `ไม่ได้รับการอนุมัติ กรุณาแก้ไขข้อมูลในปฏิทินแล้วส่งใหม่อีกครั้ง`
+      ],
+      primary: link ? { label: "เปิดระบบ →", url: link } : null
+    };
+  }
+  const full = {
+    ...opts,
+    sectionName,
+    requestNo: title,
+    greetingName,
+    extraHtml: detailCard("แบบฟอร์ม", title, rows)
+  };
+  return {
+    subject,
+    html: renderEmail(full),
+    text: renderText({ ...full, plainParagraphs: [plain] }),
+    type: `FORM_${stage}`
+  };
+}
+
 module.exports = {
+  buildFormSubmissionEmail,
   buildDeeplink,
   buildAccountLockedEmail,
   loadRequestContext,

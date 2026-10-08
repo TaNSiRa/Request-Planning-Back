@@ -6,7 +6,7 @@ const { requireAuth } = require("../../middleware/auth");
 const { buildOtWorkbook } = require("../../services/otExport");
 const { findSignature, ensureSignatureDir } = require("../../services/xlsxKit");
 const { resolveSection } = require("../../services/sectionService");
-const { countOt } = require("../../services/otHours");
+const { otUnitFor, otEntryFromRow, loadOtMonth } = require("../../services/monthForms");
 
 // Personal OT log behind the Personal calendar page. Like the personal to-do
 // board it belongs to the person, not a section: every route works on the
@@ -30,26 +30,17 @@ const hm = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, "Time must be HH:mm");
 
 const OT_COLUMNS = "ot_date, start_time, end_time, reason, sign_mode, ot_type, is_holiday";
 
-function toEntry(row) {
-  const otType = row.ot_type === "SPECIAL" ? "SPECIAL" : "NORMAL";
-  const holiday = row.is_holiday === true || row.is_holiday === 1;
-  return {
-    date: row.ot_date,
-    startTime: row.start_time,
-    endTime: row.end_time,
-    reason: row.reason,
-    signMode: row.sign_mode,
-    otType,
-    holiday,
-    minutes: countOt(row.start_time, row.end_time, { holiday, special: otType === "SPECIAL" }).minutes
-  };
-}
+const toEntry = otEntryFromRow;
 
 // Until patch_personal_ot.sql is applied the table (SQL error 208) or its later
 // columns (207) are missing; say so plainly instead of a generic 500.
 async function otQuery(text, params) {
+  return otQueryWrap(() => query(text, params));
+}
+
+async function otQueryWrap(run) {
   try {
-    return await query(text, params);
+    return await run();
   } catch (err) {
     if (err?.number === 208 || err?.number === 207) {
       const e = new Error("OT is not set up on this server yet (database patch_personal_ot.sql)");
@@ -138,33 +129,11 @@ router.delete("/:date", asyncHandler(async (req, res) => {
   res.json({ ok: true });
 }));
 
-// Sections whose OT form exists (assets/templates/ot-template.xlsx is the
-// Automation section's form), keyed by section code, with the department name
-// on the people's profiles (users.section) that belongs on that form. Other
-// sections get no export until they have one.
-const OT_FORM_SECTIONS = { AUTOMATION: "Automation" };
-
-// Who is printed on the form: active members of the section whose profile
-// department is the form's, ranked below Manager (M4) — a larger sort_order is
-// a lower rank — and not trainees. People with no position are left off too.
-const ROSTER_SQL = `
-  SELECT u.id, u.employee_no, u.full_name, u.display_name, u.section AS unit, u.phone
-  FROM users u
-  JOIN positions p ON p.id = u.position_id
-  WHERE u.is_active = 1
-    AND LOWER(LTRIM(RTRIM(u.section))) = LOWER(@unit)
-    AND EXISTS (SELECT 1 FROM user_section_memberships m
-                WHERE m.user_id = u.id AND m.section_id = @sectionId AND m.is_active = 1)
-    AND p.sort_order > ISNULL((SELECT MIN(sort_order) FROM positions WHERE abbreviation = 'M4'), 40)
-    AND LOWER(LTRIM(RTRIM(p.name))) <> 'trainee'
-    AND LOWER(LTRIM(RTRIM(ISNULL(p.abbreviation, '')))) <> 'trainee'`;
-
-// The form's roster and their OT for ?month=YYYY-MM, after checking the
-// section has a form. Sends the error response itself and returns null when
-// it can't go on.
+// The section's OT form data for ?month=YYYY-MM, after checking the section
+// has a form. Sends the error response itself and returns null when it can't
+// go on.
 async function loadDepartmentOt(req, res) {
-  const unit = OT_FORM_SECTIONS[`${req.section.code}`.toUpperCase()];
-  if (!unit) {
+  if (!otUnitFor(req.section.code)) {
     res.status(403).json({ message: "There is no OT form for this section yet" });
     return null;
   }
@@ -174,30 +143,8 @@ async function loadDepartmentOt(req, res) {
     res.status(400).json({ message: "month must be YYYY-MM" });
     return null;
   }
-  const ym = `${m[1]}-${m[2]}`;
-  const params = { sectionId: req.section.id, unit, from: `${ym}-01`, to: `${ym}-31` };
-  const people = (await query(ROSTER_SQL, params)).recordset
-    .map(r => ({
-      employeeNo: `${r.employee_no ?? ""}`.trim(),
-      fullName: `${r.full_name || r.display_name || ""}`.trim(),
-      unit: `${r.unit ?? ""}`.trim(),
-      phone: r.phone
-    }))
-    .sort((a, b) => a.employeeNo.localeCompare(b.employeeNo, undefined, { numeric: true }));
-  const rows = (await otQuery(
-    `SELECT r.employee_no, o.ot_date, o.start_time, o.end_time, o.reason, o.sign_mode, o.ot_type, o.is_holiday
-     FROM personal_ot o
-     JOIN (${ROSTER_SQL}) r ON r.id = o.user_id
-     WHERE o.ot_date BETWEEN @from AND @to
-     ORDER BY o.ot_date`,
-    params
-  )).recordset;
-  return {
-    year: Number(m[1]),
-    month,
-    people,
-    entries: rows.map(r => ({ employeeNo: `${r.employee_no ?? ""}`.trim(), ...toEntry(r) }))
-  };
+  const data = await otQueryWrap(() => loadOtMonth(req.section.id, req.section.code, `${m[1]}-${m[2]}`));
+  return { year: Number(m[1]), month, ...data };
 }
 
 // GET /api/ot/export-people?month=YYYY-MM — who on the form has OT this month,

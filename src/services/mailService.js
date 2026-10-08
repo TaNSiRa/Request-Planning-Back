@@ -58,7 +58,16 @@ async function resolveSectionId(requestId, sectionId) {
 // must not wait seconds per recipient on the SMTP server. Callers that act on
 // the outcome (the settings test send, reminder jobs that stamp only after a
 // real delivery) pass waitForDelivery: true.
-async function sendMail({ to, subject, html, text, requestId, type, sectionId, ignoreEnabledFlag = false, waitForDelivery = false }) {
+//
+// to / cc take one address or a list. attachments: [{ filename, content:
+// Buffer }] go out with the message but are not kept in the outbox.
+async function sendMail({ to, cc, attachments, subject, html, text, requestId, type, sectionId, ignoreEnabledFlag = false, waitForDelivery = false }) {
+  const toList = [].concat(to || []).filter(Boolean);
+  const ccList = [].concat(cc || []).filter(Boolean);
+  // The outbox keeps one address column of 255 characters: the recipients
+  // joined, trimmed to fit (the full lists go to the SMTP server).
+  const recorded = [toList.join(", "), ccList.length ? `cc: ${ccList.join(", ")}` : ""]
+    .filter(Boolean).join(" | ").slice(0, 255);
   const resolvedSectionId = await resolveSectionId(requestId, sectionId);
   // 'mail.enabled' is the on/off switch OF THE OWNING SECTION — each section
   // decides for itself whether the system emails its people. When off, we still
@@ -78,7 +87,7 @@ async function sendMail({ to, subject, html, text, requestId, type, sectionId, i
       requestId: requestId || null,
       sectionId: resolvedSectionId,
       type,
-      to,
+      to: recorded,
       subject,
       html,
       status
@@ -91,7 +100,7 @@ async function sendMail({ to, subject, html, text, requestId, type, sectionId, i
   const tx = getTransporter();
   if (!tx) return { sent: false, reason: "SMTP config is blank" };
 
-  const delivery = deliver(tx, outboxId, { to, subject, html, text });
+  const delivery = deliver(tx, outboxId, { to: toList, cc: ccList, attachments, subject, html, text });
   if (waitForDelivery) return delivery;
   delivery.catch(err => {
     // eslint-disable-next-line no-console
@@ -100,14 +109,16 @@ async function sendMail({ to, subject, html, text, requestId, type, sectionId, i
   return { sent: false, queued: true };
 }
 
-async function deliver(tx, outboxId, { to, subject, html, text }) {
+async function deliver(tx, outboxId, { to, cc, attachments, subject, html, text }) {
   try {
     const info = await tx.sendMail({
       from: env.smtp.from,
       to,
+      cc: cc && cc.length ? cc : undefined,
       subject,
       html,
-      text: text || undefined
+      text: text || undefined,
+      attachments: attachments && attachments.length ? attachments : undefined
     });
     await query(
       "UPDATE email_outbox SET status='sent', sent_at=DATEADD(HOUR, 7, SYSUTCDATETIME()), error_message=NULL WHERE id=@id",

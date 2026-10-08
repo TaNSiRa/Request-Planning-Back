@@ -5,6 +5,7 @@ const { asyncHandler } = require("../../middleware/asyncHandler");
 const { requireAuth } = require("../../middleware/auth");
 const { buildOffsiteWorkbook } = require("../../services/offsiteExport");
 const { findSignature, ensureSignatureDir } = require("../../services/xlsxKit");
+const { offsiteEntryFromRow } = require("../../services/monthForms");
 
 // Personal off-site work log ("ทำงานนอกสถานที่") behind the Personal calendar
 // page, and the person's own monthly Clocking In-Out Confirmation form. Like
@@ -27,15 +28,7 @@ function isYmd(value) {
 const hm = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, "Time must be HH:mm");
 const COLUMNS = "work_date, start_time, end_time, place, reason";
 
-function toEntry(row) {
-  return {
-    date: row.work_date,
-    startTime: row.start_time,
-    endTime: row.end_time,
-    place: row.place || "",
-    reason: row.reason || ""
-  };
-}
+const toEntry = offsiteEntryFromRow;
 
 // Until patch_personal_offsite.sql is applied the table is missing (SQL error
 // 208); say so plainly instead of a generic 500.

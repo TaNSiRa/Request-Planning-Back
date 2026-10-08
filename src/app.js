@@ -26,6 +26,7 @@ const weeklyPlanRoutes = require("./modules/weeklyplan/weeklyplan.routes");
 const personalTodoRoutes = require("./modules/personaltodo/personaltodo.routes");
 const otRoutes = require("./modules/ot/ot.routes");
 const offsiteRoutes = require("./modules/offsite/offsite.routes");
+const formRoutes = require("./modules/forms/forms.routes");
 const healthRoutes = require("./modules/health/health.routes");
 
 function createApp() {
@@ -138,7 +139,8 @@ function createApp() {
     ["/api/weekly-plan", weeklyPlanRoutes],
     ["/api/personal-todo", personalTodoRoutes],
     ["/api/ot", otRoutes],
-    ["/api/offsite", offsiteRoutes]
+    ["/api/offsite", offsiteRoutes],
+    ["/api/form-submissions", formRoutes]
   ];
   for (const [path, router] of guarded) app.use(path, requireAuth, requirePdpaConsent, router);
 

@@ -25,10 +25,14 @@ const TEMPLATE_DAYS = 31;
 const EMPLOYEE_ROW_OFFSETS = [8, 9, 10, 11, 12, 13];
 const DATE_ROW_OFFSET = 2;
 
-// Employee (signature) cell box, in EMU: column J is 19.14 chars wide (≈134 px
-// at the workbook's 7 px digit) and an employee row is 19.9 pt tall.
-const SIGN_COL = 9; // J, zero-based
-const SIGN_CELL_W = 134 * 9525;
+// Signature cell boxes, in EMU: column widths at the workbook's 7 px digit —
+// J (Employee) 19.14 chars ≈ 134 px, K (Chief/Asst.Mgr.) 16.43 ≈ 115 px,
+// L (Manager) 14.14 ≈ 99 px — and an employee row 19.9 pt tall.
+const SIGN_COLS = {
+  employee: { col: 9, w: 134 * 9525 },
+  chief: { col: 10, w: 115 * 9525 },
+  manager: { col: 11, w: 99 * 9525 }
+};
 const SIGN_CELL_H = Math.round(19.9 * 12700);
 const SIGN_PAD_X = 60000;
 const SIGN_MAX_H = 240000; // may overhang the row a hair, like the template's own signatures
@@ -62,11 +66,11 @@ function trimBlocks(zip, sheet, lastRow) {
   return xml;
 }
 
-// A signature centred in the Employee cell of [row].
-function signatureAnchor(image, row) {
-  const { cx, cy } = fitPicture(image.width, image.height, SIGN_CELL_W - 2 * SIGN_PAD_X, SIGN_MAX_H);
+// A signature centred in [box] (one of SIGN_COLS) on [row].
+function signatureAnchor(image, row, box = SIGN_COLS.employee) {
+  const { cx, cy } = fitPicture(image.width, image.height, box.w - 2 * SIGN_PAD_X, SIGN_MAX_H);
   return {
-    col: SIGN_COL, colOff: (SIGN_CELL_W - cx) / 2,
+    col: box.col, colOff: (box.w - cx) / 2,
     row0: row - 1, rowOff: (SIGN_CELL_H - cy) / 2,
     cx, cy
   };
@@ -96,11 +100,12 @@ function planBlocks(people, entries) {
 // endTime, reason, signMode:'SELF'|'ESIGN' }]; anyone not on the roster is ignored.
 // Every printed day form lists the whole roster: No., Code, Name, Section
 // (unit) and phone, plus In, Out, Reason and the Employee signature (image or
-// blank) for whoever had OT that day. Chief/Asst.Mgr., Manager and bus route
-// stay blank.
+// blank) for whoever had OT that day. Bus route stays blank; Chief/Asst.Mgr.
+// and Manager are blank too unless approvals carries their signature images
+// ({ chief, manager }), which then go on every row that has OT.
 // Returns { buffer, days, missingSignatures }: missingSignatures = employee
 // numbers that asked for an e-signature with no image on file (left blank).
-function buildOtWorkbook({ year, month, exportedBy, people, entries }) {
+function buildOtWorkbook({ year, month, exportedBy, people, entries, approvals = {} }) {
   const blocks = planBlocks(people, entries);
   if (!blocks.length) throw httpError(422, "There is no OT to export for this month");
   if (blocks.length > TEMPLATE_DAYS) {
@@ -126,6 +131,7 @@ function buildOtWorkbook({ year, month, exportedBy, people, entries }) {
 
   const shrinkStyles = new Map();
   const signatures = new Map(); // code -> { image, rows } (null image = none on file)
+  const otRows = [];
   blocks.forEach((block, b) => {
     block.people.forEach((person, p) => {
       const row = FIRST_BLOCK_ROW + BLOCK_ROWS * b + EMPLOYEE_ROW_OFFSETS[p];
@@ -140,6 +146,7 @@ function buildOtWorkbook({ year, month, exportedBy, people, entries }) {
       sheet = setCell(sheet, `G${row}`, e.startTime);
       sheet = setCell(sheet, `H${row}`, e.endTime);
       sheet = setCellShrunk(zip, sheet, `I${row}`, e.reason, shrinkStyles);
+      otRows.push(row);
       if (e.signMode === "ESIGN" && code) {
         if (!signatures.has(code)) signatures.set(code, { image: findSignature(code), rows: [] });
         signatures.get(code).rows.push(row);
@@ -149,9 +156,15 @@ function buildOtWorkbook({ year, month, exportedBy, people, entries }) {
 
   if (blocks.length < TEMPLATE_DAYS) sheet = trimBlocks(zip, sheet, lastRow);
   zip.updateFile(FORM_SHEET, Buffer.from(openAtTop(sheet), "utf8"));
-  addPictures(zip, DRAWING, [...signatures.values()]
-    .filter(g => g.image)
-    .map(g => ({ image: g.image, anchors: g.rows.map(row => signatureAnchor(g.image, row)) })));
+  const approverGroups = [["chief", approvals.chief], ["manager", approvals.manager]]
+    .filter(([, image]) => image)
+    .map(([role, image]) => ({ image, anchors: otRows.map(row => signatureAnchor(image, row, SIGN_COLS[role])) }));
+  addPictures(zip, DRAWING, [
+    ...[...signatures.values()]
+      .filter(g => g.image)
+      .map(g => ({ image: g.image, anchors: g.rows.map(row => signatureAnchor(g.image, row)) })),
+    ...approverGroups
+  ]);
   finishWorkbook(zip, { printArea: `$A$16:$N$${lastRow}`, exportedBy });
 
   return {
