@@ -6,7 +6,7 @@ const { requireAuth } = require("../../middleware/auth");
 const { audit } = require("../../middleware/audit");
 const { requireAdmin, requireSectionAdmin, resolveSection, isAdmin } = require("../../services/sectionService");
 const { blockViewerWrites } = require("../../middleware/viewerGuard");
-const { verifyMail, isMailConfigured, sendMail } = require("../../services/mailService");
+const { verifyMail, isMailConfigured, sendMail, sendTestMail } = require("../../services/mailService");
 const { normalizeMaxAttachments, getUserDisplayOrder } = require("../../services/settingsService");
 const { verifyHoliday } = require("../../db/holidayPool");
 const { emitSystem } = require("../../services/realtimeService");
@@ -37,6 +37,17 @@ router.get("/holiday/verify", requireAdmin, asyncHandler(async (req, res) => {
 // Check the SMTP connection/credentials without sending anything.
 router.get("/mail/verify", requireAdmin, asyncHandler(async (req, res) => {
   res.json({ configured: isMailConfigured(), ...(await verifyMail()) });
+}));
+
+// "Send test email" button on Settings › Email notifications: delivers to the
+// signed-in user's OWN address (never a client-supplied one) and reports the
+// real failure reason, so a section admin can diagnose SMTP on the server.
+router.post("/mail/test-self", requireSectionAdmin, audit("TEST", "MAIL"), asyncHandler(async (req, res) => {
+  const row = (await query("SELECT email FROM users WHERE id=@userId", { userId: req.user.id })).recordset[0];
+  if (!row?.email) {
+    return res.json({ ok: false, stage: "recipient", message: "Your account has no email address" });
+  }
+  res.json({ to: row.email, ...(await sendTestMail({ to: row.email, sectionId: req.section?.id })) });
 }));
 
 // Send a real test email to prove end-to-end delivery works.

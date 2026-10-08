@@ -139,4 +139,46 @@ async function deliver(tx, outboxId, { to, cc, attachments, subject, html, text 
   }
 }
 
-module.exports = { sendMail, isMailConfigured, verifyMail };
+// Settings-page "send test email": sends straight through the transporter and
+// returns WHY it failed (network code, SMTP reply, failing command) so an admin
+// can diagnose the server. Never includes credentials.
+async function sendTestMail({ to, sectionId }) {
+  if (!isMailConfigured()) {
+    return { ok: false, stage: "config", message: "SMTP_HOST / SMTP_FROM is blank in backend/.env" };
+  }
+  const subject = "Test email — Request & Planning";
+  const html = "<p>This is a test email from the Request &amp; Planning system. If you received it, SMTP delivery is working.</p>";
+  const insert = await query(
+    `INSERT INTO email_outbox (section_id, mail_type, to_email, subject, body_html, status)
+     OUTPUT INSERTED.id VALUES (@sectionId, 'TEST', @to, @subject, @html, 'queued')`,
+    { sectionId: sectionId || null, to, subject, html }
+  );
+  const outboxId = insert.recordset[0].id;
+  try {
+    const info = await getTransporter().sendMail({ from: env.smtp.from, to, subject, html });
+    await query(
+      "UPDATE email_outbox SET status='sent', sent_at=DATEADD(HOUR, 7, SYSUTCDATETIME()), error_message=NULL WHERE id=@id",
+      { id: outboxId }
+    );
+    return { ok: true, messageId: info.messageId };
+  } catch (err) {
+    await query("UPDATE email_outbox SET status='failed', error_message=@error WHERE id=@id", {
+      id: outboxId, error: `${err.message}`.slice(0, 3000)
+    });
+    // eslint-disable-next-line no-console
+    console.error(`[mail] test send to ${to} failed: ${err.code || ""} ${err.message}`);
+    const network = ["ESOCKET", "ETIMEDOUT", "ECONNECTION", "ENETUNREACH", "ECONNREFUSED", "ENOTFOUND", "EDNS"];
+    return {
+      ok: false,
+      stage: err.command === "CONN" || network.includes(err.code) ? "connect" : "smtp",
+      code: err.code || null,
+      command: err.command || null,
+      responseCode: err.responseCode || null,
+      message: `${err.response || err.message}`.slice(0, 500),
+      host: env.smtp.host,
+      port: env.smtp.port
+    };
+  }
+}
+
+module.exports = { sendMail, sendTestMail, isMailConfigured, verifyMail };

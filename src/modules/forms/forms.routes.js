@@ -75,11 +75,25 @@ async function loadSettings(sectionId) {
     parsed = {};
   }
   const ids = list => [...new Set((Array.isArray(list) ? list : []).map(Number).filter(n => Number.isInteger(n) && n > 0))];
-  return Object.fromEntries(Object.keys(EMPTY_SETTINGS).map(k => [k, ids(parsed[k])]));
+  return {
+    ...Object.fromEntries(Object.keys(EMPTY_SETTINGS).map(k => [k, ids(parsed[k])])),
+    // The section admin's switch for the Personal calendar's Send button
+    // (on until turned off).
+    sendEnabled: parsed.sendEnabled !== false
+  };
+}
+
+function maySend(req, settings) {
+  return isAdmin(req.user) || req.sectionAccess?.isSectionAdmin === true || settings.custodians.includes(req.user.id);
 }
 
 function canSubmit(req, settings) {
-  return isAdmin(req.user) || req.sectionAccess?.isSectionAdmin === true || settings.custodians.includes(req.user.id);
+  return settings.sendEnabled && maySend(req, settings);
+}
+
+function assertCanSubmit(req, settings) {
+  if (!settings.sendEnabled) throw httpError(403, "Sending OT / off-site forms is turned off for this section");
+  if (!maySend(req, settings)) throw httpError(403, "Only admins, section admins and document custodians can send the forms");
 }
 
 async function usersByIds(ids) {
@@ -100,7 +114,7 @@ const nameOf = u => `${u?.full_name || u?.display_name || ""}`.trim();
 // custodians (with names), and what the caller may do here.
 router.get("/settings", asyncHandler(async (req, res) => {
   const settings = await loadSettings(req.section.id);
-  const all = await usersByIds([...new Set(Object.values(settings).flat())]);
+  const all = await usersByIds([...new Set(Object.keys(EMPTY_SETTINGS).flatMap(k => settings[k]))]);
   const named = list => list.map(id => all.find(u => u.id === id)).filter(Boolean)
     .map(u => ({ userId: u.id, name: nameOf(u), employeeNo: u.employee_no }));
   res.json({
@@ -114,8 +128,14 @@ router.get("/settings", asyncHandler(async (req, res) => {
 router.put("/settings", requireSectionAdmin, audit("EDIT", "FORM_APPROVERS", req => req.section?.id),
   asyncHandler(async (req, res) => {
     const ids = z.array(z.number().int().positive()).max(50).optional().default([]);
-    const input = z.object({ otChief: ids, otManager: ids, offsiteDeptMgr: ids, custodians: ids }).parse(req.body);
-    const value = JSON.stringify(Object.fromEntries(Object.entries(input).map(([k, v]) => [k, [...new Set(v)]])));
+    const input = z.object({
+      otChief: ids, otManager: ids, offsiteDeptMgr: ids, custodians: ids,
+      sendEnabled: z.boolean().optional().default(true)
+    }).parse(req.body);
+    const value = JSON.stringify({
+      ...Object.fromEntries(Object.keys(EMPTY_SETTINGS).map(k => [k, [...new Set(input[k])]])),
+      sendEnabled: input.sendEnabled
+    });
     await query(
       `MERGE app_settings AS target USING (SELECT @key AS setting_key, @sectionId AS section_id) AS source
        ON target.setting_key = source.setting_key AND COALESCE(target.section_id, 0) = COALESCE(source.section_id, 0)
@@ -169,7 +189,7 @@ async function submissionsOf(sectionId, ym) {
 router.get("/preview", asyncHandler(async (req, res) => {
   const ym = monthSchema.parse(req.query.month);
   const settings = await loadSettings(req.section.id);
-  if (!canSubmit(req, settings)) throw httpError(403, "Only admins, section admins and document custodians can send the forms");
+  assertCanSubmit(req, settings);
   const { ot, offsite } = await loadMonthData(req, ym);
   const people = new Map();
   const touch = (employeeNo, fullName) => {
@@ -284,7 +304,7 @@ router.post("/submit", audit("SUBMIT", "FORM_SUBMISSION", req => req.section?.id
     esign: z.array(z.string().trim().max(50)).max(500).optional().default([])
   }).parse(req.body);
   const settings = await loadSettings(req.section.id);
-  if (!canSubmit(req, settings)) throw httpError(403, "Only admins, section admins and document custodians can send the forms");
+  assertCanSubmit(req, settings);
   const kinds = [...new Set(input.kinds)];
   const { ot, offsite } = await loadMonthData(req, input.month);
 

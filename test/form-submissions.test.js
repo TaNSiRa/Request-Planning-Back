@@ -90,6 +90,32 @@ describe("form submissions", () => {
     assert.equal((await member.get("/api/form-submissions/settings")).body.canSubmit, true);
   });
 
+  it("hides the Send button and refuses sending while the section has it turned off", async () => {
+    const setSend = on => query(
+      `UPDATE app_settings SET setting_value = JSON_MODIFY(setting_value, '$.sendEnabled', CAST(@on AS bit))
+       WHERE section_id = @sid AND setting_key = 'forms.approvers'`,
+      { sid: fixture.sectionId, on: on ? 1 : 0 }
+    );
+    const member = await ctx.login(app, "member");
+    await setSend(false);
+    try {
+      const settings = await member.get("/api/form-submissions/settings");
+      assert.equal(settings.body.sendEnabled, false);
+      assert.equal(settings.body.canSubmit, false);
+      const preview = await member.get("/api/form-submissions/preview?month=2026-11");
+      assert.equal(preview.status, 403);
+      assert.match(preview.body.message, /turned off/);
+      assert.equal((await member.post("/api/form-submissions/submit").send({ month: "2026-11", kinds: ["OT"] })).status, 403);
+      // The approvers stay set while it is off.
+      assert.equal(settings.body.custodians.length, 1);
+    } finally {
+      await setSend(true);
+    }
+    const back = await member.get("/api/form-submissions/settings");
+    assert.equal(back.body.sendEnabled, true);
+    assert.equal(back.body.canSubmit, true);
+  });
+
   it("flags the section for its form approvers, so they reach the inbox", async () => {
     const flag = async name => {
       const s = await ctx.login(app, name);
