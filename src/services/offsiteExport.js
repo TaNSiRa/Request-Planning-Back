@@ -1,6 +1,7 @@
 const path = require("path");
 const {
-  httpError, openTemplate, setCell, setCellShrunk, fitPicture, addPictures, openAtTop, finishWorkbook
+  httpError, openTemplate, setCell, setCellShrunk, fitPicture, pictureXml, addImageParts, maxShapeId,
+  openAtTop, finishWorkbook
 } = require("./xlsxKit");
 
 // Builds one person's monthly "Clocking In-Out Confirmation" form
@@ -24,18 +25,17 @@ const LAST_LINE = FIRST_LINE + LINES - 1; // 24
 const LINE_MERGES = [["B", "C"], ["D", "E"], ["F", "G"], ["J", "K"], ["L", "M"]];
 const PRINT_LAST_ROW = 44;
 
-// The approval-box picture ("พนักงาน / Employee", Department Mgr., …) sits
-// from column F + 457200 EMU, row 26 + 187743 EMU (6027420 × 1269679 EMU).
-// Its boxes, measured off the picture as Excel draws it: Employee 0–1513000
-// EMU across, then Department Mgr. 1513000–3015000; the signing space is the
-// top ~45 %.
-const SIGN_BOX = { col: 5, colOff: 457200, row0: 25, rowOff: 187743, h: 560000 };
-const SIGN_BOXES = [{ x: 0, w: 1513000 }, { x: 1513000, w: 1502000 }];
-const SIGN_PAD = 60000;
-// The boxes' "…/…/…" date line: between the row line under the box name
-// (≈ 910000 EMU down) and the picture's bottom edge (≈ 1263000). The white date
-// box sits inside those lines, covering the dots but not the borders.
-const SIGN_DATE = { top: 925000, h: 322000, inset: 25000 };
+// The approval-box picture ("พนักงาน / Employee", Department Mgr., …;
+// xl/media/image2.png, 3166 × 666 px) and its boxes in the picture's own
+// pixels, measured off the image: the Employee box spans x 4–790, Department
+// Mgr. 793–1580 (lines 4 px wide); the signing space is y 3–319; the
+// "…/…/…" date line sits at y 580–648, inside the bottom row (477–659).
+const APPROVAL_PICTURE = 'name="Picture 2"';
+const PICTURE_PX = { w: 3166, h: 666 };
+const SIGN_BOXES = [{ x0: 4, x1: 790 }, { x0: 793, x1: 1580 }];
+const SIGN_SPACE = { y0: 3, y1: 319, pad: 30 };
+// The white date box: over the dots and slashes, clear of the lines around.
+const DATE_BOX = { y0: 556, y1: 655, inset: 12 };
 
 // Today in Thailand as DD/MM/YYYY, the way the form's date line reads.
 function thaiToday() {
@@ -44,15 +44,59 @@ function thaiToday() {
 
 // A borderless white text box with [text] centred in it — laid over the
 // picture's dotted date line so the date reads cleanly.
-function dateBoxAnchor({ col, colOff, row0, rowOff, cx, cy, id, text }) {
-  return `<xdr:oneCellAnchor><xdr:from><xdr:col>${col}</xdr:col><xdr:colOff>${Math.round(colOff)}</xdr:colOff>`
-    + `<xdr:row>${row0}</xdr:row><xdr:rowOff>${Math.round(rowOff)}</xdr:rowOff></xdr:from><xdr:ext cx="${cx}" cy="${cy}"/>`
-    + `<xdr:sp macro="" textlink=""><xdr:nvSpPr><xdr:cNvPr id="${id}" name="E-Sign Date ${id}"/><xdr:cNvSpPr txBox="1"/></xdr:nvSpPr>`
-    + `<xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom>`
+function dateBoxXml({ x, y, cx, cy, id, text }) {
+  return `<xdr:sp macro="" textlink=""><xdr:nvSpPr><xdr:cNvPr id="${id}" name="E-Sign Date ${id}"/><xdr:cNvSpPr txBox="1"/></xdr:nvSpPr>`
+    + `<xdr:spPr><a:xfrm><a:off x="${Math.round(x)}" y="${Math.round(y)}"/><a:ext cx="${Math.round(cx)}" cy="${Math.round(cy)}"/></a:xfrm>`
+    + `<a:prstGeom prst="rect"><a:avLst/></a:prstGeom>`
     + `<a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill><a:ln><a:noFill/></a:ln></xdr:spPr>`
     + `<xdr:txBody><a:bodyPr wrap="none" lIns="0" tIns="0" rIns="0" bIns="0" anchor="ctr"/><a:lstStyle/>`
     + `<a:p><a:pPr algn="ctr"/><a:r><a:rPr lang="en-US" sz="1100"><a:solidFill><a:srgbClr val="000000"/></a:solidFill>`
-    + `<a:latin typeface="Calibri"/></a:rPr><a:t>${text}</a:t></a:r></a:p></xdr:txBody></xdr:sp><xdr:clientData/></xdr:oneCellAnchor>`;
+    + `<a:latin typeface="Calibri"/></a:rPr><a:t>${text}</a:t></a:r></a:p></xdr:txBody></xdr:sp>`;
+}
+
+// Signs boxes of the approval picture — signed: [{ box (index into
+// SIGN_BOXES), image, date }]. The signatures and their dates go into the
+// picture's own anchor, grouped with it and laid out in its coordinates, so
+// they stretch and move with the picture however Excel sizes the columns
+// (that changes with the screen's DPI) and never drift off their boxes.
+function signApprovalBox(zip, signed) {
+  let drawing = zip.readAsText(DRAWING.drawing);
+  const anchor = [...drawing.matchAll(/<xdr:twoCellAnchor\b[\s\S]*?<\/xdr:twoCellAnchor>/g)]
+    .map(m => m[0]).find(a => a.includes(APPROVAL_PICTURE));
+  const pic = anchor && anchor.match(/<xdr:pic>[\s\S]*<\/xdr:pic>/);
+  const xfrm = pic && pic[0].match(/<a:off x="(\d+)" y="(\d+)"\/><a:ext cx="(\d+)" cy="(\d+)"\/>/);
+  if (!xfrm) throw new Error("Off-site template: approval picture not found");
+  const [ox, oy, cx, cy] = xfrm.slice(1).map(Number);
+  const sx = cx / PICTURE_PX.w;
+  const sy = cy / PICTURE_PX.h;
+
+  const relIds = addImageParts(zip, DRAWING.rels, signed.map(s => s.image));
+  let id = maxShapeId(drawing);
+  const shapes = [];
+  signed.forEach(({ box, image }, i) => {
+    const { x0, x1 } = SIGN_BOXES[box];
+    const { pad, y0, y1 } = SIGN_SPACE;
+    const size = fitPicture(image.width, image.height, (x1 - x0 - 2 * pad) * sx, (y1 - y0 - 2 * pad) * sy);
+    shapes.push(pictureXml({
+      id: ++id, relId: relIds[i], ...size,
+      x: ox + ((x0 + x1) / 2) * sx - size.cx / 2,
+      y: oy + ((y0 + y1) / 2) * sy - size.cy / 2
+    }));
+  });
+  for (const { box, date } of signed) {
+    const { x0, x1 } = SIGN_BOXES[box];
+    shapes.push(dateBoxXml({
+      id: ++id, text: date,
+      x: ox + (x0 + DATE_BOX.inset) * sx, y: oy + DATE_BOX.y0 * sy,
+      cx: (x1 - x0 - 2 * DATE_BOX.inset) * sx, cy: (DATE_BOX.y1 - DATE_BOX.y0) * sy
+    }));
+  }
+  const group = `<xdr:grpSp><xdr:nvGrpSpPr><xdr:cNvPr id="${++id}" name="Approval Boxes ${id}"/><xdr:cNvGrpSpPr/></xdr:nvGrpSpPr>`
+    + `<xdr:grpSpPr><a:xfrm><a:off x="${ox}" y="${oy}"/><a:ext cx="${cx}" cy="${cy}"/>`
+    + `<a:chOff x="${ox}" y="${oy}"/><a:chExt cx="${cx}" cy="${cy}"/></a:xfrm></xdr:grpSpPr>`
+    + `${pic[0]}${shapes.join("")}</xdr:grpSp>`;
+  drawing = drawing.replace(anchor, () => anchor.replace(pic[0], () => group));
+  zip.updateFile(DRAWING.drawing, Buffer.from(drawing, "utf8"));
 }
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -63,30 +107,6 @@ function formDate(ymd) {
   return `${d}-${MONTHS[Number(m) - 1]}-${y.slice(2)}`;
 }
 
-// Width of columns A–N in EMU, as Excel lays the template out (measured in
-// Excel, in points). Computing them from <cols> drifted by several points by
-// column F, enough to push the signature boxes' date over the frame lines.
-const COLUMN_POINTS = [41.4, 36.6, 36.6, 47.4, 51, 74.4, 74.4, 52.8, 52.8, 28.8, 28.8, 28.8, 28.8, 141.6];
-function columnWidths() {
-  return COLUMN_POINTS.map(pt => Math.round(pt * 12700));
-}
-
-function rowHeights(sheet) {
-  const heights = [];
-  for (const m of sheet.matchAll(/<row r="(\d+)"[^>]*? ht="([\d.]+)"/g)) {
-    heights[Number(m[1]) - 1] = Math.round(Number(m[2]) * 12700);
-  }
-  return heights;
-}
-
-// Moves an offset that runs past its cell on into the following cells.
-function normalise(index, offset, sizes, fallback) {
-  while (offset > (sizes[index] ?? fallback)) {
-    offset -= sizes[index] ?? fallback;
-    index += 1;
-  }
-  return { index, offset };
-}
 
 // Make room for [count] more lines: copies of the last-but-one line go in
 // before the last one (which keeps the thick bottom edge), and everything
@@ -163,28 +183,7 @@ function buildOffsiteWorkbook({ person, entries, signature, exportedBy, signedOn
     signature && { box: 0, image: signature, date: signedOn || thaiToday() },
     deptMgr?.image && { box: 1, image: deptMgr.image, date: deptMgr.signedOn || thaiToday() }
   ].filter(Boolean);
-  if (signed.length) {
-    const cols = columnWidths();
-    const heights = rowHeights(sheet);
-    const place = (offset, rowOff) => {
-      const x = normalise(SIGN_BOX.col, SIGN_BOX.colOff + offset, cols, 64 * 9525);
-      const y = normalise(SIGN_BOX.row0 + extra, SIGN_BOX.rowOff + rowOff, heights, 14.4 * 12700);
-      return { col: x.index, colOff: x.offset, row0: y.index, rowOff: y.offset };
-    };
-    addPictures(zip, DRAWING, signed.map(({ box, image }) => {
-      const { x, w } = SIGN_BOXES[box];
-      const { cx, cy } = fitPicture(image.width, image.height, w - 2 * SIGN_PAD, SIGN_BOX.h - 2 * SIGN_PAD);
-      return { image, anchors: [{ ...place(x + (w - cx) / 2, (SIGN_BOX.h - cy) / 2), cx, cy }] };
-    }));
-    let drawing = zip.readAsText(DRAWING.drawing);
-    let id = Math.max(0, ...[...drawing.matchAll(/<xdr:cNvPr id="(d+)"/g)].map(m => Number(m[1])));
-    const dates = signed.map(({ box, date }) => dateBoxAnchor({
-      ...place(SIGN_BOXES[box].x + SIGN_DATE.inset, SIGN_DATE.top),
-      cx: Math.round(SIGN_BOXES[box].w - 2 * SIGN_DATE.inset), cy: SIGN_DATE.h, id: ++id, text: date
-    }));
-    drawing = drawing.replace("</xdr:wsDr>", `${dates.join("")}</xdr:wsDr>`);
-    zip.updateFile(DRAWING.drawing, Buffer.from(drawing, "utf8"));
-  }
+  if (signed.length) signApprovalBox(zip, signed);
 
   // The dates are text ("14-Oct-26", as the form wants them); stop Excel
   // flagging every one as a two-digit-year date in text.

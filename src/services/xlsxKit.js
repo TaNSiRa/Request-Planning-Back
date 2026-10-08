@@ -181,34 +181,39 @@ function fitPicture(width, height, maxW, maxH) {
   return { cx: Math.round(width * scale), cy: Math.round(height * scale) };
 }
 
+// A signature picture shape at x, y, cx × cy (EMU) — inside a group these
+// are the group's child coordinates.
+function pictureXml({ id, relId, x = 0, y = 0, cx, cy }) {
+  return `<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="${id}" name="E-Signature ${id}"/>`
+    + `<xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr>`
+    + `<xdr:blipFill><a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:embed="${relId}"/>`
+    + `<a:stretch><a:fillRect/></a:stretch></xdr:blipFill>`
+    + `<xdr:spPr><a:xfrm><a:off x="${Math.round(x)}" y="${Math.round(y)}"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm>`
+    + `<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic>`;
+}
+
 function pictureAnchor({ col, colOff, row0, rowOff, cx, cy, id, relId }) {
   return `<xdr:oneCellAnchor><xdr:from><xdr:col>${col}</xdr:col><xdr:colOff>${Math.max(0, Math.round(colOff))}</xdr:colOff>`
     + `<xdr:row>${row0}</xdr:row><xdr:rowOff>${Math.max(0, Math.round(rowOff))}</xdr:rowOff></xdr:from>`
     + `<xdr:ext cx="${cx}" cy="${cy}"/>`
-    + `<xdr:pic><xdr:nvPicPr><xdr:cNvPr id="${id}" name="E-Signature ${id}"/>`
-    + `<xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr>`
-    + `<xdr:blipFill><a:blip xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" r:embed="${relId}"/>`
-    + `<a:stretch><a:fillRect/></a:stretch></xdr:blipFill>`
-    + `<xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm>`
-    + `<a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:oneCellAnchor>`;
+    + pictureXml({ id, relId, cx, cy }) + "<xdr:clientData/></xdr:oneCellAnchor>";
 }
 
-// Adds pictures to a sheet's drawing part. groups: [{ image, anchors }] — one
-// media file per image ({ buffer, ext, width, height }), placed at each anchor
-// ({ col, colOff, row0, rowOff, cx, cy }, EMU, zero-based col/row).
-function addPictures(zip, { drawing: drawingPath, rels: relsPath }, groups) {
-  groups = groups.filter(g => g.image && g.anchors.length);
-  if (!groups.length) return;
+// The highest shape id in a drawing part (new shapes number on from it).
+function maxShapeId(drawing) {
+  return Math.max(0, ...[...drawing.matchAll(/<xdr:cNvPr id="(\d+)"/g)].map(m => Number(m[1])));
+}
+
+// Adds [images] ({ buffer, ext }) as media parts the drawing links to through
+// [relsPath]; returns their relationship ids, in order.
+function addImageParts(zip, relsPath, images) {
   let types = zip.readAsText("[Content_Types].xml");
   // A drawing that holds only text boxes may have no rels part yet.
   let rels = zip.getEntry(relsPath)
     ? zip.readAsText(relsPath)
     : '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
       + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>';
-  let drawing = zip.readAsText(drawingPath);
-  let id = Math.max(0, ...[...drawing.matchAll(/<xdr:cNvPr id="(\d+)"/g)].map(m => Number(m[1])));
-  const xml = [];
-  groups.forEach(({ image, anchors }, i) => {
+  const ids = images.map((image, i) => {
     const media = `esign_${i + 1}${image.ext}`;
     zip.addFile(`xl/media/${media}`, image.buffer);
     const ext = image.ext.slice(1);
@@ -219,10 +224,26 @@ function addPictures(zip, { drawing: drawingPath, rels: relsPath }, groups) {
     const relId = `rIdEsign${i + 1}`;
     rels = rels.replace("</Relationships>",
       `<Relationship Id="${relId}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/${media}"/></Relationships>`);
-    for (const a of anchors) xml.push(pictureAnchor({ ...a, id: ++id, relId }));
+    return relId;
   });
   zip.updateFile("[Content_Types].xml", Buffer.from(types, "utf8"));
   zip.addFile(relsPath, Buffer.from(rels, "utf8")); // adds or replaces
+  return ids;
+}
+
+// Adds pictures to a sheet's drawing part. groups: [{ image, anchors }] — one
+// media file per image ({ buffer, ext, width, height }), placed at each anchor
+// ({ col, colOff, row0, rowOff, cx, cy }, EMU, zero-based col/row).
+function addPictures(zip, { drawing: drawingPath, rels: relsPath }, groups) {
+  groups = groups.filter(g => g.image && g.anchors.length);
+  if (!groups.length) return;
+  const relIds = addImageParts(zip, relsPath, groups.map(g => g.image));
+  let drawing = zip.readAsText(drawingPath);
+  let id = maxShapeId(drawing);
+  const xml = [];
+  groups.forEach(({ anchors }, i) => {
+    for (const a of anchors) xml.push(pictureAnchor({ ...a, id: ++id, relId: relIds[i] }));
+  });
   drawing = drawing.replace("</xdr:wsDr>", `${xml.join("")}</xdr:wsDr>`);
   zip.updateFile(drawingPath, Buffer.from(drawing, "utf8"));
 }
@@ -261,6 +282,9 @@ function finishWorkbook(zip, { printArea, exportedBy }) {
 }
 
 module.exports = {
+  pictureXml,
+  addImageParts,
+  maxShapeId,
   E_SIGNATURE_DIR,
   ensureSignatureDir,
   findSignature,

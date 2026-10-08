@@ -98,8 +98,8 @@ describe("OT form export", () => {
   const sheetOf = buffer => new AdmZip(buffer).readAsText("xl/worksheets/sheet1.xml");
   const textAt = (xml, ref) => (xml.match(new RegExp(`<c r="${ref}"[^>]*>(?:<is><t[^>]*>([^<]*)</t></is>)?`)) || [])[1];
   const numAt = (xml, ref) => (xml.match(new RegExp(`<c r="${ref}"[^>]*><v>([^<]*)</v>`)) || [])[1];
-  // Day forms are 14 rows from row 16; the six employee rows are form start + 8 … 13.
-  const rowOf = (block, person) => 16 + 14 * block + 8 + person;
+  // Day forms are 14 rows from row 1; the six employee rows are form start + 8 … 13.
+  const rowOf = (block, person) => 1 + 14 * block + 8 + person;
 
   it("is only offered to sections that have a form", async () => {
     const s = await ctx.login(app, "requester");
@@ -151,13 +151,16 @@ describe("OT form export", () => {
     assert.equal(textAt(xml, `D${rowOf(1, 0)}`), "Trimate Ritthep");
     assert.equal(textAt(xml, `G${rowOf(1, 0)}`), undefined);
     assert.equal(textAt(xml, `I${rowOf(1, 3)}`), "Sat work");
-    // Two forms only — nothing after row 16 + 2·14 − 1.
-    assert.ok(xml.includes(`<row r="43"`));
-    assert.ok(!xml.includes(`<row r="44"`));
-    assert.match(new AdmZip(buffer).readAsText("xl/workbook.xml"), /\$A\$16:\$N\$43/);
-    const dates = new AdmZip(buffer).readAsText("xl/worksheets/sheet2.xml");
-    assert.match(dates, /<c r="B2"[^>]*><v>46056<\/v>/); // 2026-02-03
-    assert.match(dates, /<c r="B3"[^>]*><v>46074<\/v>/); // 2026-02-21
+    // Two forms only — nothing after row 2·14, and no blank master form or
+    // date sheet: the file is the forms and nothing else.
+    assert.ok(xml.includes(`<row r="28"`));
+    assert.ok(!xml.includes(`<row r="29"`));
+    const workbook = new AdmZip(buffer).readAsText("xl/workbook.xml");
+    assert.match(workbook, /\$A\$1:\$N\$28/);
+    assert.equal((workbook.match(/<sheet /g) || []).length, 1);
+    // Each form's date (L3, L17).
+    assert.equal(numAt(xml, "L3"), "46056"); // 2026-02-03
+    assert.equal(numAt(xml, "L17"), "46074"); // 2026-02-21
   });
 
   it("continues a roster longer than six on a second form for the same date", () => {
@@ -172,8 +175,7 @@ describe("OT form export", () => {
     assert.equal(numAt(xml, `C${rowOf(1, 1)}`), "107");
     assert.equal(numAt(xml, `A${rowOf(1, 1)}`), "8"); // numbering carries on
     assert.equal(textAt(xml, `I${rowOf(1, 1)}`), "x");
-    const dates = new AdmZip(buffer).readAsText("xl/worksheets/sheet2.xml");
-    assert.match(dates, /<c r="B3"[^>]*><v>46304<\/v>/); // 2026-10-09 again
+    assert.equal(numAt(xml, "L17"), "46304"); // 2026-10-09 again
   });
 
   it("places each person's e-signature image, and reports the ones missing", () => {

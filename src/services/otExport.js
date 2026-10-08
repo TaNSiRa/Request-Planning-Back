@@ -1,6 +1,6 @@
 const path = require("path");
 const {
-  findSignature, httpError, openTemplate, setCell, setFormulaCache, setCellShrunk,
+  findSignature, httpError, openTemplate, setCell, setCellShrunk,
   excelSerial, fitPicture, addPictures, openAtTop, finishWorkbook
 } = require("./xlsxKit");
 
@@ -8,18 +8,18 @@ const {
 // ล่วงเวลา) from the section's real form, kept byte-identical as a template
 // (see xlsxKit.js).
 //
-// Template layout (Sheet1):
-//   · rows 1–15: an unprinted master copy of one day — left untouched.
-//   · rows 16–449 (the print area): 31 identical, blank day forms of 14 rows.
-//     Form i starts at row 16 + 14·i; its date cell L(start+2) is the formula
-//     =Sheet3!B(i+2), and its six employee rows are start+8 … start+13 (only
+// Template layout (Sheet1, its only sheet):
+//   · rows 1–434 (the print area): 31 identical, blank day forms of 14 rows.
+//     Form i starts at row 1 + 14·i; its date cell is L(start+2) (merged
+//     L:M, dd/mm/yy), and its six employee rows are start+8 … start+13 (only
 //     the M/D column is pre-filled).
-// Sheet3 (xl/worksheets/sheet2.xml) holds the 31 date serials in B2:B32.
+// (The company's original also had an unprinted master copy of a day above
+// the forms and a Sheet3 of dates feeding the date cells; both were taken
+// out of the template so the file opens on the first form.)
 const TEMPLATE = path.join(__dirname, "..", "..", "assets", "templates", "ot-template.xlsx");
 const FORM_SHEET = "xl/worksheets/sheet1.xml";
-const DATES_SHEET = "xl/worksheets/sheet2.xml";
 const DRAWING = { drawing: "xl/drawings/drawing1.xml", rels: "xl/drawings/_rels/drawing1.xml.rels" };
-const FIRST_BLOCK_ROW = 16;
+const FIRST_BLOCK_ROW = 1;
 const BLOCK_ROWS = 14;
 const TEMPLATE_DAYS = 31;
 const EMPLOYEE_ROW_OFFSETS = [8, 9, 10, 11, 12, 13];
@@ -116,18 +116,10 @@ function buildOtWorkbook({ year, month, exportedBy, people, entries, approvals =
   let sheet = zip.readAsText(FORM_SHEET);
   const lastRow = FIRST_BLOCK_ROW + BLOCK_ROWS * blocks.length - 1;
 
-  // Dates: Sheet3 feeds every block's date cell, so block i shows its day. The
-  // cached copies are updated too so the file reads right before any
-  // recalculation.
-  let dates = zip.readAsText(DATES_SHEET);
-  for (let i = 0; i < TEMPLATE_DAYS; i++) {
-    const serial = i < blocks.length ? excelSerial(year, month, blocks[i].day) : null;
-    dates = setCell(dates, `B${i + 2}`, serial);
-    if (serial !== null) {
-      sheet = setFormulaCache(sheet, `L${FIRST_BLOCK_ROW + BLOCK_ROWS * i + DATE_ROW_OFFSET}`, serial);
-    }
-  }
-  zip.updateFile(DATES_SHEET, Buffer.from(dates, "utf8"));
+  // Each form's date.
+  blocks.forEach((block, i) => {
+    sheet = setCell(sheet, `L${FIRST_BLOCK_ROW + BLOCK_ROWS * i + DATE_ROW_OFFSET}`, excelSerial(year, month, block.day));
+  });
 
   const shrinkStyles = new Map();
   const signatures = new Map(); // code -> { image, rows } (null image = none on file)
@@ -165,7 +157,7 @@ function buildOtWorkbook({ year, month, exportedBy, people, entries, approvals =
       .map(g => ({ image: g.image, anchors: g.rows.map(row => signatureAnchor(g.image, row)) })),
     ...approverGroups
   ]);
-  finishWorkbook(zip, { printArea: `$A$16:$N$${lastRow}`, exportedBy });
+  finishWorkbook(zip, { printArea: `$A$1:$N$${lastRow}`, exportedBy });
 
   return {
     buffer: zip.toBuffer(),
