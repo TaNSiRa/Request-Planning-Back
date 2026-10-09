@@ -186,6 +186,36 @@ describe("form submissions", () => {
     assert.equal((await approver2.post(`/api/form-submissions/steps/${chiefStep}/approve`)).status, 403);
   });
 
+  it("lets a section admin who is no approver watch the steps, read-only", async () => {
+    const { requester } = fixture.users;
+    const before = (await query(
+      `SELECT u.role_id, m.is_section_admin FROM users u
+       JOIN user_section_memberships m ON m.user_id = u.id AND m.section_id = @sid
+       WHERE u.id = @id`,
+      { id: requester, sid: fixture.sectionId }
+    )).recordset[0];
+    const role = (await query("SELECT id FROM roles WHERE code = 'SECTION_ADMIN'")).recordset[0];
+    await query("UPDATE users SET role_id=@role WHERE id=@id", { role: role.id, id: requester });
+    await query("UPDATE user_section_memberships SET is_section_admin=1 WHERE user_id=@id AND section_id=@sid",
+      { id: requester, sid: fixture.sectionId });
+    try {
+      const admin = await ctx.login(app, "requester");
+      const seen = (await admin.get("/api/form-submissions/pending")).body.data;
+      assert.deepEqual(seen.map(i => `${i.kind}:${i.role}`).sort(), ["OFFSITE:DEPT_MGR", "OT:CHIEF"]);
+      assert.ok(seen.every(i => i.canAct === false));
+      // The forms open for them, but deciding is refused.
+      assert.equal((await admin.get(`/api/form-submissions/${seen[0].submissionId}/files`)).status, 200);
+      for (const item of seen) {
+        assert.equal((await admin.post(`/api/form-submissions/steps/${item.stepId}/approve`)).status, 403);
+        assert.equal((await admin.post(`/api/form-submissions/steps/${item.stepId}/reject`).send({ comment: "No" })).status, 403);
+      }
+    } finally {
+      await query("UPDATE users SET role_id=@role WHERE id=@id", { role: before.role_id, id: requester });
+      await query("UPDATE user_section_memberships SET is_section_admin=@on WHERE user_id=@id AND section_id=@sid",
+        { on: before.is_section_admin, id: requester, sid: fixture.sectionId });
+    }
+  });
+
   it("signs the OT form step by step and mails the signed result", async () => {
     const approver1 = await ctx.login(app, "approver1");
     const approver2 = await ctx.login(app, "approver2");

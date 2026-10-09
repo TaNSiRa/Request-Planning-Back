@@ -363,8 +363,12 @@ router.post("/submit", audit("SUBMIT", "FORM_SUBMISSION", req => req.section?.id
 
 // ── Approving ───────────────────────────────────────────────────────────────
 
-// GET /api/form-submissions/pending — steps waiting for the caller: those it
-// is an approver of (a global admin may act on any, so sees them all).
+// GET /api/form-submissions/pending — steps waiting in the section's inbox.
+// As with request approvals (approvals.routes.js), SEEING a step and ACTING
+// on it differ: a section admin watches every pending step of their section,
+// but read-only (canAct false) unless they are one of its approvers — and the
+// decision endpoints below refuse them either way. Approvers see their own
+// steps; a global admin sees and may act on all.
 router.get("/pending", asyncHandler(async (req, res) => {
   const rows = (await formsQuery(
     `SELECT st.id AS step_id, st.role, st.step_no, s.id AS submission_id, s.kind, s.form_month, s.submitted_at,
@@ -380,9 +384,8 @@ router.get("/pending", asyncHandler(async (req, res) => {
     { sectionId: req.section.id, userId: req.user.id }
   )).recordset;
   const admin = isAdmin(req.user);
-  // Only what the caller can sign: a step's approvers (and a global admin,
-  // who may act on any). Others — section admins included — don't see it.
-  const data = rows.filter(r => r.is_candidate || admin).map(r => {
+  const watcher = req.sectionAccess?.isSectionAdmin === true;
+  const data = rows.filter(r => r.is_candidate || admin || watcher).map(r => {
     const snap = JSON.parse(r.snapshot_json);
     const people = r.kind === "OT"
       ? new Set(snap.ot.entries.map(e => e.employeeNo)).size
