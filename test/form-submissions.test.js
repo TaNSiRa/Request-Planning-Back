@@ -59,7 +59,8 @@ before(async () => {
       sid: fixture.sectionId,
       value: JSON.stringify({
         otChief: [approver1, coapprover], otManager: [approver2, coapprover],
-        offsiteDeptMgr: [approver1], custodians: [member]
+        offsiteDeptMgr: [approver1], custodians: [member],
+        sendEnabled: true
       })
     }
   );
@@ -97,6 +98,15 @@ describe("form submissions", () => {
       { sid: fixture.sectionId, on: on ? 1 : 0 }
     );
     const member = await ctx.login(app, "member");
+    // Never set: off, like every section until its admin turns it on.
+    await query(
+      `UPDATE app_settings SET setting_value = JSON_MODIFY(setting_value, '$.sendEnabled', NULL)
+       WHERE section_id = @sid AND setting_key = 'forms.approvers'`,
+      { sid: fixture.sectionId }
+    );
+    const unset = await member.get("/api/form-submissions/settings");
+    assert.equal(unset.body.sendEnabled, false);
+    assert.equal(unset.body.canSubmit, false);
     await setSend(false);
     try {
       const settings = await member.get("/api/form-submissions/settings");
@@ -291,7 +301,7 @@ describe("form submissions", () => {
     assert.equal((await member.post("/api/form-submissions/submit").send({ month: "2027-01", kinds: ["OFFSITE"] })).status, 422);
     await query("UPDATE app_settings SET setting_value=@v WHERE section_id=@sid AND setting_key='forms.approvers'", {
       sid: fixture.sectionId,
-      v: JSON.stringify({ otChief: [], otManager: [], offsiteDeptMgr: [], custodians: [fixture.users.member] })
+      v: JSON.stringify({ otChief: [], otManager: [], offsiteDeptMgr: [], custodians: [fixture.users.member], sendEnabled: true })
     });
     const requester = await ctx.login(app, "requester");
     await requester.put("/api/offsite/2027-01-05").send({ startTime: "08:30", endTime: "17:10", reason: "x" });

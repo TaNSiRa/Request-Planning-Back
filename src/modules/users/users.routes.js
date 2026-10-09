@@ -323,6 +323,75 @@ router.patch("/:id(\\d+)", requireSectionAdmin, audit("EDIT", "USER", req => req
   res.json({ ok: true });
 }));
 
+// ── Adding an existing account to this section ─────────────────────────────
+// Someone whose account lives in another section (their home section owns its
+// identity, role and password) can still be given access here — to request in
+// this section and / or work in it. Manage Users lists only this section's
+// members, so these two find such an account and add the one membership.
+
+// GET /api/users/lookup?q= — active accounts that are not members here yet,
+// matched on employee no., e-mail or name. Global admins and viewers are left
+// out: an admin reaches every section already, a viewer's reach is its own
+// setting. Only what is needed to pick the right person is returned.
+router.get("/lookup", requireSectionAdmin, asyncHandler(async (req, res) => {
+  const q = z.string().trim().min(2, "Type at least 2 characters").max(100).parse(req.query.q ?? "");
+  const like = q.replace(/[\\%_[]/g, ch => `\\${ch}`);
+  const rows = (await query(
+    `SELECT TOP 20 u.id, u.employee_no, u.email, u.display_name, u.full_name, u.section, u.department,
+            (SELECT STRING_AGG(s.name, ', ') FROM user_section_memberships ms
+               JOIN request_sections s ON s.id = ms.section_id
+               WHERE ms.user_id = u.id AND ms.is_active = 1) AS section_names
+     FROM users u JOIN roles r ON r.id = u.role_id
+     WHERE u.is_active = 1 AND r.code NOT IN ('ADMIN', 'VIEWER')
+       AND NOT EXISTS (SELECT 1 FROM user_section_memberships m
+                       WHERE m.user_id = u.id AND m.section_id = @sectionId AND m.is_active = 1)
+       AND (u.employee_no LIKE @prefix ESCAPE '\\' OR u.email LIKE @contains ESCAPE '\\'
+            OR u.full_name LIKE @contains ESCAPE '\\' OR u.display_name LIKE @contains ESCAPE '\\')
+     ORDER BY CASE WHEN u.employee_no = @q THEN 0 ELSE 1 END, u.full_name, u.display_name`,
+    { sectionId: req.section.id, q, prefix: `${like}%`, contains: `%${like}%` }
+  )).recordset;
+  res.json({
+    data: rows.map(u => ({
+      id: u.id,
+      employeeNo: u.employee_no,
+      name: `${u.full_name || u.display_name || ""}`.trim(),
+      email: u.email,
+      department: u.department,
+      section: u.section,
+      sections: u.section_names || ""
+    }))
+  });
+}));
+
+// POST /api/users/:id/join-section { canRequest = true, canWork = false } — gives the account
+// a plain membership in THIS section only (never section admin; a global
+// admin raises that later in the edit dialog). Its other memberships are not
+// touched.
+router.post("/:id(\\d+)/join-section", requireSectionAdmin, audit("ADD_EXISTING_MEMBER", "USER", req => req.params.id),
+  asyncHandler(async (req, res) => {
+    const input = z.object({
+      canRequest: z.boolean().optional().default(true),
+      canWork: z.boolean().optional().default(false)
+    }).refine(v => v.canRequest || v.canWork, { message: "Pick Can request, Can work or both" }).parse(req.body);
+    const targetId = Number(req.params.id);
+    const target = (await query(
+      `SELECT u.is_active, r.code AS role_code,
+              (SELECT TOP 1 m.is_active FROM user_section_memberships m
+                 WHERE m.user_id = u.id AND m.section_id = @sectionId) AS member_active
+       FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = @id`,
+      { id: targetId, sectionId: req.section.id }
+    )).recordset[0];
+    if (!target || !target.is_active) return res.status(404).json({ message: "User not found" });
+    if (target.role_code === "ADMIN" || target.role_code === "VIEWER") {
+      return res.status(403).json({ message: "Admins and viewers are not added to sections this way" });
+    }
+    if (target.member_active) return res.status(409).json({ message: "This user is already a member of this section" });
+    await upsertMembership(targetId, req.section.id, input.canRequest, input.canWork, false);
+    forgetAccount(targetId);
+    emitSystem("users.updated", { id: targetId });
+    res.status(201).json({ ok: true });
+  }));
+
 // Section access on its own, for a row the actor may SEE but not manage: another
 // section's admin who also holds a membership here. Their identity, role, active
 // flag and password belong to whoever administers them — PATCH /:id refuses the

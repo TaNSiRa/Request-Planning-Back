@@ -77,9 +77,9 @@ async function loadSettings(sectionId) {
   const ids = list => [...new Set((Array.isArray(list) ? list : []).map(Number).filter(n => Number.isInteger(n) && n > 0))];
   return {
     ...Object.fromEntries(Object.keys(EMPTY_SETTINGS).map(k => [k, ids(parsed[k])])),
-    // The section admin's switch for the Personal calendar's Send button
-    // (on until turned off).
-    sendEnabled: parsed.sendEnabled !== false
+    // The section admin's switch for the Personal calendar's Send button —
+    // off in every section until its admin turns it on and saves.
+    sendEnabled: parsed.sendEnabled === true
   };
 }
 
@@ -130,7 +130,7 @@ router.put("/settings", requireSectionAdmin, audit("EDIT", "FORM_APPROVERS", req
     const ids = z.array(z.number().int().positive()).max(50).optional().default([]);
     const input = z.object({
       otChief: ids, otManager: ids, offsiteDeptMgr: ids, custodians: ids,
-      sendEnabled: z.boolean().optional().default(true)
+      sendEnabled: z.boolean().optional().default(false)
     }).parse(req.body);
     const value = JSON.stringify({
       ...Object.fromEntries(Object.keys(EMPTY_SETTINGS).map(k => [k, [...new Set(input[k])]])),
