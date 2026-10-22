@@ -142,6 +142,22 @@ describe("account lockout after repeated failed sign-ins", () => {
     assert.equal((await lockState(email)).until, null, "and it is cleared on the way through");
   });
 
+  it("once a lock runs out, the failure count starts over", async () => {
+    const email = ctx.testEmail("approver2");
+    await query(
+      `UPDATE users SET failed_login_count = @failures,
+                        login_locked_until = DATEADD(MINUTE, -1, DATEADD(HOUR, 7, SYSUTCDATETIME()))
+       WHERE email = @email`,
+      { failures: MAX_FAILURES, email }
+    );
+    const typo = await freshLogin(email, WRONG);
+    assert.equal(typo.status, 401);
+    const state = await lockState(email);
+    assert.equal(state.failures, 1, "the count restarts instead of carrying on from the old lock");
+    assert.equal(state.until, null, "one typo after the lock must not lock again");
+    assert.equal((await freshLogin(email, PASSWORD)).status, 200);
+  });
+
   it("an unknown account cannot be used to probe for lock state", async () => {
     const res = await freshLogin(`nobody-${Date.now()}@${ctx.EMAIL_DOMAIN}`, WRONG);
     assert.equal(res.status, 401);
